@@ -1,0 +1,73 @@
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - auth-service
+      - case-service
+    networks:
+      - frontend_net
+      - backend_net
+
+  auth-service:
+    build: ./services/auth-service
+    env_file: .env
+    depends_on: [auth-db]
+    networks: [backend_net]
+
+  case-service:
+    build: ./services/case-service
+    env_file: .env
+    depends_on: [case-db, auth-service, anonymization-service]
+    networks: [backend_net]
+
+  ner-service:
+    build: ./services/ner-service
+    env_file: .env
+    networks: [backend_net]
+
+  anonymization-service:
+    build: ./services/anonymization-service
+    env_file: .env
+    depends_on: [ner-service, anonymized-db, personal-data-db]
+    networks: [backend_net]
+
+  auth-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: auth_db
+    networks: [backend_net]
+
+  case-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: case_db
+    networks: [backend_net]
+
+  anonymized-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: anonymized_db
+    networks: [backend_net]
+
+  personal-data-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: personal_data_db
+    networks: [backend_net]
+
+networks:
+  frontend_net:
+  backend_net:
+    internal: true
