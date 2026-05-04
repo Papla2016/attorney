@@ -1,7 +1,7 @@
 import axios from 'axios';
 
 export const client = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE_URL || 'http://localhost:8080/api'
+  baseURL: '/api'
 });
 
 client.interceptors.request.use((config) => {
@@ -11,13 +11,19 @@ client.interceptors.request.use((config) => {
 });
 
 client.interceptors.response.use(
-  (r) => r,
+  (response) => response,
   (error) => {
-    if (error?.response?.status === 401) {
+    const status = error?.response?.status;
+    const url: string = error?.config?.url || '';
+    const isAuthLogin = url.includes('/auth/login');
+
+    if (status === 401 && !isAuthLogin && localStorage.getItem('access_token')) {
       localStorage.removeItem('access_token');
-      localStorage.setItem('session_expired_message', 'Сессия истекла, войдите снова');
-      if (window.location.pathname !== '/login') window.location.href = '/login';
+      if (window.location.pathname !== '/login') {
+        window.location.href = '/login';
+      }
     }
+
     return Promise.reject(error);
   }
 );

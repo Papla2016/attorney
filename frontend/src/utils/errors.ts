@@ -1,7 +1,12 @@
-export const getErrorMessage = (error: any): string => {
-  if (error?.response?.data?.error?.message) return error.response.data.error.message;
-  if (error?.response?.status === 403) return 'Недостаточно прав для выполнения действия.';
-  if (error?.response?.status === 404) return 'Запрашиваемые данные не найдены.';
-  if (error?.message === 'Network Error') return 'Не удалось подключиться к серверу.';
-  return error?.message || 'Произошла ошибка.';
+export const getApiErrorMessage = (error: any, context?: 'login'): string => {
+  const status = error?.response?.status;
+
+  if (context === 'login' && status === 401) return 'Неверный логин или пароль';
+  if (status === 401) return 'Сессия истекла. Войдите снова.';
+  if (status === 403) return 'Недостаточно прав';
+  if (status === 404) return 'Данные не найдены';
+  if ([500, 502, 503, 504].includes(status)) return 'Внутренняя ошибка сервера. Попробуйте позже.';
+  if (error?.message === 'Network Error') return 'Не удалось подключиться к серверу';
+
+  return 'Не удалось выполнить действие';
 };

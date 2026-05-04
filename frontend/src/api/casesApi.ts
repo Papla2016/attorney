@@ -1,5 +1,6 @@
 import { client } from './client';
 import type { CreateCaseRequest, UploadDocumentRequest } from './types';
+
 export const searchPublicDocuments = (params: any) => client.get('/cases/public/documents', { params });
 export const getPublicDocument = (id: string) => client.get(`/cases/public/documents/${id}`);
 export const getFavorites = () => client.get('/cases/me/favorites');
@@ -8,7 +9,7 @@ export const removeFavorite = (documentId: string) => client.delete(`/cases/me/f
 export const participatingCases = () => client.get('/cases/me/participating');
 export const restoredCase = (caseId: string) => client.get(`/cases/${caseId}/restored`);
 export const createCase = (payload: CreateCaseRequest) => client.post('/cases', payload);
-export const staffCases = () => client.get('/cases/me/staff');
+export const staffCases = () => client.get('/cases/staff/my');
 export const caseDetails = (caseId: string) => client.get(`/cases/${caseId}`);
 export const uploadDoc = (caseId: string, payload: UploadDocumentRequest) => client.post(`/cases/${caseId}/documents`, payload);
 export const docStatus = (docId: string) => client.get(`/cases/documents/${docId}/status`);
