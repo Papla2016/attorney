@@ -1,0 +1,15 @@
+import { client } from './client';
+import type { CreateCaseRequest, UploadDocumentRequest } from './types';
+export const searchPublicDocuments = (params: any) => client.get('/cases/public/documents', { params });
+export const getPublicDocument = (id: string) => client.get(`/cases/public/documents/${id}`);
+export const getFavorites = () => client.get('/cases/me/favorites');
+export const addFavorite = (documentId: string) => client.post(`/cases/me/favorites/${documentId}`);
+export const removeFavorite = (documentId: string) => client.delete(`/cases/me/favorites/${documentId}`);
+export const participatingCases = () => client.get('/cases/me/participating');
+export const restoredCase = (caseId: string) => client.get(`/cases/${caseId}/restored`);
+export const createCase = (payload: CreateCaseRequest) => client.post('/cases', payload);
+export const staffCases = () => client.get('/cases/me/staff');
+export const caseDetails = (caseId: string) => client.get(`/cases/${caseId}`);
+export const uploadDoc = (caseId: string, payload: UploadDocumentRequest) => client.post(`/cases/${caseId}/documents`, payload);
+export const docStatus = (docId: string) => client.get(`/cases/documents/${docId}/status`);
+export const publishDocument = (docId: string) => client.post(`/cases/documents/${docId}/publish`);

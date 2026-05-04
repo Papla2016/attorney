@@ -1,0 +1,7 @@
+import { client } from './client';
+import type { User } from './types';
+export const login = (username: string, password: string) => client.post('/auth/login', { username, password });
+export const register = (payload: {username: string; email: string; password: string;}) => client.post('/auth/register', payload);
+export const me = async (): Promise<User> => (await client.get('/auth/me')).data;
+export const listUsers = async (): Promise<User[]> => (await client.get('/auth/users')).data;
+export const assignRole = (userId: string, role: string) => client.post(`/auth/users/${userId}/roles`, { role });
