@@ -2,7 +2,9 @@ from datetime import datetime, timedelta, timezone
 import os
 import uuid
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from jose import jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
@@ -27,8 +29,43 @@ SEED_ROLES = {
 }
 
 
-def error(status: int, code: str, message: str):
-    raise HTTPException(status_code=status, detail={"error": {"code": code, "message": message, "details": {}}})
+def error_payload(code: str, message: str, details: dict | None = None):
+    return {"error": {"code": code, "message": message, "details": details or {}}}
+
+
+def error(status: int, code: str, message: str, details: dict | None = None):
+    raise HTTPException(status_code=status, detail=error_payload(code, message, details))
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    if isinstance(exc.detail, dict) and "error" in exc.detail:
+        return JSONResponse(status_code=exc.status_code, content=exc.detail)
+    return JSONResponse(status_code=exc.status_code, content=error_payload("HTTP_ERROR", str(exc.detail)))
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=400, content=error_payload("BAD_REQUEST", "Некорректный запрос", {"validation_errors": exc.errors()}))
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+audit_log: list[dict] = []
+
+
+def audit(actor_user_id: str | None, action: str, resource_type: str, resource_id: str, details: dict | None = None):
+    audit_log.append({
+        "id": str(uuid.uuid4()),
+        "user_id": actor_user_id,
+        "action": action,
+        "resource_type": resource_type,
+        "resource_id": resource_id,
+        "created_at": now_iso(),
+        "details": details or {},
+    })
 
 
 users: dict[str, dict] = {}
@@ -189,5 +226,14 @@ def set_roles(user_id: str, data: RolesIn, claims=Depends(get_current)):
     next_roles = data.roles if data.roles is not None else ([data.role] if data.role else None)
     if not next_roles:
         error(400, "BAD_REQUEST", "roles is required")
+    previous_roles = u['roles'].copy()
     u['roles'] = next_roles
+    audit(claims.get("sub"), "UPDATE_USER_ROLES", "USER", u["id"], {"previous_roles": previous_roles, "roles": next_roles})
     return {"id": u['id'], "username": u['username'], "email": u['email'], "roles": u['roles']}
+
+
+@app.get('/api/auth/admin/audit')
+def admin_audit(claims=Depends(get_current)):
+    if 'ADMIN' not in claims.get('roles', []):
+        error(403, "ACCESS_DENIED", "Недостаточно прав")
+    return {"items": audit_log, "total": len(audit_log)}

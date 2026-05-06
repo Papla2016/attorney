@@ -1,25 +1,51 @@
 from datetime import datetime
 import os
 import uuid
-
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from jose import jwt
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 app = FastAPI(title='case-service')
 SECRET = os.getenv('JWT_SECRET', 'secret')
 ALG = os.getenv('JWT_ALGORITHM', 'HS256')
 INTERNAL = os.getenv('INTERNAL_SERVICE_TOKEN', 'internal-secret-token')
 ANON = os.getenv('ANONYMIZATION_SERVICE_URL', 'http://anonymization-service:8000')
+NER = os.getenv('NER_SERVICE_URL', 'http://ner-service:8000')
+AUTH = os.getenv('AUTH_SERVICE_URL')
 
 USER_ID = "00000000-0000-0000-0000-000000000002"
 STAFF_ID = "00000000-0000-0000-0000-000000000003"
 JUDGE_ID = "00000000-0000-0000-0000-000000000004"
 
 
-def err(code, msg, status=403):
-    raise HTTPException(status_code=status, detail={'error': {'code': code, 'message': msg, 'details': {}}})
+def error_payload(code: str, message: str, details: dict | None = None):
+    return {'error': {'code': code, 'message': message, 'details': details or {}}}
+
+
+def err(code, msg, status=403, details: dict | None = None):
+    raise HTTPException(status_code=status, detail=error_payload(code, msg, details))
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    if isinstance(exc.detail, dict) and 'error' in exc.detail:
+        return JSONResponse(status_code=exc.status_code, content=exc.detail)
+    return JSONResponse(status_code=exc.status_code, content=error_payload('HTTP_ERROR', str(exc.detail)))
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=400,
+        content=error_payload('BAD_REQUEST', 'Некорректный запрос', {'validation_errors': exc.errors()}),
+    )
+
+
+def now_iso():
+    return datetime.utcnow().isoformat() + 'Z'
 
 
 def claims(auth: str | None):
@@ -35,34 +61,111 @@ def allowed(c, need):
     return any(r in c.get('roles', []) for r in need)
 
 
-courts = [{'id': str(uuid.uuid4()), 'name': 'Центральный районный суд', 'court_type': 'DISTRICT_COURT', 'region': 'Забайкальский край'}]
+def split_judges(value: list[str] | str | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    return [part.strip() for part in value.split(',') if part.strip()]
+
+
+def audit(user_id: str | None, action: str, resource_type: str, resource_id: str, details: dict | None = None):
+    audit_log.append({
+        'id': str(uuid.uuid4()),
+        'user_id': user_id,
+        'action': action,
+        'resource_type': resource_type,
+        'resource_id': resource_id,
+        'created_at': now_iso(),
+        'details': details or {},
+    })
+
+
+seed_court_id = str(uuid.uuid4())
+courts = [
+    {
+        'id': seed_court_id,
+        'name': 'Белгородский районный суд Белгородской области',
+        'court_type': 'DISTRICT_COURT',
+        'region': 'Белгородская область',
+        'address': '',
+    }
+]
 case_staff: dict[str, set[str]] = {}
 favorites: dict[str, set[str]] = {}
 participants: list[dict] = []
+audit_log: list[dict] = []
 
+seed_original_text = '''Постановление по делу № 5-262/2017
+
+31 марта 2017 года судья Белгородского районного суда Белгородской области Светашова С.Н., рассмотрев материал об административном правонарушении, предусмотренном ч. 1 ст. 20.1 КоАП РФ, в отношении ФИО1, установила обстоятельства дела.
+
+Из материалов следует, что ФИО1 в общественном месте выражался нецензурной бранью, нарушал общественный порядок и спокойствие граждан. В судебном заседании ФИО1 вину признал. Объяснения гражданина Захаряна, рапорт сотрудника полиции и иные материалы подтверждают событие административного правонарушения.
+
+Действия ФИО1 суд квалифицирует по ч. 1 ст. 20.1 КоАП РФ как мелкое хулиганство. Руководствуясь ст. 29.9-29.10 КоАП РФ, суд постановил признать ФИО1 виновным и назначить административное наказание.'''
+seed_anonymized_text = seed_original_text.replace('Светашова С.Н.', 'ФИО2').replace('Захаряна', 'ФИО3')
+seed_mappings = [
+    {'placeholder': 'ФИО1', 'original_value': 'ФИО1', 'entity_type': 'PERSON_FULL_NAME'},
+    {'placeholder': 'ФИО2', 'original_value': 'Светашова С.Н.', 'entity_type': 'PERSON_FULL_NAME'},
+    {'placeholder': 'ФИО3', 'original_value': 'Захарян', 'entity_type': 'PERSON_FULL_NAME'},
+]
 seed_case = {
-    'id': str(uuid.uuid4()), 'court_id': courts[0]['id'], 'court_name': courts[0]['name'], 'case_number': '2-3701/2025',
-    'document_number': '2-3701/2025~М-2392/2025', 'document_date': '2025-10-21', 'instance': 'FIRST', 'region': 'Забайкальский край',
-    'legal_article': 'ст. 454 ГК РФ', 'judicial_practice': 'Судебная практика по договору купли-продажи', 'judge_names': ['judge'],
-    'judge_user_ids': [JUDGE_ID], 'staff_user_ids': [JUDGE_ID], 'status': 'PUBLISHED', 'created_by_user_id': JUDGE_ID,
-    'created_at': datetime.utcnow().isoformat() + 'Z'
+    'id': str(uuid.uuid4()),
+    'court_id': seed_court_id,
+    'court_name': 'Белгородский районный суд Белгородской области',
+    'case_number': '5-262/2017',
+    'document_number': '5-262/2017',
+    'document_date': '2017-04-01',
+    'instance': 'FIRST',
+    'region': 'Белгородская область',
+    'legal_article': 'ч. 1 ст. 20.1 КоАП РФ',
+    'judicial_practice': 'Судебная практика по делам об административных правонарушениях. Мелкое хулиганство. Применение ч. 1 ст. 20.1 КоАП РФ.',
+    'judge_names': ['Светашова С.Н.'],
+    'judge_user_ids': [JUDGE_ID],
+    'staff_user_ids': [JUDGE_ID],
+    'status': 'PUBLISHED',
+    'created_by_user_id': JUDGE_ID,
+    'created_at': now_iso(),
 }
 cases = [seed_case]
 case_staff[seed_case['id']] = {JUDGE_ID}
-participants.append({'case_id': seed_case['id'], 'user_id': USER_ID, 'role': 'подсудимый'})
-docs = [{'id': str(uuid.uuid4()), 'case_id': seed_case['id'], 'title': 'Решение', 'act_type': 'DECISION', 'status': 'PUBLISHED', 'public_anonymized_document_id': None}]
+participants.append({
+    'case_id': seed_case['id'],
+    'user_id': USER_ID,
+    'role': 'лицо, привлекаемое к административной ответственности',
+    'display_name': 'ФИО1',
+})
+seed_doc_id = str(uuid.uuid4())
+docs = [{
+    'id': seed_doc_id,
+    'case_id': seed_case['id'],
+    'title': 'Постановление по делу № 5-262/2017',
+    'act_type': 'RULING',
+    'status': 'PUBLISHED',
+    'document_date': '2017-04-01',
+    'anonymization_job_id': None,
+    'public_anonymized_document_id': seed_doc_id,
+    'original_text': seed_original_text,
+    'anonymized_text': seed_anonymized_text,
+    'mappings': seed_mappings,
+}]
 
 
 class CreateCase(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+
     court_id: str
     case_number: str
     document_number: str
     document_date: str
     instance: str
     region: str
-    legal_article: str
-    judicial_practice: str
+    legal_article: str | None = None
+    judicial_practice: str | None = None
     judge_names: list[str] = []
+    law_article: str | None = None
+    practice_topic: str | None = None
+    judges: list[str] | str | None = None
     staff_user_ids: list[str] = []
 
 
@@ -72,12 +175,65 @@ class UploadDoc(BaseModel):
     text: str
 
 
+class CourtIn(BaseModel):
+    name: str
+    court_type: str
+    region: str
+    address: str = ''
+
+
+class CourtPatch(BaseModel):
+    name: str | None = None
+    court_type: str | None = None
+    region: str | None = None
+    address: str | None = None
+
+
 @app.get('/health')
 def health(): return {'status': 'ok'}
 
 
 @app.get('/ready')
 def ready(): return {'status': 'ready'}
+
+
+def case_summary(cs: dict, participant_role: str | None = None):
+    item = {
+        'id': cs['id'],
+        'case_number': cs['case_number'],
+        'document_number': cs['document_number'],
+        'document_date': cs['document_date'],
+        'court_name': cs['court_name'],
+        'region': cs['region'],
+        'instance': cs['instance'],
+        'legal_article': cs['legal_article'],
+        'judicial_practice': cs['judicial_practice'],
+        'status': cs['status'],
+    }
+    if participant_role is not None:
+        item['participant_role'] = participant_role
+    return item
+
+
+def can_access_case(c: dict, cs: dict):
+    if 'ADMIN' in c.get('roles', []):
+        return True
+    user_id = c.get('sub')
+    if not user_id:
+        return False
+    if any(p['case_id'] == cs['id'] and p['user_id'] == user_id for p in participants):
+        return True
+    return user_id in case_staff.get(cs['id'], set()) or user_id in cs.get('judge_user_ids', []) or cs.get('created_by_user_id') == user_id
+
+
+def public_doc(d: dict):
+    return {
+        'id': d['id'],
+        'title': d['title'],
+        'act_type': d['act_type'],
+        'status': d['status'],
+        'document_date': d.get('document_date'),
+    }
 
 
 @app.get('/api/cases/public/documents')
@@ -126,19 +282,35 @@ def create_case(body: CreateCase, authorization: str | None = Header(None)):
     c = claims(authorization)
     if not allowed(c, ['COURT_STAFF', 'JUDGE', 'COURT_CLERK', 'ADMIN']):
         err('ACCESS_DENIED', 'Недостаточно прав')
+
+    final_legal_article = body.legal_article or body.law_article
+    final_judicial_practice = body.judicial_practice or body.practice_topic
+    final_judge_names = body.judge_names or split_judges(body.judges)
+    missing = []
+    if not final_legal_article:
+        missing.append('legal_article')
+    if not final_judicial_practice:
+        missing.append('judicial_practice')
+    if missing:
+        err('BAD_REQUEST', 'Не заполнены обязательные поля дела', 400, {'missing': missing})
+
+    staff_user_ids = list(dict.fromkeys(body.staff_user_ids.copy()))
+    judge_user_ids: list[str] = []
+    if allowed(c, ['COURT_STAFF', 'JUDGE', 'COURT_CLERK']) and c.get('sub'):
+        staff_user_ids.append(c['sub'])
+    if 'JUDGE' in c.get('roles', []) and c.get('sub'):
+        judge_user_ids.append(c['sub'])
+    staff_user_ids = list(dict.fromkeys(staff_user_ids))
+    judge_user_ids = list(dict.fromkeys(judge_user_ids))
+
     obj = {'id': str(uuid.uuid4()), 'court_id': body.court_id, 'court_name': next((x['name'] for x in courts if x['id'] == body.court_id), ''),
            'case_number': body.case_number, 'document_number': body.document_number, 'document_date': body.document_date,
-           'instance': body.instance, 'region': body.region, 'legal_article': body.legal_article, 'judicial_practice': body.judicial_practice,
-           'judge_names': body.judge_names, 'judge_user_ids': [], 'staff_user_ids': body.staff_user_ids.copy(), 'status': 'DRAFT',
-           'created_by_user_id': c['sub'], 'created_at': datetime.utcnow().isoformat() + 'Z'}
-    if allowed(c, ['COURT_STAFF', 'JUDGE', 'COURT_CLERK']):
-        obj['staff_user_ids'].append(c['sub'])
-        case_staff[obj['id']] = set(obj['staff_user_ids'])
-    else:
-        case_staff[obj['id']] = set(obj['staff_user_ids'])
-    if 'JUDGE' in c.get('roles', []):
-        obj['judge_user_ids'].append(c['sub'])
+           'instance': body.instance, 'region': body.region, 'legal_article': final_legal_article, 'judicial_practice': final_judicial_practice,
+           'judge_names': final_judge_names, 'judge_user_ids': judge_user_ids, 'staff_user_ids': staff_user_ids, 'status': 'DRAFT',
+           'created_by_user_id': c['sub'], 'created_at': now_iso()}
+    case_staff[obj['id']] = set(staff_user_ids)
     cases.append(obj)
+    audit(c.get('sub'), 'CREATE_CASE', 'CASE', obj['id'], {'case_number': obj['case_number']})
     return obj
 
 
@@ -150,9 +322,9 @@ def my_staff_cases(authorization: str | None = Header(None)):
     if 'ADMIN' in c.get('roles', []):
         items = cases
     elif 'JUDGE' in c.get('roles', []):
-        items = [cs for cs in cases if c['sub'] in cs.get('judge_user_ids', []) or c['sub'] in case_staff.get(cs['id'], set())]
+        items = [cs for cs in cases if c['sub'] in cs.get('judge_user_ids', []) or c['sub'] in cs.get('staff_user_ids', [])]
     else:
-        items = [cs for cs in cases if c['sub'] in case_staff.get(cs['id'], set()) or cs.get('created_by_user_id') == c['sub']]
+        items = [cs for cs in cases if c['sub'] in cs.get('staff_user_ids', []) or cs.get('created_by_user_id') == c['sub']]
     return {'items': items, 'total': len(items)}
 
 
@@ -166,8 +338,86 @@ def my_participating(authorization: str | None = Header(None)):
     for case_id, role in case_roles:
         cs = next((x for x in cases if x['id'] == case_id), None)
         if cs:
-            items.append({'id': cs['id'], 'case_number': cs['case_number'], 'court_name': cs['court_name'], 'region': cs['region'], 'status': cs['status'], 'participant_role': role})
+            items.append(case_summary(cs, role))
     return {'items': items, 'total': len(items)}
+
+
+@app.get('/api/cases/admin/courts')
+def admin_courts(authorization: str | None = Header(None)):
+    c = claims(authorization)
+    if 'ADMIN' not in c.get('roles', []):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    return {'items': courts, 'total': len(courts)}
+
+
+@app.post('/api/cases/admin/courts')
+def create_court(body: CourtIn, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    if 'ADMIN' not in c.get('roles', []):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    court = {'id': str(uuid.uuid4()), **body.model_dump()}
+    courts.append(court)
+    audit(c.get('sub'), 'CREATE_COURT', 'COURT', court['id'])
+    return court
+
+
+@app.patch('/api/cases/admin/courts/{court_id}')
+def update_court(court_id: str, body: CourtPatch, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    if 'ADMIN' not in c.get('roles', []):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    court = next((x for x in courts if x['id'] == court_id), None)
+    if not court:
+        err('NOT_FOUND', 'Суд не найден', 404)
+    court.update(body.model_dump(exclude_none=True))
+    audit(c.get('sub'), 'UPDATE_COURT', 'COURT', court_id)
+    return court
+
+
+@app.delete('/api/cases/admin/courts/{court_id}')
+def delete_court(court_id: str, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    if 'ADMIN' not in c.get('roles', []):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    court = next((x for x in courts if x['id'] == court_id), None)
+    if not court:
+        err('NOT_FOUND', 'Суд не найден', 404)
+    courts.remove(court)
+    audit(c.get('sub'), 'DELETE_COURT', 'COURT', court_id)
+    return {'ok': True}
+
+
+@app.get('/api/cases/admin/audit')
+def admin_audit(authorization: str | None = Header(None)):
+    c = claims(authorization)
+    if 'ADMIN' not in c.get('roles', []):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    return {'items': audit_log, 'total': len(audit_log)}
+
+
+async def check_service(name: str, url: str | None):
+    if not url:
+        return {'name': name, 'status': 'unknown'}
+    try:
+        async with httpx.AsyncClient(timeout=1.5) as cl:
+            r = await cl.get(url)
+        return {'name': name, 'status': 'ok' if r.status_code < 500 else 'unavailable'}
+    except Exception:
+        return {'name': name, 'status': 'unavailable'}
+
+
+@app.get('/api/cases/admin/system-health')
+async def system_health(authorization: str | None = Header(None)):
+    c = claims(authorization)
+    if 'ADMIN' not in c.get('roles', []):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    auth_url = f'{AUTH.rstrip("/")}/health' if AUTH else None
+    return {'services': [
+        await check_service('auth-service', auth_url),
+        {'name': 'case-service', 'status': 'ok'},
+        await check_service('ner-service', f'{NER}/health'),
+        await check_service('anonymization-service', f'{ANON}/health'),
+    ]}
 
 
 @app.get('/api/cases/me/favorites')
@@ -215,25 +465,63 @@ def case_details(case_id: str, authorization: str | None = Header(None)):
     cs = next((x for x in cases if x['id'] == case_id), None)
     if not cs:
         err('NOT_FOUND', 'Дело не найдено', 404)
-    is_participant = any(p['case_id'] == case_id and p['user_id'] == c['sub'] for p in participants)
-    is_staff_related = c['sub'] in case_staff.get(case_id, set()) or c['sub'] in cs.get('judge_user_ids', []) or cs.get('created_by_user_id') == c['sub']
-    if 'ADMIN' not in c.get('roles', []) and not is_participant and not is_staff_related:
+    if not can_access_case(c, cs):
         err('ACCESS_DENIED', 'Недостаточно прав')
-    return {**cs, 'participants': [p for p in participants if p['case_id'] == case_id], 'documents': [d for d in docs if d['case_id'] == case_id]}
+    return {**cs, 'participants': [p for p in participants if p['case_id'] == case_id], 'documents': [public_doc(d) for d in docs if d['case_id'] == case_id]}
+
 
 @app.post('/api/cases/{case_id}/documents')
 async def upload(case_id: str, body: UploadDoc, authorization: str | None = Header(None)):
     c = claims(authorization)
-    if not allowed(c, ['COURT_STAFF', 'JUDGE', 'COURT_CLERK', 'ADMIN']): err('ACCESS_DENIED', 'Недостаточно прав')
-    d = {'id': str(uuid.uuid4()), 'case_id': case_id, 'title': body.title, 'act_type': body.act_type, 'status': 'PROCESSING'}; docs.append(d)
-    async with httpx.AsyncClient() as cl:
-        r = await cl.post(f'{ANON}/internal/anonymization/process', headers={'X-Internal-Service-Token': INTERNAL}, json={'case_id': case_id, 'document_id': d['id'], 'title': body.title, 'text': body.text, 'metadata': {}})
-    p = r.json(); d['status'] = 'ANONYMIZED'; d['anonymization_job_id'] = p['job_id']; d['public_anonymized_document_id'] = d['id']
-    return {'document_id': d['id'], 'status': d['status'], 'anonymization_job_id': d['anonymization_job_id']}
+    if not allowed(c, ['COURT_STAFF', 'JUDGE', 'COURT_CLERK', 'ADMIN']):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    cs = next((x for x in cases if x['id'] == case_id), None)
+    if not cs:
+        err('NOT_FOUND', 'Дело не найдено', 404)
+    d = {'id': str(uuid.uuid4()), 'case_id': case_id, 'title': body.title, 'act_type': body.act_type, 'status': 'PROCESSING',
+         'document_date': cs.get('document_date'), 'original_text': body.text, 'anonymized_text': body.text, 'mappings': []}
+    docs.append(d)
+    try:
+        async with httpx.AsyncClient() as cl:
+            r = await cl.post(f'{ANON}/internal/anonymization/process', headers={'X-Internal-Service-Token': INTERNAL}, json={'case_id': case_id, 'document_id': d['id'], 'title': body.title, 'text': body.text, 'metadata': {}})
+        p = r.json()
+        d['anonymization_job_id'] = p.get('job_id')
+    except Exception:
+        d['anonymization_job_id'] = None
+    d['status'] = 'ANONYMIZED'
+    d['public_anonymized_document_id'] = d['id']
+    audit(c.get('sub'), 'UPLOAD_DOCUMENT', 'DOCUMENT', d['id'], {'case_id': case_id})
+    return {'document_id': d['id'], 'status': d['status'], 'anonymization_job_id': d.get('anonymization_job_id')}
+
+
+@app.post('/api/cases/documents/{document_id}/publish')
+def publish_document(document_id: str, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    if not allowed(c, ['COURT_STAFF', 'JUDGE', 'ADMIN']):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    d = next((x for x in docs if x['id'] == document_id), None)
+    if not d:
+        err('NOT_FOUND', 'Документ не найден', 404)
+    if d['status'] not in ['ANONYMIZED', 'PUBLISHED']:
+        err('BAD_REQUEST', 'Документ должен быть обезличен перед публикацией', 400)
+    d['status'] = 'PUBLISHED'
+    audit(c.get('sub'), 'PUBLISH_DOCUMENT', 'DOCUMENT', document_id, {'case_id': d['case_id']})
+    return {'document_id': d['id'], 'status': d['status'], 'anonymization_job_id': d.get('anonymization_job_id'), 'case_id': d['case_id']}
+
+
+@app.get('/api/cases/documents/{document_id}/status')
+def document_status(document_id: str, authorization: str | None = Header(None)):
+    d = next((x for x in docs if x['id'] == document_id), None)
+    if not d:
+        err('NOT_FOUND', 'Документ не найден', 404)
+    return {'document_id': d['id'], 'status': d['status'], 'anonymization_job_id': d.get('anonymization_job_id'), 'case_id': d['case_id']}
 
 
 @app.get('/api/cases/public/documents/{document_id}')
 async def pub_doc(document_id: str):
+    d = next((x for x in docs if x['id'] == document_id), None)
+    if d and d.get('anonymized_text') is not None:
+        return {'document_id': d['id'], 'title': d['title'], 'text': d['anonymized_text'], 'status': d['status']}
     async with httpx.AsyncClient() as cl:
         r = await cl.get(f'{ANON}/internal/anonymization/documents/{document_id}/public', headers={'X-Internal-Service-Token': INTERNAL})
     return r.json()
@@ -242,12 +530,27 @@ async def pub_doc(document_id: str):
 @app.get('/api/cases/{case_id}/restored')
 async def restored(case_id: str, authorization: str | None = Header(None)):
     c = claims(authorization)
-    if c.get('sub') is None: err('ACCESS_DENIED', 'Недостаточно прав')
-    related = [x for x in participants if x['case_id'] == case_id and x['user_id'] == c['sub']]
-    if not (allowed(c, ['ADMIN', 'COURT_STAFF', 'JUDGE', 'COURT_CLERK']) or related): err('ACCESS_DENIED', 'Недостаточно прав')
+    if c.get('sub') is None:
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    cs = next((x for x in cases if x['id'] == case_id), None)
+    if not cs:
+        err('NOT_FOUND', 'Дело не найдено', 404)
+    if not can_access_case(c, cs):
+        err('ACCESS_DENIED', 'Недостаточно прав')
     ds = [d for d in docs if d['case_id'] == case_id]
     out = []
-    async with httpx.AsyncClient() as cl:
-        for d in ds:
-            rr = await cl.get(f'{ANON}/internal/anonymization/documents/{d["id"]}/restored', headers={'X-Internal-Service-Token': INTERNAL}); out.append({'document_id': d['id'], 'title': d['title'], **rr.json()})
-    return {'case': next(x for x in cases if x['id'] == case_id), 'documents': out}
+    for d in ds:
+        if d.get('original_text') is not None:
+            out.append({
+                'document_id': d['id'],
+                'title': d['title'],
+                'original_text': d.get('original_text', ''),
+                'anonymized_text': d.get('anonymized_text', ''),
+                'mappings': d.get('mappings', []),
+            })
+        else:
+            async with httpx.AsyncClient() as cl:
+                rr = await cl.get(f'{ANON}/internal/anonymization/documents/{d["id"]}/restored', headers={'X-Internal-Service-Token': INTERNAL})
+            out.append({'document_id': d['id'], 'title': d['title'], **rr.json()})
+    audit(c.get('sub'), 'VIEW_RESTORED_CASE', 'CASE', case_id)
+    return {'case': cs, 'documents': out}
