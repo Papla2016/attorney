@@ -14,3 +14,5 @@ export const caseDetails = (caseId: string) => client.get(`/cases/${caseId}`);
 export const uploadDoc = (caseId: string, payload: UploadDocumentRequest) => client.post(`/cases/${caseId}/documents`, payload);
 export const docStatus = (docId: string) => client.get(`/cases/documents/${docId}/status`);
 export const publishDocument = (docId: string) => client.post(`/cases/documents/${docId}/publish`);
+
+export const updateCaseStatus = (caseId: string, status: 'DRAFT' | 'PUBLISHED' | 'ARCHIVED') => client.patch(`/cases/${caseId}/status`, { status });

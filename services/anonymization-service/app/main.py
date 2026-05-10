@@ -27,13 +27,40 @@ def _error(status: int, code: str, message: str):
 
 
 def make_placeholder(entity_type: str, idx: int) -> str:
-    if entity_type.startswith('PERSON_') or entity_type == 'CASE_PARTICIPANT':
+    if entity_type in {'PERSON_FULL_NAME', 'JUDGE', 'CASE_PARTICIPANT', 'COURT_SECRETARY'} or entity_type.startswith('PERSON_'):
         return f'ФИО{idx}'
     mapping = {
-        'ADDRESS': 'АДРЕС', 'PHONE': 'ТЕЛЕФОН', 'EMAIL': 'EMAIL', 'PASSPORT': 'ПАСПОРТ', 'SNILS': 'СНИЛС',
-        'INN': 'ИНН', 'BANK_ACCOUNT': 'СЧЕТ', 'CARD_NUMBER': 'КАРТА', 'ORGANIZATION': 'ОРГАНИЗАЦИЯ',
+        'ADDRESS': 'АДРЕС',
+        'LOCATION': 'МЕСТО',
+        'ORGANIZATION': 'ОРГАНИЗАЦИЯ',
+        'PHONE': 'ТЕЛЕФОН',
+        'EMAIL': 'EMAIL',
+        'PASSPORT': 'ПАСПОРТ',
+        'SNILS': 'СНИЛС',
+        'INN': 'ИНН',
+        'BIRTH_DATE': 'ДАТА',
+        'BANK_ACCOUNT': 'СЧЕТ',
+        'CARD_NUMBER': 'КАРТА',
     }
-    return f"{mapping.get(entity_type, 'ПДН')}{idx}"
+    return f"{mapping.get(entity_type, 'ДАННЫЕ')}{idx}"
+
+
+def apply_anonymization(text: str, entities: list[dict]) -> tuple[str, list[dict]]:
+    by_type: dict[str, int] = defaultdict(int)
+    text_to_placeholder: dict[str, str] = {}
+    mappings = []
+    for e in entities:
+        original = e['text']
+        entity_type = e['type']
+        if original not in text_to_placeholder:
+            by_type[entity_type] += 1
+            text_to_placeholder[original] = make_placeholder(entity_type, by_type[entity_type])
+        mappings.append({'placeholder': text_to_placeholder[original], 'original_value': original, 'entity_type': entity_type})
+
+    anonymized = text
+    for e in sorted(entities, key=lambda x: x['start'], reverse=True):
+        anonymized = anonymized[:e['start']] + text_to_placeholder[e['text']] + anonymized[e['end']:]
+    return anonymized, mappings
 
 
 @app.get('/health')
@@ -62,18 +89,7 @@ async def process(body: ProcessRequest, x_internal_service_token: str | None = H
         )
     entities = ner.json().get('entities', [])
 
-    by_type: dict[str, int] = defaultdict(int)
-    text_to_placeholder: dict[str, str] = {}
-    mappings = []
-    for e in entities:
-        if e['text'] not in text_to_placeholder:
-            by_type[e['type']] += 1
-            text_to_placeholder[e['text']] = make_placeholder(e['type'], by_type[e['type']])
-        mappings.append({'placeholder': text_to_placeholder[e['text']], 'original_value': e['text'], 'entity_type': e['type']})
-
-    anonymized = body.text
-    for e in sorted(entities, key=lambda x: x['start'], reverse=True):
-        anonymized = anonymized[:e['start']] + text_to_placeholder[e['text']] + anonymized[e['end']:]
+    anonymized, mappings = apply_anonymization(body.text, entities)
 
     public_docs[body.document_id] = {
         'document_id': body.document_id,

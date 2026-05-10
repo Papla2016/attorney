@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 from abc import ABC, abstractmethod
@@ -6,6 +7,7 @@ from pydantic import BaseModel
 
 app = FastAPI(title='ner-service')
 INTERNAL = os.getenv('INTERNAL_SERVICE_TOKEN', 'internal-secret-token')
+LOGGER = logging.getLogger(__name__)
 
 
 class Entity(BaseModel):
@@ -23,47 +25,187 @@ class ExtractRequest(BaseModel):
 
 
 class BaseNerProvider(ABC):
+    name = 'base'
+
     @abstractmethod
     def extract(self, text: str) -> list[Entity]:
         raise NotImplementedError
 
 
-class RegexRuleNerProvider(BaseNerProvider):
-    def __init__(self) -> None:
-        self.patterns = [
-            ('EMAIL', re.compile(r'[\w\.-]+@[\w\.-]+'), 0.95),
-            ('PHONE', re.compile(r'(?:\+7|8)[\s\-()]?\d{3}[\s\-()]?\d{3}[\s\-()]?\d{2}[\s\-()]?\d{2}'), 0.93),
-            ('SNILS', re.compile(r'\d{3}-\d{3}-\d{3}\s\d{2}'), 0.92),
-            ('INN', re.compile(r'\b\d{10}(?:\d{2})?\b'), 0.88),
-            ('PASSPORT', re.compile(r'\b\d{4}\s?\d{6}\b'), 0.88),
-            ('BIRTH_DATE', re.compile(r'\b\d{2}\.\d{2}\.\d{4}\b'), 0.86),
-            ('PERSON_FULL_NAME', re.compile(r'[А-ЯЁ][а-яё]+\s[А-ЯЁ][а-яё]+\s[А-ЯЁ][а-яё]+'), 0.85),
-            ('ADDRESS', re.compile(r'(?:г\.|город)\s?[А-ЯЁа-яё\-]+,?\s?(?:ул\.|улица)\s?[А-ЯЁа-яё\-]+,?\s?(?:д\.|дом)\s?\d+'), 0.8),
-        ]
-        self.role_based = re.compile(r'(истец|ответчик|с участием|председательствующего судьи|при секретаре)\s+([А-ЯЁ][а-яё]+\s?[А-ЯЁ]\.[А-ЯЁ]\.)', re.IGNORECASE)
+def map_natasha_type(span_type: str) -> str:
+    return {
+        'PER': 'PERSON_FULL_NAME',
+        'LOC': 'LOCATION',
+        'ORG': 'ORGANIZATION',
+    }.get(span_type, span_type)
+
+
+class NatashaNerProvider(BaseNerProvider):
+    name = 'natasha'
+
+    def __init__(self):
+        from natasha import (
+            Segmenter,
+            MorphVocab,
+            NewsEmbedding,
+            NewsMorphTagger,
+            NewsSyntaxParser,
+            NewsNERTagger,
+            Doc,
+        )
+
+        self.doc_cls = Doc
+        self.segmenter = Segmenter()
+        self.morph_vocab = MorphVocab()
+        self.emb = NewsEmbedding()
+        self.morph_tagger = NewsMorphTagger(self.emb)
+        self.syntax_parser = NewsSyntaxParser(self.emb)
+        self.ner_tagger = NewsNERTagger(self.emb)
 
     def extract(self, text: str) -> list[Entity]:
+        doc = self.doc_cls(text)
+        doc.segment(self.segmenter)
+        doc.tag_morph(self.morph_tagger)
+        doc.parse_syntax(self.syntax_parser)
+        doc.tag_ner(self.ner_tagger)
+
         entities: list[Entity] = []
-        for etype, pattern, conf in self.patterns:
-            for m in pattern.finditer(text):
-                entities.append(Entity(type=etype, text=m.group(0), start=m.start(), end=m.end(), confidence=conf, source='regex'))
-        for m in self.role_based.finditer(text):
-            entities.append(Entity(type='CASE_PARTICIPANT', text=m.group(2), start=m.start(2), end=m.end(2), confidence=0.82, source='rule'))
-        entities.sort(key=lambda x: (x.start, -(x.end - x.start)))
+        for span in doc.spans:
+            span.normalize(self.morph_vocab)
+            mapped_type = map_natasha_type(span.type)
+            if mapped_type in {'PERSON_FULL_NAME', 'LOCATION', 'ORGANIZATION'}:
+                entities.append(Entity(
+                    type=mapped_type,
+                    text=span.text,
+                    start=span.start,
+                    end=span.stop,
+                    confidence=0.90,
+                    source='natasha',
+                ))
         return entities
 
 
-provider: BaseNerProvider = RegexRuleNerProvider()
+class RegexRuleNerProvider(BaseNerProvider):
+    name = 'regex'
+
+    def __init__(self) -> None:
+        flags = re.IGNORECASE | re.UNICODE
+        fio_full = r'[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+'
+        fio_initials = r'[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\.'
+        fio = rf'(?:{fio_full}|{fio_initials})'
+        self.patterns = [
+            ('EMAIL', re.compile(r'(?<![\w.-])[\w.+-]+@[\w.-]+\.[A-Za-zА-Яа-яЁё]{2,}\b'), 0.95, 'regex'),
+            ('PHONE', re.compile(r'(?<!\d)(?:\+7|8)[\s\-()]?\d{3}[\s\-()]?\d{3}[\s\-()]?\d{2}[\s\-()]?\d{2}(?!\d)'), 0.93, 'regex'),
+            ('SNILS', re.compile(r'\b\d{3}-\d{3}-\d{3}\s?\d{2}\b'), 0.92, 'regex'),
+            ('INN', re.compile(r'\b\d{10}(?:\d{2})?\b'), 0.88, 'regex'),
+            ('PASSPORT', re.compile(r'\bпаспорт(?:\s+серии)?\s*\d{2}\s?\d{2}(?:\s+номер)?\s*\d{6}\b|\b\d{4}\s?\d{6}\b', flags), 0.88, 'regex'),
+            ('BIRTH_DATE', re.compile(r'\b(?:дата\s+рождения|родивш(?:ийся|аяся))\s*:?[\s\w]*?\d{2}\.\d{2}\.\d{4}\b|\b\d{2}\.\d{2}\.\d{4}\b', flags), 0.86, 'regex'),
+            ('PERSON_FULL_NAME', re.compile(fio), 0.85, 'regex'),
+            ('ORGANIZATION', re.compile(r'\b(?:ООО|АО|ПАО|ЗАО|ОАО|ФГБУ|МВД|УМВД|Прокуратура|судебный\s+участок)\s+[«"А-ЯЁA-Z][^,.;\n]+', flags), 0.82, 'rule'),
+            ('ADDRESS', re.compile(r'\b(?:(?:г\.|город)\s*[А-ЯЁа-яё\- ]+|(?:ул\.|улица)\s*[А-ЯЁа-яё\- ]+|(?:д\.|дом)\s*\d+[А-Яа-я]?)(?:,?\s*(?:(?:ул\.|улица)\s*[А-ЯЁа-яё\- ]+|(?:д\.|дом)\s*\d+[А-Яа-я]?))*', flags), 0.80, 'regex'),
+            ('LOCATION', re.compile(r'\b(?:г\.|город)\s*[А-ЯЁа-яё\- ]+', flags), 0.78, 'regex'),
+        ]
+        role_specs = [
+            ('JUDGE', r'(?:судья|председательствующего\s+судьи|под\s+председательством)'),
+            ('COURT_SECRETARY', r'(?:при\s+секретаре)'),
+            ('CASE_PARTICIPANT', r'(?:истец|ответчик|заявитель|подсудимый|лицо,\s*привлекаемое\s+к\s+административной\s+ответственности|с\s+участием|в\s+отношении)'),
+        ]
+        self.role_patterns = [
+            (etype, re.compile(rf'\b{prefix}\s+(?:[^.\n,;:]*?\s+)?({fio})', flags), 0.87 if etype != 'CASE_PARTICIPANT' else 0.82)
+            for etype, prefix in role_specs
+        ]
+
+    def extract(self, text: str) -> list[Entity]:
+        entities: list[Entity] = []
+        for etype, pattern, conf, source in self.patterns:
+            for m in pattern.finditer(text):
+                value = m.group(0).strip(' ,;')
+                start = m.start() + (len(m.group(0)) - len(m.group(0).lstrip(' ,;')))
+                entities.append(Entity(type=etype, text=value, start=start, end=start + len(value), confidence=conf, source=source))
+        for etype, pattern, conf in self.role_patterns:
+            for m in pattern.finditer(text):
+                entities.append(Entity(type=etype, text=m.group(1), start=m.start(1), end=m.end(1), confidence=conf, source='rule'))
+        return deduplicate_entities(entities)
+
+
+FORMAL_TYPES = {'EMAIL', 'PHONE', 'SNILS', 'INN', 'PASSPORT'}
+NATASHA_TYPES = {'PERSON_FULL_NAME', 'LOCATION', 'ORGANIZATION'}
+
+
+def entity_priority(entity: Entity) -> int:
+    if entity.type in FORMAL_TYPES and entity.source in {'regex', 'rule'}:
+        return 4
+    if entity.type in NATASHA_TYPES and entity.source == 'natasha':
+        return 3
+    if entity.source == 'rule':
+        return 2
+    return 1
+
+
+def overlaps(left: Entity, right: Entity) -> bool:
+    return left.start < right.end and right.start < left.end
+
+
+def choose_entity(current: Entity, candidate: Entity) -> Entity:
+    current_key = (entity_priority(current), current.confidence, current.end - current.start)
+    candidate_key = (entity_priority(candidate), candidate.confidence, candidate.end - candidate.start)
+    return candidate if candidate_key > current_key else current
+
+
+def deduplicate_entities(entities: list[Entity]) -> list[Entity]:
+    selected: list[Entity] = []
+    for entity in sorted(entities, key=lambda x: (x.start, -(x.end - x.start), -x.confidence)):
+        duplicate = next((i for i, existing in enumerate(selected) if existing.start == entity.start and existing.end == entity.end and existing.text == entity.text), None)
+        if duplicate is not None:
+            selected[duplicate] = choose_entity(selected[duplicate], entity)
+            continue
+        overlap_idx = next((i for i, existing in enumerate(selected) if overlaps(existing, entity)), None)
+        if overlap_idx is not None:
+            selected[overlap_idx] = choose_entity(selected[overlap_idx], entity)
+            continue
+        selected.append(entity)
+    return sorted(selected, key=lambda x: (x.start, x.end))
+
+
+class HybridNerProvider(BaseNerProvider):
+    name = 'hybrid'
+
+    def __init__(self, natasha_provider: NatashaNerProvider | None = None, regex_provider: RegexRuleNerProvider | None = None):
+        self.natasha_provider = natasha_provider or NatashaNerProvider()
+        self.regex_provider = regex_provider or RegexRuleNerProvider()
+
+    def extract(self, text: str) -> list[Entity]:
+        return deduplicate_entities(self.natasha_provider.extract(text) + self.regex_provider.extract(text))
+
+
+def build_provider() -> tuple[BaseNerProvider, str]:
+    requested = os.getenv('NER_PROVIDER', 'hybrid').lower()
+    regex_provider = RegexRuleNerProvider()
+    if requested == 'regex':
+        return regex_provider, 'regex'
+    try:
+        if requested == 'natasha':
+            return NatashaNerProvider(), 'natasha'
+        if requested == 'hybrid':
+            return HybridNerProvider(regex_provider=regex_provider), 'hybrid'
+        LOGGER.warning('Unknown NER_PROVIDER=%s, using hybrid', requested)
+        return HybridNerProvider(regex_provider=regex_provider), 'hybrid'
+    except Exception:
+        LOGGER.exception('Failed to initialize Natasha NER provider, falling back to regex provider')
+        return regex_provider, 'regex-fallback'
+
+
+provider, active_provider = build_provider()
 
 
 @app.get('/health')
 def health():
-    return {'status': 'ok'}
+    return {'status': 'ok', 'provider': active_provider}
 
 
 @app.get('/ready')
 def ready():
-    return {'status': 'ready'}
+    return {'status': 'ready', 'provider': active_provider}
 
 
 @app.post('/internal/ner/extract')

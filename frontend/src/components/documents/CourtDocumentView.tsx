@@ -1,42 +1,87 @@
+export type CourtDocumentCaseInfo = {
+  case_number?: string;
+  document_number?: string;
+  court_name?: string;
+  region?: string;
+  document_date?: string;
+  legal_article?: string;
+  judge_names?: string[];
+};
+
 type CourtDocumentViewProps = {
+  title?: string;
+  text?: string;
+  caseInfo?: CourtDocumentCaseInfo;
+  isRestored?: boolean;
   caseData?: any;
   document?: any;
-  text?: string;
   restored?: boolean;
 };
 
-const join = (items?: string[]) => items?.filter(Boolean).join(', ') || '—';
-const firstText = (...values: any[]) => values.find((v) => typeof v === 'string' && v.trim()) || '';
+const firstText = (...values: any[]) => values.find((value) => typeof value === 'string' && value.trim()) || '';
+const list = (value: any) => (Array.isArray(value) ? value.filter(Boolean) : []);
+const join = (items?: string[]) => (items?.filter(Boolean).length ? items.filter(Boolean).join(', ') : '—');
 
-export default function CourtDocumentView({ caseData, document, text, restored }: CourtDocumentViewProps) {
-  const judges = caseData?.judge_names || caseData?.judges || [];
-  const participants = caseData?.participants || [];
-  const documentText = firstText(text, document?.anonymized_text, document?.full_text, document?.text, document?.original_text);
-  const title = document?.title || document?.act_type || 'Судебный акт';
-  const court = caseData?.court_name || caseData?.court || document?.court || 'Суд не указан';
+export default function CourtDocumentView({
+  title,
+  text,
+  caseInfo,
+  isRestored,
+  caseData,
+  document,
+  restored,
+}: CourtDocumentViewProps) {
+  const info: CourtDocumentCaseInfo = {
+    case_number: caseInfo?.case_number || caseData?.case_number || document?.case_number,
+    document_number: caseInfo?.document_number || caseData?.document_number || document?.document_number,
+    court_name: caseInfo?.court_name || caseData?.court_name || caseData?.court || document?.court_name || document?.court,
+    region: caseInfo?.region || caseData?.region || document?.region,
+    document_date: caseInfo?.document_date || caseData?.document_date || document?.document_date || document?.date,
+    legal_article: caseInfo?.legal_article || caseData?.legal_article || caseData?.law_article || document?.legal_article || document?.law_article,
+    judge_names: caseInfo?.judge_names || list(caseData?.judge_names || caseData?.judges || document?.judge_names || document?.judges),
+  };
+  const documentTitle = firstText(title, document?.title, document?.act_type, document?.document_type, 'Судебный документ');
+  const documentText = firstText(
+    text,
+    document?.anonymized_text,
+    document?.text,
+    document?.content,
+    document?.public_text,
+    document?.full_text,
+    document?.original_text,
+  );
+  const showRestoredWarning = Boolean(isRestored || restored);
+  const metaRows = [
+    ['Номер дела', info.case_number],
+    ['Номер документа', info.document_number],
+    ['Дата', info.document_date],
+    ['Суд', info.court_name],
+    ['Регион', info.region],
+    ['Статья закона', info.legal_article],
+    ['Судьи', join(info.judge_names)],
+  ];
 
   return (
-    <article className='court-document'>
-      <header className='court-document-header'>
-        <div className='court-document-material'>Материал № {caseData?.case_number || document?.case_number || '—'}</div>
-        <h2 className='court-document-title'>{String(title).toUpperCase()}</h2>
-        <p>{caseData?.document_date || document?.document_date || 'Дата не указана'}{caseData?.region ? `, ${caseData.region}` : ''}</p>
-        <p>{court}</p>
+    <article className="court-document">
+      {showRestoredWarning && (
+        <div className="status-warning court-document-warning">
+          Внимание: отображаются восстановленные данные. Доступ к просмотру должен фиксироваться в журнале аудита.
+        </div>
+      )}
+      <header className="court-document-header">
+        <h2 className="court-document-title">{documentTitle}</h2>
       </header>
-      <section className='court-document-section'>
-        <p><b>Судья:</b> {join(judges)}</p>
-        <p><b>Статья закона:</b> {caseData?.legal_article || caseData?.law_article || '—'}</p>
-        {participants.length > 0 && <p><b>Участники:</b> {participants.map((p: any) => p.display_name || p.name || p.username || p.role).filter(Boolean).join(', ')}</p>}
-      </section>
-      <section className='court-document-section'>
-        <h3>Установил</h3>
-        <div className='court-document-text'>{documentText || 'Текст документа пока не загружен.'}</div>
-      </section>
-      <section className='court-document-section'>
-        <h3>Постановил</h3>
-        <div className='court-document-text'>{restored ? 'Восстановленный текст приведён выше. Персональные данные отображаются только пользователям с правом доступа.' : 'Обезличенная версия документа доступна для просмотра и публикации в соответствии со статусом обработки.'}</div>
-      </section>
-      <footer className='court-document-signature'>Судья {join(judges)}</footer>
+      <dl className="court-document-meta">
+        {metaRows.map(([label, value]) => (
+          <div key={label}>
+            <dt>{label}</dt>
+            <dd>{value || '—'}</dd>
+          </div>
+        ))}
+      </dl>
+      <div className="court-document-text">
+        {documentText || 'Текст документа отсутствует. Возможно, документ ещё не был обезличен или опубликован.'}
+      </div>
     </article>
   );
 }
