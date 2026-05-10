@@ -189,6 +189,10 @@ class CourtPatch(BaseModel):
     address: str | None = None
 
 
+class CaseStatusPatch(BaseModel):
+    status: str
+
+
 @app.get('/health')
 def health(): return {'status': 'ok'}
 
@@ -226,6 +230,31 @@ def can_access_case(c: dict, cs: dict):
     return user_id in case_staff.get(cs['id'], set()) or user_id in cs.get('judge_user_ids', []) or cs.get('created_by_user_id') == user_id
 
 
+def can_manage_case_status(c: dict, cs: dict):
+    if 'ADMIN' in c.get('roles', []):
+        return True
+    user_id = c.get('sub')
+    if not user_id:
+        return False
+    if 'JUDGE' in c.get('roles', []) and (user_id in case_staff.get(cs['id'], set()) or user_id in cs.get('judge_user_ids', [])):
+        return True
+    if allowed(c, ['COURT_STAFF', 'COURT_CLERK']) and (user_id in case_staff.get(cs['id'], set()) or user_id in cs.get('staff_user_ids', [])):
+        return True
+    return False
+
+
+def document_metadata(cs: dict):
+    return {
+        'case_number': cs.get('case_number'),
+        'document_number': cs.get('document_number'),
+        'court_name': cs.get('court_name'),
+        'region': cs.get('region'),
+        'document_date': cs.get('document_date'),
+        'legal_article': cs.get('legal_article'),
+        'judge_names': cs.get('judge_names', []),
+    }
+
+
 def public_doc(d: dict):
     return {
         'id': d['id'],
@@ -248,7 +277,7 @@ def pub_docs(
         if d['status'] != 'PUBLISHED':
             continue
         cs = next((x for x in cases if x['id'] == d['case_id']), None)
-        if not cs:
+        if not cs or cs.get('status') != 'PUBLISHED':
             continue
         if q and q.lower() not in (cs['case_number'] + ' ' + d['title']).lower():
             continue
@@ -457,6 +486,24 @@ def del_fav(document_id: str, authorization: str | None = Header(None)):
     return {'ok': True}
 
 
+@app.patch('/api/cases/{case_id}/status')
+def update_case_status(case_id: str, body: CaseStatusPatch, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    if not allowed(c, ['ADMIN', 'JUDGE', 'COURT_STAFF', 'COURT_CLERK']):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    if body.status not in {'DRAFT', 'PUBLISHED', 'ARCHIVED'}:
+        err('BAD_REQUEST', 'Недопустимый статус дела', 400, {'allowed': ['DRAFT', 'PUBLISHED', 'ARCHIVED']})
+    cs = next((x for x in cases if x['id'] == case_id), None)
+    if not cs:
+        err('NOT_FOUND', 'Дело не найдено', 404)
+    if not can_manage_case_status(c, cs):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    old_status = cs.get('status')
+    cs['status'] = body.status
+    audit(c.get('sub'), 'UPDATE_CASE_STATUS', 'CASE', case_id, {'old_status': old_status, 'new_status': body.status})
+    return cs
+
+
 @app.get('/api/cases/{case_id}')
 def case_details(case_id: str, authorization: str | None = Header(None)):
     c = claims(authorization)
@@ -497,16 +544,25 @@ async def upload(case_id: str, body: UploadDoc, authorization: str | None = Head
 @app.post('/api/cases/documents/{document_id}/publish')
 def publish_document(document_id: str, authorization: str | None = Header(None)):
     c = claims(authorization)
-    if not allowed(c, ['COURT_STAFF', 'JUDGE', 'ADMIN']):
+    if not allowed(c, ['COURT_STAFF', 'JUDGE', 'COURT_CLERK', 'ADMIN']):
         err('ACCESS_DENIED', 'Недостаточно прав')
     d = next((x for x in docs if x['id'] == document_id), None)
     if not d:
         err('NOT_FOUND', 'Документ не найден', 404)
+    cs = next((x for x in cases if x['id'] == d['case_id']), None)
+    if not cs:
+        err('NOT_FOUND', 'Дело не найдено', 404)
+    if not can_manage_case_status(c, cs):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    if not (d.get('anonymized_text') or d.get('public_anonymized_document_id')):
+        err('DOCUMENT_TEXT_NOT_READY', 'Текст документа ещё не готов или не опубликован', 409)
     if d['status'] not in ['ANONYMIZED', 'PUBLISHED']:
         err('BAD_REQUEST', 'Документ должен быть обезличен перед публикацией', 400)
     d['status'] = 'PUBLISHED'
+    if any(doc['case_id'] == cs['id'] and doc['status'] == 'PUBLISHED' for doc in docs):
+        cs['status'] = 'PUBLISHED'
     audit(c.get('sub'), 'PUBLISH_DOCUMENT', 'DOCUMENT', document_id, {'case_id': d['case_id']})
-    return {'document_id': d['id'], 'status': d['status'], 'anonymization_job_id': d.get('anonymization_job_id'), 'case_id': d['case_id']}
+    return {'ok': True, 'document_id': d['id'], 'document_status': d['status'], 'case_id': d['case_id'], 'case_status': cs['status']}
 
 
 @app.get('/api/cases/documents/{document_id}/status')
@@ -520,11 +576,32 @@ def document_status(document_id: str, authorization: str | None = Header(None)):
 @app.get('/api/cases/public/documents/{document_id}')
 async def pub_doc(document_id: str):
     d = next((x for x in docs if x['id'] == document_id), None)
-    if d and d.get('anonymized_text') is not None:
-        return {'document_id': d['id'], 'title': d['title'], 'text': d['anonymized_text'], 'status': d['status']}
-    async with httpx.AsyncClient() as cl:
-        r = await cl.get(f'{ANON}/internal/anonymization/documents/{document_id}/public', headers={'X-Internal-Service-Token': INTERNAL})
-    return r.json()
+    if not d or d.get('status') != 'PUBLISHED':
+        err('NOT_FOUND', 'Документ не найден', 404)
+    cs = next((x for x in cases if x['id'] == d['case_id']), None)
+    if not cs or cs.get('status') != 'PUBLISHED':
+        err('NOT_FOUND', 'Документ не найден', 404)
+
+    anonymized_text = d.get('anonymized_text') or ''
+    if not anonymized_text.strip() and d.get('public_anonymized_document_id'):
+        async with httpx.AsyncClient() as cl:
+            r = await cl.get(
+                f'{ANON}/internal/anonymization/documents/{d["public_anonymized_document_id"]}/public',
+                headers={'X-Internal-Service-Token': INTERNAL},
+            )
+        if r.status_code < 400:
+            anonymized_text = r.json().get('anonymized_text') or ''
+
+    if not anonymized_text.strip():
+        err('DOCUMENT_TEXT_NOT_READY', 'Текст документа ещё не готов или не опубликован', 409)
+
+    return {
+        'document_id': d['id'],
+        'case_id': cs['id'],
+        'title': d['title'],
+        'anonymized_text': anonymized_text,
+        'metadata': document_metadata(cs),
+    }
 
 
 @app.get('/api/cases/{case_id}/restored')
