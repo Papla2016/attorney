@@ -193,6 +193,47 @@ class CaseStatusPatch(BaseModel):
     status: str
 
 
+class ParticipantPatch(BaseModel):
+    user_id: str | None = None
+    role: str | None = None
+    display_name: str | None = None
+
+
+class CasePatch(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+
+    court_id: str | None = None
+    court_name: str | None = None
+    case_number: str | None = None
+    document_number: str | None = None
+    document_date: str | None = None
+    instance: str | None = None
+    region: str | None = None
+    legal_article: str | None = None
+    judicial_practice: str | None = None
+    judge_names: list[str] | str | None = None
+    participant_user_ids: list[str] | None = None
+    participants: list[ParticipantPatch] | None = None
+    judge_user_ids: list[str] | None = None
+    staff_user_ids: list[str] | None = None
+
+
+class MappingIn(BaseModel):
+    original_value: str
+    placeholder: str | None = None
+    entity_type: str
+    mode: str = 'new'
+
+
+class ReanonymizeIn(BaseModel):
+    mappings: list[dict] = []
+
+
+class SaveAnonymizationIn(BaseModel):
+    anonymized_text: str
+    mappings: list[dict] = []
+
+
 @app.get('/health')
 def health(): return {'status': 'ok'}
 
@@ -241,6 +282,44 @@ def can_manage_case_status(c: dict, cs: dict):
     if allowed(c, ['COURT_STAFF', 'COURT_CLERK']) and (user_id in case_staff.get(cs['id'], set()) or user_id in cs.get('staff_user_ids', [])):
         return True
     return False
+
+
+def can_manage_case(c: dict, cs: dict):
+    if 'ADMIN' in c.get('roles', []):
+        return True
+    user_id = c.get('sub')
+    if not user_id:
+        return False
+    if 'JUDGE' in c.get('roles', []) and (user_id in cs.get('judge_user_ids', []) or user_id in case_staff.get(cs['id'], set())):
+        return True
+    if allowed(c, ['COURT_STAFF', 'COURT_CLERK']) and (
+        user_id in cs.get('staff_user_ids', []) or user_id in case_staff.get(cs['id'], set()) or cs.get('created_by_user_id') == user_id
+    ):
+        return True
+    return False
+
+
+def case_card(cs: dict):
+    return {**cs, 'participants': [p for p in participants if p['case_id'] == cs['id']], 'documents': [public_doc(d) for d in docs if d['case_id'] == cs['id']]}
+
+
+def find_document_and_case(document_id: str):
+    d = next((x for x in docs if x['id'] == document_id), None)
+    if not d:
+        err('NOT_FOUND', 'Документ не найден', 404)
+    cs = next((x for x in cases if x['id'] == d['case_id']), None)
+    if not cs:
+        err('NOT_FOUND', 'Дело не найдено', 404)
+    return d, cs
+
+
+def sync_doc_from_anonymization(d: dict, payload: dict):
+    if 'anonymized_text' in payload:
+        d['anonymized_text'] = payload.get('anonymized_text') or ''
+    if 'mappings' in payload:
+        d['mappings'] = payload.get('mappings') or []
+    if 'original_text' in payload:
+        d['original_text'] = payload.get('original_text') or d.get('original_text', '')
 
 
 def document_metadata(cs: dict):
@@ -504,6 +583,49 @@ def update_case_status(case_id: str, body: CaseStatusPatch, authorization: str |
     return cs
 
 
+
+@app.patch('/api/cases/{case_id}')
+def update_case(case_id: str, body: CasePatch, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    if not allowed(c, ['ADMIN', 'JUDGE', 'COURT_STAFF', 'COURT_CLERK']):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    cs = next((x for x in cases if x['id'] == case_id), None)
+    if not cs:
+        err('NOT_FOUND', 'Дело не найдено', 404)
+    if not can_manage_case(c, cs):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+
+    data = body.model_dump(exclude_unset=True)
+    changed = {}
+    for field in ['court_id', 'court_name', 'case_number', 'document_number', 'document_date', 'instance', 'region', 'legal_article', 'judicial_practice', 'judge_user_ids', 'staff_user_ids']:
+        if field in data:
+            changed[field] = {'old': cs.get(field), 'new': data[field]}
+            cs[field] = data[field]
+    if 'court_id' in data and 'court_name' not in data:
+        cs['court_name'] = next((x['name'] for x in courts if x['id'] == data['court_id']), cs.get('court_name', ''))
+    if 'judge_names' in data:
+        new_judges = split_judges(data['judge_names'])
+        changed['judge_names'] = {'old': cs.get('judge_names', []), 'new': new_judges}
+        cs['judge_names'] = new_judges
+    if 'staff_user_ids' in data:
+        case_staff[case_id] = set(data['staff_user_ids'] or [])
+    if 'participants' in data:
+        participants[:] = [p for p in participants if p['case_id'] != case_id]
+        for p in data['participants'] or []:
+            item = p if isinstance(p, dict) else p.model_dump(exclude_none=True)
+            if item.get('user_id'):
+                participants.append({'case_id': case_id, 'user_id': item['user_id'], 'role': item.get('role', ''), 'display_name': item.get('display_name', '')})
+        changed['participants'] = {'updated': True}
+    elif 'participant_user_ids' in data:
+        existing = {p['user_id'] for p in participants if p['case_id'] == case_id}
+        for user_id in data['participant_user_ids'] or []:
+            if user_id not in existing:
+                participants.append({'case_id': case_id, 'user_id': user_id, 'role': '', 'display_name': ''})
+        changed['participant_user_ids'] = {'new': data['participant_user_ids']}
+    audit(c.get('sub'), 'UPDATE_CASE', 'CASE', case_id, changed)
+    return case_card(cs)
+
+
 @app.get('/api/cases/{case_id}')
 def case_details(case_id: str, authorization: str | None = Header(None)):
     c = claims(authorization)
@@ -514,7 +636,7 @@ def case_details(case_id: str, authorization: str | None = Header(None)):
         err('NOT_FOUND', 'Дело не найдено', 404)
     if not can_access_case(c, cs):
         err('ACCESS_DENIED', 'Недостаточно прав')
-    return {**cs, 'participants': [p for p in participants if p['case_id'] == case_id], 'documents': [public_doc(d) for d in docs if d['case_id'] == case_id]}
+    return case_card(cs)
 
 
 @app.post('/api/cases/{case_id}/documents')
@@ -533,12 +655,106 @@ async def upload(case_id: str, body: UploadDoc, authorization: str | None = Head
             r = await cl.post(f'{ANON}/internal/anonymization/process', headers={'X-Internal-Service-Token': INTERNAL}, json={'case_id': case_id, 'document_id': d['id'], 'title': body.title, 'text': body.text, 'metadata': {}})
         p = r.json()
         d['anonymization_job_id'] = p.get('job_id')
+        d['anonymized_text'] = p.get('anonymized_text') or d['anonymized_text']
+        d['mappings'] = p.get('mappings') or []
     except Exception:
         d['anonymization_job_id'] = None
     d['status'] = 'ANONYMIZED'
     d['public_anonymized_document_id'] = d['id']
     audit(c.get('sub'), 'UPLOAD_DOCUMENT', 'DOCUMENT', d['id'], {'case_id': case_id})
-    return {'document_id': d['id'], 'status': d['status'], 'anonymization_job_id': d.get('anonymization_job_id')}
+    return {'document_id': d['id'], 'case_id': case_id, 'title': d['title'], 'status': d['status'], 'anonymization_job_id': d.get('anonymization_job_id'), 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
+
+
+
+@app.delete('/api/cases/{case_id}/documents/{document_id}')
+async def delete_document(case_id: str, document_id: str, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    if not allowed(c, ['ADMIN', 'JUDGE', 'COURT_STAFF', 'COURT_CLERK']):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    cs = next((x for x in cases if x['id'] == case_id), None)
+    if not cs:
+        err('NOT_FOUND', 'Дело не найдено', 404)
+    if not can_manage_case(c, cs):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    d = next((x for x in docs if x['id'] == document_id and x['case_id'] == case_id), None)
+    if not d:
+        err('NOT_FOUND', 'Документ не найден', 404)
+    details = {'case_id': case_id, 'title': d.get('title')}
+    docs.remove(d)
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as cl:
+            r = await cl.delete(f'{ANON}/internal/anonymization/documents/{document_id}', headers={'X-Internal-Service-Token': INTERNAL})
+        if r.status_code >= 400:
+            details['internal_delete'] = 'unavailable'
+            details['internal_status_code'] = r.status_code
+    except Exception as exc:
+        details['internal_delete'] = 'unavailable'
+        details['internal_error'] = str(exc)
+    audit(c.get('sub'), 'DELETE_DOCUMENT', 'DOCUMENT', document_id, details)
+    return {'ok': True}
+
+
+@app.get('/api/cases/documents/{document_id}/anonymization')
+async def get_document_anonymization(document_id: str, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    d, cs = find_document_and_case(document_id)
+    if not can_manage_case(c, cs):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as cl:
+            r = await cl.get(f'{ANON}/internal/anonymization/documents/{document_id}', headers={'X-Internal-Service-Token': INTERNAL})
+        if r.status_code < 400:
+            sync_doc_from_anonymization(d, r.json())
+    except Exception:
+        pass
+    return {'document_id': d['id'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
+
+
+@app.post('/api/cases/documents/{document_id}/mappings')
+async def add_document_mapping(document_id: str, body: MappingIn, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    d, cs = find_document_and_case(document_id)
+    if not can_manage_case(c, cs):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    async with httpx.AsyncClient(timeout=10.0) as cl:
+        r = await cl.post(f'{ANON}/internal/anonymization/documents/{document_id}/mappings', headers={'X-Internal-Service-Token': INTERNAL}, json=body.model_dump(exclude_none=True))
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.json())
+    payload = r.json()
+    sync_doc_from_anonymization(d, payload)
+    audit(c.get('sub'), 'ADD_MANUAL_MAPPING', 'DOCUMENT', document_id, {'case_id': d['case_id'], 'original_value': body.original_value, 'placeholder': body.placeholder, 'mode': body.mode})
+    return {'document_id': d['id'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
+
+
+@app.post('/api/cases/documents/{document_id}/reanonymize')
+async def reanonymize_document(document_id: str, body: ReanonymizeIn, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    d, cs = find_document_and_case(document_id)
+    if not can_manage_case(c, cs):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    async with httpx.AsyncClient(timeout=20.0) as cl:
+        r = await cl.post(f'{ANON}/internal/anonymization/documents/{document_id}/reanonymize', headers={'X-Internal-Service-Token': INTERNAL}, json=body.model_dump())
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.json())
+    payload = r.json()
+    sync_doc_from_anonymization(d, payload)
+    d['status'] = 'ANONYMIZED'
+    audit(c.get('sub'), 'REANONYMIZE_DOCUMENT', 'DOCUMENT', document_id, {'case_id': d['case_id']})
+    return {'document_id': d['id'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
+
+
+@app.post('/api/cases/documents/{document_id}/save-anonymization')
+def save_anonymization(document_id: str, body: SaveAnonymizationIn, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    d, cs = find_document_and_case(document_id)
+    if not can_manage_case(c, cs):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    d['anonymized_text'] = body.anonymized_text
+    d['mappings'] = body.mappings
+    if d.get('status') == 'PROCESSING':
+        d['status'] = 'ANONYMIZED'
+    audit(c.get('sub'), 'SAVE_ANONYMIZATION', 'DOCUMENT', document_id, {'case_id': d['case_id']})
+    return d
 
 
 @app.post('/api/cases/documents/{document_id}/publish')
@@ -554,8 +770,8 @@ def publish_document(document_id: str, authorization: str | None = Header(None))
         err('NOT_FOUND', 'Дело не найдено', 404)
     if not can_manage_case_status(c, cs):
         err('ACCESS_DENIED', 'Недостаточно прав')
-    if not (d.get('anonymized_text') or d.get('public_anonymized_document_id')):
-        err('DOCUMENT_TEXT_NOT_READY', 'Текст документа ещё не готов или не опубликован', 409)
+    if not (d.get('anonymized_text') or '').strip():
+        err('DOCUMENT_TEXT_NOT_READY', 'Текст документа ещё не готов', 409)
     if d['status'] not in ['ANONYMIZED', 'PUBLISHED']:
         err('BAD_REQUEST', 'Документ должен быть обезличен перед публикацией', 400)
     d['status'] = 'PUBLISHED'

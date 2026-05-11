@@ -22,11 +22,12 @@ SEED_IDS = {
     "judge": "00000000-0000-0000-0000-000000000004",
 }
 SEED_ROLES = {
-    "admin": ["ADMIN"],
-    "user": ["REGISTERED_USER"],
-    "staff": ["COURT_STAFF"],
-    "judge": ["JUDGE"],
+    "admin": "ADMIN",
+    "user": "REGISTERED_USER",
+    "staff": "COURT_STAFF",
+    "judge": "JUDGE",
 }
+VALID_ROLES = {"REGISTERED_USER", "COURT_STAFF", "JUDGE", "COURT_CLERK", "ADMIN"}
 
 
 def error_payload(code: str, message: str, details: dict | None = None):
@@ -80,7 +81,7 @@ for username, password, email in [
         "username": username,
         "email": email,
         "password_hash": pwd.hash(password),
-        "roles": SEED_ROLES[username],
+        "role": SEED_ROLES[username],
     }
 
 
@@ -110,11 +111,32 @@ class ChangePasswordIn(BaseModel):
     new_password: str
 
 
+
+def user_out(u: dict):
+    return {"id": u["id"], "username": u["username"], "email": u.get("email"), "role": u["role"], "roles": [u["role"]]}
+
+
+def role_from_payload(data: RolesIn) -> str:
+    if data.roles is not None and len(data.roles) > 1:
+        error(400, "ONLY_ONE_ROLE_ALLOWED", "У пользователя может быть только одна роль")
+    if data.role is not None:
+        role = data.role
+    elif data.roles is not None:
+        if len(data.roles) == 0:
+            error(400, "BAD_REQUEST", "role is required")
+        role = data.roles[0]
+    else:
+        error(400, "BAD_REQUEST", "role is required")
+    if role not in VALID_ROLES:
+        error(400, "BAD_REQUEST", "Недопустимая роль", {"allowed": sorted(VALID_ROLES)})
+    return role
+
 def make_token(u: dict):
     payload = {
         "sub": u["id"],
         "username": u["username"],
-        "roles": u["roles"],
+        "role": u["role"],
+        "roles": [u["role"]],
         "exp": datetime.now(timezone.utc) + timedelta(minutes=60),
     }
     return jwt.encode(payload, SECRET, algorithm=ALG)
@@ -148,8 +170,8 @@ def register(data: RegisterIn):
     if data.username in users:
         error(400, "USERNAME_ALREADY_EXISTS", "username already exists")
     uid = str(uuid.uuid4())
-    users[data.username] = {"id": uid, "username": data.username, "email": data.email, "password_hash": pwd.hash(data.password), "roles": ["REGISTERED_USER"]}
-    return {"id": uid, "username": data.username, "email": data.email}
+    users[data.username] = {"id": uid, "username": data.username, "email": data.email, "password_hash": pwd.hash(data.password), "role": "REGISTERED_USER"}
+    return {"id": uid, "username": data.username, "email": data.email, "role": "REGISTERED_USER", "roles": ["REGISTERED_USER"]}
 
 
 @app.post('/api/auth/login')
@@ -157,7 +179,7 @@ def login(data: LoginIn):
     u = users.get(data.username)
     if not u or not pwd.verify(data.password, u['password_hash']):
         error(401, "UNAUTHORIZED", "bad creds")
-    return {"access_token": make_token(u), "token_type": "bearer", "user": {"id": u['id'], "username": u['username'], "roles": u['roles']}}
+    return {"access_token": make_token(u), "token_type": "bearer", "user": user_out(u)}
 
 
 @app.get('/api/auth/me')
@@ -165,7 +187,7 @@ def me(claims=Depends(get_current)):
     u = get_user_by_id(claims["sub"])
     if not u:
         error(404, "NOT_FOUND", "user not found")
-    return {"id": u['id'], "username": u['username'], "email": u['email'], "roles": u['roles']}
+    return user_out(u)
 
 
 @app.patch('/api/auth/me')
@@ -183,7 +205,7 @@ def update_me(data: UpdateMeIn, claims=Depends(get_current)):
             users[user["username"]] = user
     if data.email is not None:
         user["email"] = data.email
-    return {"user": {"id": user['id'], "username": user['username'], "email": user['email'], "roles": user['roles']}, "access_token": make_token(user)}
+    return {"user": user_out(user), "access_token": make_token(user)}
 
 
 @app.post('/api/auth/me/change-password')
@@ -203,7 +225,7 @@ def change_password(data: ChangePasswordIn, claims=Depends(get_current)):
 def list_users(claims=Depends(get_current)):
     if 'ADMIN' not in claims.get('roles', []):
         error(403, "ACCESS_DENIED", "Недостаточно прав")
-    return [{"id": u['id'], "username": u['username'], "email": u['email'], "roles": u['roles']} for u in users.values()]
+    return [user_out(u) for u in users.values()]
 
 
 @app.get('/api/auth/users/{user_id}')
@@ -213,7 +235,7 @@ def get_user(user_id: str, x_internal_service_token: str | None = Header(None), 
     u = get_user_by_id(user_id)
     if not u:
         error(404, "NOT_FOUND", "user not found")
-    return {"id": u['id'], "username": u['username'], "email": u['email'], "roles": u['roles']}
+    return user_out(u)
 
 
 @app.post('/api/auth/users/{user_id}/roles')
@@ -223,13 +245,11 @@ def set_roles(user_id: str, data: RolesIn, claims=Depends(get_current)):
     u = get_user_by_id(user_id)
     if not u:
         error(404, "NOT_FOUND", "user not found")
-    next_roles = data.roles if data.roles is not None else ([data.role] if data.role else None)
-    if not next_roles:
-        error(400, "BAD_REQUEST", "roles is required")
-    previous_roles = u['roles'].copy()
-    u['roles'] = next_roles
-    audit(claims.get("sub"), "UPDATE_USER_ROLES", "USER", u["id"], {"previous_roles": previous_roles, "roles": next_roles})
-    return {"id": u['id'], "username": u['username'], "email": u['email'], "roles": u['roles']}
+    next_role = role_from_payload(data)
+    previous_role = u['role']
+    u['role'] = next_role
+    audit(claims.get("sub"), "UPDATE_USER_ROLE", "USER", u["id"], {"previous_role": previous_role, "new_role": next_role})
+    return user_out(u)
 
 
 @app.get('/api/auth/admin/audit')
