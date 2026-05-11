@@ -16,6 +16,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => { refresh(); }, []);
   const login = async (username:string, password:string) => { const r = await authApi.login(username,password); localStorage.setItem('access_token', r.data.access_token); await refresh(); };
   const logout = () => { localStorage.removeItem('access_token'); setUser(null); };
-  const value = useMemo(() => ({ user, roles: user?.roles || [], isAuthenticated: !!user, isLoading, login, logout, refresh }), [user, isLoading]);
+  const value = useMemo(() => ({ user, roles: user?.role ? [user.role] : (user?.roles || []), isAuthenticated: !!user, isLoading, login, logout, refresh }), [user, isLoading]);
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
