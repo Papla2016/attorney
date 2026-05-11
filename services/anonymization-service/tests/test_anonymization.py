@@ -27,3 +27,90 @@ def test_person_and_passport_anonymization_reuses_placeholders():
 
     assert anonymized == 'ФИО1 предъявил ПАСПОРТ1. ФИО1 подписал протокол.'
     assert [m['placeholder'] for m in mappings] == ['ФИО1', 'ПАСПОРТ1', 'ФИО1']
+
+
+def test_manual_mapping_replaces_text_on_reanonymize():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    main.restored_docs['manual-doc'] = {
+        'document_id': 'manual-doc',
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': 'Иванов И.И. подписал документ. Иванов И.И. пришел.',
+        'anonymized_text': 'Иванов И.И. подписал документ. Иванов И.И. пришел.',
+        'mappings': [],
+    }
+
+    add = client.post(
+        '/internal/anonymization/documents/manual-doc/mappings',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'original_value': 'Иванов И.И.', 'entity_type': 'PERSON_FULL_NAME', 'mode': 'new'},
+    )
+    reanon = client.post(
+        '/internal/anonymization/documents/manual-doc/reanonymize',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'mappings': add.json()['mappings']},
+    )
+
+    assert add.status_code == 200
+    assert add.json()['mappings'][0]['placeholder'] == 'ФИО1'
+    assert reanon.status_code == 200
+    assert reanon.json()['anonymized_text'] == 'ФИО1 подписал документ. ФИО1 пришел.'
+
+
+def test_existing_placeholder_is_reused_for_new_value():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    main.restored_docs['existing-doc'] = {
+        'document_id': 'existing-doc',
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': 'Иванов Иван Иванович и Иванова Ивану Ивановичу',
+        'anonymized_text': 'ФИО1 и Иванова Ивану Ивановичу',
+        'mappings': [{'placeholder': 'ФИО1', 'original_value': 'Иванов Иван Иванович', 'entity_type': 'PERSON_FULL_NAME', 'source': 'ner'}],
+    }
+
+    add = client.post(
+        '/internal/anonymization/documents/existing-doc/mappings',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'original_value': 'Иванова Ивану Ивановичу', 'placeholder': 'ФИО1', 'entity_type': 'PERSON_FULL_NAME', 'mode': 'existing'},
+    )
+    reanon = client.post(
+        '/internal/anonymization/documents/existing-doc/reanonymize',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'mappings': add.json()['mappings']},
+    )
+
+    assert add.status_code == 200
+    assert any(m['original_value'] == 'Иванова Ивану Ивановичу' and m['placeholder'] == 'ФИО1' for m in add.json()['mappings'])
+    assert reanon.json()['anonymized_text'] == 'ФИО1 и ФИО1'
+
+
+def test_duplicate_values_keep_single_placeholder():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    main.restored_docs['duplicate-doc'] = {
+        'document_id': 'duplicate-doc',
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': 'Петров П.П. Петров П.П.',
+        'anonymized_text': 'Петров П.П. Петров П.П.',
+        'mappings': [],
+    }
+    payload = {'original_value': 'Петров П.П.', 'entity_type': 'PERSON_FULL_NAME', 'mode': 'new'}
+
+    first = client.post('/internal/anonymization/documents/duplicate-doc/mappings', headers={'X-Internal-Service-Token': main.INTERNAL}, json=payload)
+    second = client.post('/internal/anonymization/documents/duplicate-doc/mappings', headers={'X-Internal-Service-Token': main.INTERNAL}, json=payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert len([m for m in second.json()['mappings'] if m['original_value'] == 'Петров П.П.']) == 1
