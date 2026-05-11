@@ -7,4 +7,4 @@ export const me = async (): Promise<User> => (await client.get('/auth/me')).data
 export const updateMe = (payload: { username?: string; email?: string }) => client.patch('/auth/me', payload);
 export const changePassword = (payload: { current_password: string; new_password: string }) => client.post('/auth/me/change-password', payload);
 export const listUsers = async (): Promise<User[]> => (await client.get('/auth/users')).data;
-export const assignRoles = (userId: string, roles: string[]) => client.post(`/auth/users/${userId}/roles`, { roles });
+export const assignRoles = (userId: string, role: string) => client.post(`/auth/users/${userId}/roles`, { role, roles: [role] });

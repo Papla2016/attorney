@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import AppLayout from '../../components/layout/AppLayout';
 import { createCourt, deleteCourt, getCourts, updateCourt, type CourtPayload } from '../../api/adminApi';
 import ServerState from '../../components/ui/ServerState';
+import { RUSSIAN_REGIONS } from '../../constants/regions';
 
 const COURT_TYPES = [
   ['MAGISTRATE_COURT', 'Мировой судья'],
@@ -58,7 +59,7 @@ export default function CourtsAdminPage() {
           <form onSubmit={onSubmit}>
             <label>Название суда</label><input value={form.name} onChange={(e) => setField('name', e.target.value)} required />
             <label>Тип суда</label><select value={form.court_type} onChange={(e) => setField('court_type', e.target.value)}>{COURT_TYPES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
-            <label>Регион</label><input value={form.region} onChange={(e) => setField('region', e.target.value)} required />
+            <label>Регион</label><select name='region' value={form.region} onChange={(e) => setField('region', e.target.value)} required><option value=''>Выберите регион</option>{RUSSIAN_REGIONS.map((region) => <option key={region} value={region}>{region}</option>)}</select>
             <label>Адрес</label><input value={form.address} onChange={(e) => setField('address', e.target.value)} />
             <div className='form-row'><button className='button'>{editingId ? 'Сохранить изменения' : 'Добавить суд'}</button>{editingId && <button type='button' className='button button-secondary' onClick={resetForm}>Отмена</button>}</div>
           </form>

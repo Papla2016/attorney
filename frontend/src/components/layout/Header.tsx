@@ -27,7 +27,7 @@ export default function Header() {
               <span className="user-name">{user?.username}</span>
               <Link to="/account">Аккаунт</Link>
               <Link to="/favorites">Избранное</Link>
-              <Link to="/my-cases">Мои дела</Link>
+              <Link to={isStaff(roles) ? "/staff/cases" : "/my-cases"}>Мои дела</Link>
               {isStaff(roles) && <Link to="/staff">Панель работника суда</Link>}
               {isAdmin(roles) && <Link to="/admin">Админка</Link>}
               <button className="button button-secondary" type="button" onClick={onLogout}>Выйти</button>
