@@ -114,3 +114,63 @@ def test_duplicate_values_keep_single_placeholder():
     assert first.status_code == 200
     assert second.status_code == 200
     assert len([m for m in second.json()['mappings'] if m['original_value'] == 'Петров П.П.']) == 1
+
+
+def test_patch_delete_merge_and_reanonymize_mappings():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'edit-merge-doc'
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': 'Иванов Иван Иванович, Иванова Ивана Ивановича и Иванову Ивану Ивановичу',
+        'anonymized_text': 'ФИО1, ФИО2 и ФИО3',
+        'mappings': [
+            {'placeholder': 'ФИО1', 'original_value': 'Иванов Иван Иванович', 'entity_type': 'PERSON_FULL_NAME', 'source': 'natasha'},
+            {'placeholder': 'ФИО2', 'original_value': 'Иванова Ивана Ивановича', 'entity_type': 'PERSON_FULL_NAME', 'source': 'natasha'},
+            {'placeholder': 'ФИО3', 'original_value': 'Иванову Ивану Ивановичу', 'entity_type': 'PERSON_FULL_NAME', 'source': 'natasha'},
+        ],
+    }
+
+    fetched = client.get(f'/internal/anonymization/documents/{doc_id}', headers={'X-Internal-Service-Token': main.INTERNAL})
+    assert fetched.status_code == 200
+    mappings = fetched.json()['mappings']
+    assert all(m.get('id') and m.get('created_at') and m.get('updated_at') for m in mappings)
+
+    target_id = mappings[0]['id']
+    source_id = mappings[1]['id']
+    third_id = mappings[2]['id']
+    patched = client.patch(
+        f'/internal/anonymization/documents/{doc_id}/mappings/{source_id}',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'original_value': 'Иванова Ивана Ивановича'},
+    )
+    assert patched.status_code == 200
+    assert next(m for m in patched.json()['mappings'] if m['id'] == source_id)['source'] == 'manual'
+
+    merged = client.post(
+        f'/internal/anonymization/documents/{doc_id}/mappings/merge',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'target_mapping_id': target_id, 'source_mapping_ids': [source_id, third_id]},
+    )
+    assert merged.status_code == 200
+    assert {m['placeholder'] for m in merged.json()['mappings']} == {'ФИО1'}
+
+    reanon = client.post(
+        f'/internal/anonymization/documents/{doc_id}/reanonymize',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'mappings': merged.json()['mappings']},
+    )
+    assert reanon.status_code == 200
+    assert reanon.json()['anonymized_text'] == 'ФИО1, ФИО1 и ФИО1'
+
+    deleted = client.delete(
+        f'/internal/anonymization/documents/{doc_id}/mappings/{third_id}',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+    )
+    assert deleted.status_code == 200
+    assert all(m['id'] != third_id for m in deleted.json()['mappings'])

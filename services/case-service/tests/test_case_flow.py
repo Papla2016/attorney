@@ -235,3 +235,108 @@ def test_upload_document_returns_anonymized_text_and_mappings(monkeypatch):
     assert payload['anonymized_text'] == 'ФИО1 подал заявление'
     assert payload['mappings'][0]['original_value'] == 'Иванов И.И.'
     main.docs[:] = [d for d in main.docs if d['id'] != payload['document_id']]
+
+
+class _MappingFakeAsyncClient(_FakeAsyncClient):
+    async def get(self, url, headers=None):
+        return _FakeResponse({
+            'document_id': 'test-edit-doc',
+            'original_text': 'Иванов Иван Иванович и Иванова Ивана Ивановича',
+            'anonymized_text': 'ФИО1 и ФИО2',
+            'mappings': [
+                {'id': 'm1', 'placeholder': 'ФИО1', 'original_value': 'Иванов Иван Иванович', 'entity_type': 'PERSON_FULL_NAME', 'source': 'natasha'},
+                {'id': 'm2', 'placeholder': 'ФИО2', 'original_value': 'Иванова Ивана Ивановича', 'entity_type': 'PERSON_FULL_NAME', 'source': 'natasha'},
+            ],
+        })
+
+    async def patch(self, url, headers=None, json=None):
+        return _FakeResponse({
+            'document_id': 'test-edit-doc',
+            'anonymized_text': 'ФИО1 и ФИО2',
+            'mappings': [
+                {'id': 'm1', 'placeholder': 'ФИО1', 'original_value': json.get('original_value', 'Иванов И.И.'), 'entity_type': 'PERSON_FULL_NAME', 'source': 'manual'},
+                {'id': 'm2', 'placeholder': 'ФИО2', 'original_value': 'Иванова Ивана Ивановича', 'entity_type': 'PERSON_FULL_NAME', 'source': 'natasha'},
+            ],
+        })
+
+    async def delete(self, url, headers=None):
+        return _FakeResponse({
+            'document_id': 'test-edit-doc',
+            'anonymized_text': 'ФИО1 и ФИО2',
+            'mappings': [
+                {'id': 'm1', 'placeholder': 'ФИО1', 'original_value': 'Иванов Иван Иванович', 'entity_type': 'PERSON_FULL_NAME', 'source': 'manual'},
+            ],
+        })
+
+    async def post(self, url, headers=None, json=None):
+        if url.endswith('/mappings/merge'):
+            return _FakeResponse({
+                'document_id': 'test-edit-doc',
+                'anonymized_text': 'ФИО1 и ФИО2',
+                'mappings': [
+                    {'id': 'm1', 'placeholder': 'ФИО1', 'original_value': 'Иванов Иван Иванович', 'entity_type': 'PERSON_FULL_NAME', 'source': 'manual'},
+                    {'id': 'm2', 'placeholder': 'ФИО1', 'original_value': 'Иванова Ивана Ивановича', 'entity_type': 'PERSON_FULL_NAME', 'source': 'manual'},
+                ],
+            })
+        if url.endswith('/reanonymize'):
+            return _FakeResponse({'document_id': 'test-edit-doc', 'anonymized_text': 'ФИО1 и ФИО1', 'mappings': json['mappings']})
+        return await super().post(url, headers=headers, json=json)
+
+
+def test_update_delete_merge_mappings_and_audit(monkeypatch):
+    monkeypatch.setattr(main.httpx, 'AsyncClient', _MappingFakeAsyncClient)
+    client = TestClient(app)
+    doc = {
+        'id': 'test-edit-doc',
+        'case_id': main.seed_case['id'],
+        'title': 'Редактирование таблицы',
+        'act_type': 'RULING',
+        'status': 'ANONYMIZED',
+        'document_date': '2026-05-10',
+        'original_text': 'Иванов Иван Иванович и Иванова Ивана Ивановича',
+        'anonymized_text': 'ФИО1 и ФИО2',
+        'mappings': [],
+    }
+    main.docs.append(doc)
+    try:
+        fetched = client.get(f'/api/cases/documents/{doc["id"]}/anonymization', headers=auth_header())
+        patched = client.patch(
+            f'/api/cases/documents/{doc["id"]}/mappings/m1',
+            headers=auth_header(),
+            json={'original_value': 'Иванов И.И.'},
+        )
+        merged = client.post(
+            f'/api/cases/documents/{doc["id"]}/mappings/merge',
+            headers=auth_header(),
+            json={'target_mapping_id': 'm1', 'source_mapping_ids': ['m2']},
+        )
+        reanon = client.post(
+            f'/api/cases/documents/{doc["id"]}/reanonymize',
+            headers=auth_header(),
+            json={'mappings': merged.json()['mappings']},
+        )
+        deleted = client.delete(f'/api/cases/documents/{doc["id"]}/mappings/m2', headers=auth_header())
+
+        assert fetched.status_code == 200
+        assert fetched.json()['case_id'] == main.seed_case['id']
+        assert patched.status_code == 200
+        assert patched.json()['mappings'][0]['original_value'] == 'Иванов И.И.'
+        assert merged.status_code == 200
+        assert {m['placeholder'] for m in merged.json()['mappings']} == {'ФИО1'}
+        assert reanon.status_code == 200
+        assert reanon.json()['anonymized_text'] == 'ФИО1 и ФИО1'
+        assert deleted.status_code == 200
+        assert all(m['id'] != 'm2' for m in deleted.json()['mappings'])
+        assert any(a['action'] == 'UPDATE_MAPPING' and a['details'].get('mapping_id') == 'm1' for a in main.audit_log)
+        assert any(a['action'] == 'MERGE_MAPPINGS' and a['details'].get('target_mapping_id') == 'm1' for a in main.audit_log)
+        assert any(a['action'] == 'DELETE_MAPPING' and a['details'].get('mapping_id') == 'm2' for a in main.audit_log)
+    finally:
+        main.docs.remove(doc)
+
+
+def test_entity_types_dictionary():
+    client = TestClient(app)
+    response = client.get('/api/cases/dictionaries/entity-types')
+
+    assert response.status_code == 200
+    assert {'value': 'PERSON_FULL_NAME', 'label': 'ФИО'} in response.json()

@@ -1,4 +1,5 @@
 from collections import defaultdict
+from datetime import datetime
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -32,6 +33,17 @@ class MappingRequest(BaseModel):
     mode: str = 'new'
 
 
+class MappingPatchRequest(BaseModel):
+    placeholder: str | None = None
+    original_value: str | None = None
+    entity_type: str | None = None
+
+
+class MergeMappingsRequest(BaseModel):
+    target_mapping_id: str
+    source_mapping_ids: list[str]
+
+
 class ReanonymizeRequest(BaseModel):
     mappings: list[dict] = []
 
@@ -55,6 +67,43 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(status_code=400, content=error_payload('BAD_REQUEST', 'Некорректный запрос', {'validation_errors': exc.errors()}))
 
+
+def now_iso() -> str:
+    return datetime.utcnow().isoformat() + 'Z'
+
+
+def normalize_source(source: str | None) -> str:
+    if source == 'ner':
+        return 'natasha'
+    if source in {'manual', 'natasha', 'regex', 'rule'}:
+        return source
+    return source or 'manual'
+
+
+def ensure_mapping_metadata(mapping: dict, *, touch_updated: bool = False) -> dict:
+    now = now_iso()
+    if not mapping.get('id'):
+        mapping['id'] = str(uuid.uuid4())
+    if not mapping.get('created_at'):
+        mapping['created_at'] = mapping.get('updated_at') or now
+    if not mapping.get('updated_at') or touch_updated:
+        mapping['updated_at'] = now
+    mapping['source'] = normalize_source(mapping.get('source'))
+    return mapping
+
+
+def ensure_document_mappings(document_id: str) -> list[dict]:
+    doc = restored_docs.get(document_id)
+    if not doc:
+        return []
+    doc['mappings'] = [ensure_mapping_metadata(m) for m in doc.get('mappings', [])]
+    manual_mappings_by_document_id[document_id] = [m for m in doc['mappings'] if m.get('source') == 'manual']
+    return doc['mappings']
+
+
+def validate_non_empty(value: str | None, field: str):
+    if value is not None and not value.strip():
+        _error(400, 'BAD_REQUEST', f'{field} не должен быть пустым', {'field': field})
 
 def make_placeholder(entity_type: str, idx: int) -> str:
     if entity_type in {'PERSON_FULL_NAME', 'JUDGE', 'CASE_PARTICIPANT', 'COURT_SECRETARY'} or entity_type.startswith('PERSON_'):
@@ -85,7 +134,7 @@ def apply_anonymization(text: str, entities: list[dict]) -> tuple[str, list[dict
         if original not in text_to_placeholder:
             by_type[entity_type] += 1
             text_to_placeholder[original] = make_placeholder(entity_type, by_type[entity_type])
-        mappings.append({'placeholder': text_to_placeholder[original], 'original_value': original, 'entity_type': entity_type, 'source': e.get('source', 'ner')})
+        mappings.append(ensure_mapping_metadata({'placeholder': text_to_placeholder[original], 'original_value': original, 'entity_type': entity_type, 'source': normalize_source(e.get('source', 'natasha'))}))
 
     anonymized = text
     for e in sorted(entities, key=lambda x: x['start'], reverse=True):
@@ -108,22 +157,17 @@ def next_placeholder(entity_type: str, mappings: list[dict]) -> str:
 
 def merge_mappings(existing: list[dict], incoming: list[dict]) -> list[dict]:
     result = []
-    seen = set()
+    seen_originals = set()
     for m in [*existing, *incoming]:
         original = (m.get('original_value') or '').strip()
         placeholder = (m.get('placeholder') or '').strip()
         if not original or not placeholder:
             continue
-        key = (original, placeholder)
-        if key in seen:
+        if original in seen_originals:
             continue
-        seen.add(key)
-        result.append({
-            'placeholder': placeholder,
-            'original_value': original,
-            'entity_type': m.get('entity_type') or 'UNKNOWN',
-            'source': m.get('source') or 'manual',
-        })
+        seen_originals.add(original)
+        item = {**m, 'placeholder': placeholder, 'original_value': original, 'entity_type': m.get('entity_type') or 'UNKNOWN', 'source': normalize_source(m.get('source'))}
+        result.append(ensure_mapping_metadata(item))
     return result
 
 
@@ -166,7 +210,7 @@ def save_document(document_id: str, case_id: str, title: str, original_text: str
         'title': title,
         'original_text': original_text,
         'anonymized_text': anonymized_text,
-        'mappings': mappings,
+        'mappings': [ensure_mapping_metadata(m) for m in mappings],
     }
 
 
@@ -215,12 +259,12 @@ def restored(document_id: str, x_internal_service_token: str | None = Header(Non
     return restored_docs[document_id]
 
 
-
 @app.get('/internal/anonymization/documents/{document_id}')
 def get_document(document_id: str, x_internal_service_token: str | None = Header(None)):
     require_internal(x_internal_service_token)
     if document_id not in restored_docs:
         _error(404, 'NOT_FOUND', 'Документ не найден')
+    ensure_document_mappings(document_id)
     return restored_docs[document_id]
 
 
@@ -233,17 +277,87 @@ def add_mapping(document_id: str, body: MappingRequest, x_internal_service_token
         _error(404, 'NOT_FOUND', 'Документ не найден')
 
     doc = restored_docs[document_id]
-    existing = doc.get('mappings', [])
+    existing = ensure_document_mappings(document_id)
     manual = manual_mappings_by_document_id.setdefault(document_id, [m for m in existing if m.get('source') == 'manual'])
+    validate_non_empty(body.original_value, 'original_value')
+    validate_non_empty(body.entity_type, 'entity_type')
+    validate_non_empty(body.placeholder, 'placeholder')
     if any(m.get('original_value') == body.original_value for m in manual + existing):
         return {'document_id': document_id, 'anonymized_text': doc.get('anonymized_text', ''), 'mappings': existing}
 
     placeholder = body.placeholder if body.mode == 'existing' else next_placeholder(body.entity_type, existing + manual)
     if not placeholder:
         _error(400, 'BAD_REQUEST', 'placeholder is required for existing mode')
-    manual_mapping = {'placeholder': placeholder, 'original_value': body.original_value, 'entity_type': body.entity_type, 'source': 'manual'}
+    manual_mapping = ensure_mapping_metadata({'placeholder': placeholder, 'original_value': body.original_value, 'entity_type': body.entity_type, 'source': 'manual'})
     manual.append(manual_mapping)
     doc['mappings'] = merge_mappings(manual, existing)
+    return {'document_id': document_id, 'anonymized_text': doc.get('anonymized_text', ''), 'mappings': doc['mappings']}
+
+@app.patch('/internal/anonymization/documents/{document_id}/mappings/{mapping_id}')
+def update_mapping(document_id: str, mapping_id: str, body: MappingPatchRequest, x_internal_service_token: str | None = Header(None)):
+    require_internal(x_internal_service_token)
+    if document_id not in restored_docs:
+        _error(404, 'NOT_FOUND', 'Документ не найден')
+    validate_non_empty(body.placeholder, 'placeholder')
+    validate_non_empty(body.original_value, 'original_value')
+    validate_non_empty(body.entity_type, 'entity_type')
+    doc = restored_docs[document_id]
+    mappings = ensure_document_mappings(document_id)
+    mapping = next((m for m in mappings if m.get('id') == mapping_id), None)
+    if not mapping:
+        _error(404, 'NOT_FOUND', 'Элемент таблицы соответствия не найден')
+    data = body.model_dump(exclude_unset=True)
+    for field in ['placeholder', 'original_value', 'entity_type']:
+        if field in data:
+            mapping[field] = data[field].strip()
+    mapping['source'] = 'manual'
+    ensure_mapping_metadata(mapping, touch_updated=True)
+    doc['mappings'] = merge_mappings([m for m in mappings if m.get('source') == 'manual'], [m for m in mappings if m.get('source') != 'manual'])
+    manual_mappings_by_document_id[document_id] = [m for m in doc['mappings'] if m.get('source') == 'manual']
+    return {'document_id': document_id, 'anonymized_text': doc.get('anonymized_text', ''), 'mappings': doc['mappings']}
+
+
+@app.delete('/internal/anonymization/documents/{document_id}/mappings/{mapping_id}')
+def delete_mapping(document_id: str, mapping_id: str, x_internal_service_token: str | None = Header(None)):
+    require_internal(x_internal_service_token)
+    if document_id not in restored_docs:
+        _error(404, 'NOT_FOUND', 'Документ не найден')
+    doc = restored_docs[document_id]
+    mappings = ensure_document_mappings(document_id)
+    if not any(m.get('id') == mapping_id for m in mappings):
+        _error(404, 'NOT_FOUND', 'Элемент таблицы соответствия не найден')
+    doc['mappings'] = [m for m in mappings if m.get('id') != mapping_id]
+    manual_mappings_by_document_id[document_id] = [m for m in doc['mappings'] if m.get('source') == 'manual']
+    return {'document_id': document_id, 'anonymized_text': doc.get('anonymized_text', ''), 'mappings': doc['mappings']}
+
+
+@app.post('/internal/anonymization/documents/{document_id}/mappings/merge')
+def merge_document_mappings(document_id: str, body: MergeMappingsRequest, x_internal_service_token: str | None = Header(None)):
+    require_internal(x_internal_service_token)
+    if document_id not in restored_docs:
+        _error(404, 'NOT_FOUND', 'Документ не найден')
+    doc = restored_docs[document_id]
+    mappings = ensure_document_mappings(document_id)
+    target = next((m for m in mappings if m.get('id') == body.target_mapping_id), None)
+    if not target:
+        _error(404, 'NOT_FOUND', 'Целевой элемент таблицы соответствия не найден')
+    if not body.source_mapping_ids:
+        _error(400, 'BAD_REQUEST', 'source_mapping_ids не должен быть пустым')
+    source_ids = set(body.source_mapping_ids)
+    sources = [m for m in mappings if m.get('id') in source_ids]
+    if len(sources) != len(source_ids):
+        _error(404, 'NOT_FOUND', 'Один или несколько исходных элементов таблицы соответствия не найдены')
+    target_placeholder = target.get('placeholder')
+    target_type = target.get('entity_type') or 'UNKNOWN'
+    for m in sources:
+        m['placeholder'] = target_placeholder
+        m['entity_type'] = m.get('entity_type') or target_type
+        m['source'] = 'manual'
+        ensure_mapping_metadata(m, touch_updated=True)
+    target['source'] = 'manual'
+    ensure_mapping_metadata(target, touch_updated=True)
+    doc['mappings'] = merge_mappings([m for m in mappings if m.get('source') == 'manual'], [m for m in mappings if m.get('source') != 'manual'])
+    manual_mappings_by_document_id[document_id] = [m for m in doc['mappings'] if m.get('source') == 'manual']
     return {'document_id': document_id, 'anonymized_text': doc.get('anonymized_text', ''), 'mappings': doc['mappings']}
 
 
@@ -254,7 +368,8 @@ async def reanonymize(document_id: str, body: ReanonymizeRequest, x_internal_ser
         _error(404, 'NOT_FOUND', 'Документ не найден')
     doc = restored_docs[document_id]
     original_text = doc.get('original_text', '')
-    incoming_mappings = body.mappings or doc.get('mappings', [])
+    ensure_document_mappings(document_id)
+    incoming_mappings = [ensure_mapping_metadata(m) for m in (body.mappings or doc.get('mappings', []))]
     manual = [m for m in incoming_mappings if m.get('source') == 'manual']
     manual_mappings_by_document_id[document_id] = merge_mappings(manual_mappings_by_document_id.get(document_id, []), manual)
 
