@@ -18,6 +18,10 @@ export const publishDocument = (docId: string) => client.post(`/cases/documents/
 export const updateCaseStatus = (caseId: string, status: 'DRAFT' | 'PUBLISHED' | 'ARCHIVED') => client.patch(`/cases/${caseId}/status`, { status });
 export const getDocumentAnonymization = (documentId: string) => client.get(`/cases/documents/${documentId}/anonymization`);
 export const addDocumentMapping = (documentId: string, payload: { original_value: string; entity_type: string; mode: 'new' | 'existing'; placeholder?: string }) => client.post(`/cases/documents/${documentId}/mappings`, payload);
+
+export const updateDocumentMapping = (documentId: string, mappingId: string, payload: { placeholder: string; original_value: string; entity_type: string }) => client.patch(`/cases/documents/${documentId}/mappings/${mappingId}`, payload);
+export const deleteDocumentMapping = (documentId: string, mappingId: string) => client.delete(`/cases/documents/${documentId}/mappings/${mappingId}`);
+export const mergeDocumentMappings = (documentId: string, payload: { target_mapping_id: string; source_mapping_ids: string[] }) => client.post(`/cases/documents/${documentId}/mappings/merge`, payload);
 export const reanonymizeDocument = (documentId: string, payload: { mappings: EntityMapping[] }) => client.post(`/cases/documents/${documentId}/reanonymize`, payload);
 export const saveAnonymization = (documentId: string, payload: { anonymized_text: string; mappings: EntityMapping[] }) => client.post(`/cases/documents/${documentId}/save-anonymization`, payload);
 export const deleteCaseDocument = (caseId: string, documentId: string) => client.delete(`/cases/${caseId}/documents/${documentId}`);
