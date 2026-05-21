@@ -48,6 +48,30 @@ def now_iso():
     return datetime.utcnow().isoformat() + 'Z'
 
 
+def normalize_mapping_source(source: str | None) -> str:
+    if source == 'ner':
+        return 'natasha'
+    if source in {'manual', 'natasha', 'regex', 'rule'}:
+        return source
+    return source or 'manual'
+
+
+def ensure_mapping_metadata(mapping: dict) -> dict:
+    now = now_iso()
+    if not mapping.get('id'):
+        mapping['id'] = str(uuid.uuid4())
+    if not mapping.get('created_at'):
+        mapping['created_at'] = mapping.get('updated_at') or now
+    if not mapping.get('updated_at'):
+        mapping['updated_at'] = now
+    mapping['source'] = normalize_mapping_source(mapping.get('source'))
+    return mapping
+
+
+def ensure_doc_mappings(d: dict) -> list[dict]:
+    d['mappings'] = [ensure_mapping_metadata(m) for m in d.get('mappings', [])]
+    return d['mappings']
+
 def claims(auth: str | None):
     if not auth:
         return {'roles': ['PUBLIC'], 'sub': None}
@@ -150,6 +174,9 @@ docs = [{
     'mappings': seed_mappings,
 }]
 
+for _doc in docs:
+    ensure_doc_mappings(_doc)
+
 
 class CreateCase(BaseModel):
     model_config = ConfigDict(extra='ignore')
@@ -225,6 +252,17 @@ class MappingIn(BaseModel):
     mode: str = 'new'
 
 
+class MappingPatchIn(BaseModel):
+    placeholder: str | None = None
+    original_value: str | None = None
+    entity_type: str | None = None
+
+
+class MergeMappingsIn(BaseModel):
+    target_mapping_id: str
+    source_mapping_ids: list[str]
+
+
 class ReanonymizeIn(BaseModel):
     mappings: list[dict] = []
 
@@ -232,6 +270,27 @@ class ReanonymizeIn(BaseModel):
 class SaveAnonymizationIn(BaseModel):
     anonymized_text: str
     mappings: list[dict] = []
+
+
+@app.get('/api/cases/dictionaries/entity-types')
+def entity_types_dictionary():
+    return [
+        {'value': 'PERSON_FULL_NAME', 'label': 'ФИО'},
+        {'value': 'CASE_PARTICIPANT', 'label': 'Участник дела'},
+        {'value': 'JUDGE', 'label': 'Судья'},
+        {'value': 'COURT_SECRETARY', 'label': 'Секретарь судебного заседания'},
+        {'value': 'ADDRESS', 'label': 'Адрес'},
+        {'value': 'LOCATION', 'label': 'Место'},
+        {'value': 'ORGANIZATION', 'label': 'Организация'},
+        {'value': 'PHONE', 'label': 'Телефон'},
+        {'value': 'EMAIL', 'label': 'Электронная почта'},
+        {'value': 'PASSPORT', 'label': 'Паспортные данные'},
+        {'value': 'SNILS', 'label': 'СНИЛС'},
+        {'value': 'INN', 'label': 'ИНН'},
+        {'value': 'BIRTH_DATE', 'label': 'Дата рождения'},
+        {'value': 'DATE', 'label': 'Дата'},
+        {'value': 'OTHER', 'label': 'Иные данные'},
+    ]
 
 
 @app.get('/health')
@@ -317,7 +376,7 @@ def sync_doc_from_anonymization(d: dict, payload: dict):
     if 'anonymized_text' in payload:
         d['anonymized_text'] = payload.get('anonymized_text') or ''
     if 'mappings' in payload:
-        d['mappings'] = payload.get('mappings') or []
+        d['mappings'] = [ensure_mapping_metadata(m) for m in (payload.get('mappings') or [])]
     if 'original_text' in payload:
         d['original_text'] = payload.get('original_text') or d.get('original_text', '')
 
@@ -468,7 +527,6 @@ def create_court(body: CourtIn, authorization: str | None = Header(None)):
     audit(c.get('sub'), 'CREATE_COURT', 'COURT', court['id'])
     return court
 
-
 @app.patch('/api/cases/admin/courts/{court_id}')
 def update_court(court_id: str, body: CourtPatch, authorization: str | None = Header(None)):
     c = claims(authorization)
@@ -564,7 +622,6 @@ def del_fav(document_id: str, authorization: str | None = Header(None)):
     favorites.setdefault(c['sub'], set()).discard(document_id)
     return {'ok': True}
 
-
 @app.patch('/api/cases/{case_id}/status')
 def update_case_status(case_id: str, body: CaseStatusPatch, authorization: str | None = Header(None)):
     c = claims(authorization)
@@ -581,8 +638,6 @@ def update_case_status(case_id: str, body: CaseStatusPatch, authorization: str |
     cs['status'] = body.status
     audit(c.get('sub'), 'UPDATE_CASE_STATUS', 'CASE', case_id, {'old_status': old_status, 'new_status': body.status})
     return cs
-
-
 
 @app.patch('/api/cases/{case_id}')
 def update_case(case_id: str, body: CasePatch, authorization: str | None = Header(None)):
@@ -656,14 +711,13 @@ async def upload(case_id: str, body: UploadDoc, authorization: str | None = Head
         p = r.json()
         d['anonymization_job_id'] = p.get('job_id')
         d['anonymized_text'] = p.get('anonymized_text') or d['anonymized_text']
-        d['mappings'] = p.get('mappings') or []
+        d['mappings'] = [ensure_mapping_metadata(m) for m in (p.get('mappings') or [])]
     except Exception:
         d['anonymization_job_id'] = None
     d['status'] = 'ANONYMIZED'
     d['public_anonymized_document_id'] = d['id']
     audit(c.get('sub'), 'UPLOAD_DOCUMENT', 'DOCUMENT', d['id'], {'case_id': case_id})
     return {'document_id': d['id'], 'case_id': case_id, 'title': d['title'], 'status': d['status'], 'anonymization_job_id': d.get('anonymization_job_id'), 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
-
 
 
 @app.delete('/api/cases/{case_id}/documents/{document_id}')
@@ -707,7 +761,8 @@ async def get_document_anonymization(document_id: str, authorization: str | None
             sync_doc_from_anonymization(d, r.json())
     except Exception:
         pass
-    return {'document_id': d['id'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
+    ensure_doc_mappings(d)
+    return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
 
 
 @app.post('/api/cases/documents/{document_id}/mappings')
@@ -722,8 +777,68 @@ async def add_document_mapping(document_id: str, body: MappingIn, authorization:
         raise HTTPException(status_code=r.status_code, detail=r.json())
     payload = r.json()
     sync_doc_from_anonymization(d, payload)
-    audit(c.get('sub'), 'ADD_MANUAL_MAPPING', 'DOCUMENT', document_id, {'case_id': d['case_id'], 'original_value': body.original_value, 'placeholder': body.placeholder, 'mode': body.mode})
-    return {'document_id': d['id'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
+    audit(c.get('sub'), 'ADD_MANUAL_MAPPING', 'DOCUMENT', document_id, {'document_id': document_id, 'case_id': d['case_id'], 'original_value': body.original_value, 'placeholder': body.placeholder, 'mode': body.mode})
+    return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
+
+@app.patch('/api/cases/documents/{document_id}/mappings/{mapping_id}')
+async def update_document_mapping(document_id: str, mapping_id: str, body: MappingPatchIn, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    d, cs = find_document_and_case(document_id)
+    if not can_manage_case(c, cs):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    async with httpx.AsyncClient(timeout=10.0) as cl:
+        r = await cl.patch(
+            f'{ANON}/internal/anonymization/documents/{document_id}/mappings/{mapping_id}',
+            headers={'X-Internal-Service-Token': INTERNAL},
+            json=body.model_dump(exclude_unset=True),
+        )
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.json())
+    payload = r.json()
+    sync_doc_from_anonymization(d, payload)
+    audit(c.get('sub'), 'UPDATE_MAPPING', 'DOCUMENT', document_id, {'document_id': document_id, 'case_id': d['case_id'], 'mapping_id': mapping_id})
+    return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
+
+
+@app.delete('/api/cases/documents/{document_id}/mappings/{mapping_id}')
+async def delete_document_mapping(document_id: str, mapping_id: str, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    d, cs = find_document_and_case(document_id)
+    if not can_manage_case(c, cs):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    async with httpx.AsyncClient(timeout=10.0) as cl:
+        r = await cl.delete(f'{ANON}/internal/anonymization/documents/{document_id}/mappings/{mapping_id}', headers={'X-Internal-Service-Token': INTERNAL})
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.json())
+    payload = r.json()
+    sync_doc_from_anonymization(d, payload)
+    audit(c.get('sub'), 'DELETE_MAPPING', 'DOCUMENT', document_id, {'document_id': document_id, 'case_id': d['case_id'], 'mapping_id': mapping_id})
+    return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
+
+
+@app.post('/api/cases/documents/{document_id}/mappings/merge')
+async def merge_document_mappings(document_id: str, body: MergeMappingsIn, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    d, cs = find_document_and_case(document_id)
+    if not can_manage_case(c, cs):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    async with httpx.AsyncClient(timeout=10.0) as cl:
+        r = await cl.post(
+            f'{ANON}/internal/anonymization/documents/{document_id}/mappings/merge',
+            headers={'X-Internal-Service-Token': INTERNAL},
+            json=body.model_dump(),
+        )
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.json())
+    payload = r.json()
+    sync_doc_from_anonymization(d, payload)
+    audit(c.get('sub'), 'MERGE_MAPPINGS', 'DOCUMENT', document_id, {
+        'document_id': document_id,
+        'case_id': d['case_id'],
+        'target_mapping_id': body.target_mapping_id,
+        'source_mapping_ids': body.source_mapping_ids,
+    })
+    return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
 
 
 @app.post('/api/cases/documents/{document_id}/reanonymize')
@@ -739,8 +854,8 @@ async def reanonymize_document(document_id: str, body: ReanonymizeIn, authorizat
     payload = r.json()
     sync_doc_from_anonymization(d, payload)
     d['status'] = 'ANONYMIZED'
-    audit(c.get('sub'), 'REANONYMIZE_DOCUMENT', 'DOCUMENT', document_id, {'case_id': d['case_id']})
-    return {'document_id': d['id'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
+    audit(c.get('sub'), 'REANONYMIZE_DOCUMENT', 'DOCUMENT', document_id, {'document_id': document_id, 'case_id': d['case_id']})
+    return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
 
 
 @app.post('/api/cases/documents/{document_id}/save-anonymization')
@@ -750,10 +865,10 @@ def save_anonymization(document_id: str, body: SaveAnonymizationIn, authorizatio
     if not can_manage_case(c, cs):
         err('ACCESS_DENIED', 'Недостаточно прав')
     d['anonymized_text'] = body.anonymized_text
-    d['mappings'] = body.mappings
+    d['mappings'] = [ensure_mapping_metadata(m) for m in body.mappings]
     if d.get('status') == 'PROCESSING':
         d['status'] = 'ANONYMIZED'
-    audit(c.get('sub'), 'SAVE_ANONYMIZATION', 'DOCUMENT', document_id, {'case_id': d['case_id']})
+    audit(c.get('sub'), 'SAVE_ANONYMIZATION', 'DOCUMENT', document_id, {'document_id': document_id, 'case_id': d['case_id']})
     return d
 
 
