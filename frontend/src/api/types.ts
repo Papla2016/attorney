@@ -6,7 +6,7 @@ export interface CaseDocument { id: string; title: string; document_number?: str
 export interface PublicDocumentListItem { id: string; title: string; case_number?: string; document_number?: string; court?: string; region?: string; document_date?: string; act_type?: string; instance?: string; law_article?: string; practice_topic?: string; is_favorite?: boolean; favorite?: boolean; }
 export interface PublicDocumentDetails extends PublicDocumentListItem { anonymized_text: string; can_view_restored?: boolean; }
 export type FavoriteDocument = PublicDocumentListItem;
-export interface EntityMapping { placeholder: string; original_value: string; entity_type: string; source?: string; }
+export interface EntityMapping { id?: string; placeholder: string; original_value: string; entity_type: string; source?: string; }
 export interface RestoredDocument { id: string; title: string; original_text: string; anonymized_text: string; entity_mappings: EntityMapping[]; }
 export interface RestoredCase { id: string; case_number: string; court?: string; region?: string; documents: RestoredDocument[]; }
 export interface CreateCaseRequest { court_id?: string; case_number: string; document_number?: string; document_date?: string; instance?: string; region?: string; legal_article?: string; judicial_practice?: string; judge_names?: string[]; staff_user_ids?: string[]; }
