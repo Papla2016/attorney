@@ -25,3 +25,5 @@ export const mergeDocumentMappings = (documentId: string, payload: { target_mapp
 export const reanonymizeDocument = (documentId: string, payload: { mappings: EntityMapping[] }) => client.post(`/cases/documents/${documentId}/reanonymize`, payload);
 export const saveAnonymization = (documentId: string, payload: { anonymized_text: string; mappings: EntityMapping[] }) => client.post(`/cases/documents/${documentId}/save-anonymization`, payload);
 export const deleteCaseDocument = (caseId: string, documentId: string) => client.delete(`/cases/${caseId}/documents/${documentId}`);
+
+export const repairPlaceholders = (documentId: string) => client.post(`/cases/documents/${documentId}/mappings/repair-placeholders`);

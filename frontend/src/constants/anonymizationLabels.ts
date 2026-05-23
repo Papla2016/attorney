@@ -49,3 +49,11 @@ export function getEntityTypeLabel(value?: string) {
 export function getSourceLabel(value?: string) {
   return SOURCE_LABELS[value || ''] || value || '—';
 }
+
+
+export const PERSON_ROLE_LABELS: Record<string, string> = {
+  JUDGE: 'Судья', COURT_SECRETARY: 'Секретарь судебного заседания', PLAINTIFF: 'Истец', DEFENDANT: 'Ответчик', THIRD_PARTY: 'Третье лицо', REPRESENTATIVE: 'Представитель', WITNESS: 'Свидетель', PROSECUTOR: 'Прокурор', ADVOCATE: 'Адвокат', CONVICTED: 'Осуждённый', ACQUITTED: 'Оправданный', ADMINISTRATIVE_OFFENDER: 'Лицо, привлекаемое к административной ответственности', OTHER_PERSON: 'Иное лицо', UNKNOWN: 'Роль не определена'
+};
+export const REDACTION_DECISION_LABELS: Record<string, string> = { REDACT: 'Обезличить', KEEP: 'Оставить в тексте', REVIEW: 'Требуется проверка' };
+export const DATE_PURPOSE_LABELS: Record<string, string> = { BIRTH_DATE: 'Дата рождения', DOCUMENT_DATE: 'Дата документа', HEARING_DATE: 'Дата судебного заседания', CONTRACT_DATE: 'Дата договора', EVENT_DATE: 'Дата события', UNKNOWN_DATE: 'Назначение даты не определено' };
+export const LOCATION_PURPOSE_LABELS: Record<string, string> = { RESIDENCE_ADDRESS: 'Адрес проживания', STAY_ADDRESS: 'Адрес пребывания', BIRTH_PLACE: 'Место рождения', PROPERTY_LOCATION: 'Местонахождение имущества', VEHICLE_LOCATION: 'Местонахождение транспортного средства', COURT_LOCATION: 'Местонахождение суда', ORGANIZATION_LOCATION: 'Адрес организации', GENERIC_LOCATION: 'Место', UNKNOWN_LOCATION: 'Назначение места не определено' };
