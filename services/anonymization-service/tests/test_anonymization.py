@@ -13,7 +13,7 @@ def test_internal_access_denied_without_token():
 
 def test_placeholder_mapping_same_value_same_placeholder():
     assert make_placeholder('PERSON_FULL_NAME', 1) == 'ФИО1'
-    assert make_placeholder('EMAIL', 2) == 'EMAIL2'
+    assert make_placeholder('EMAIL', 2) == 'ЭЛЕКТРОННАЯ_ПОЧТА2'
 
 
 def test_person_and_passport_anonymization_reuses_placeholders():
@@ -213,6 +213,41 @@ def test_placeholder_unique_by_cluster():
     entities = [
         {'type': 'PERSON_FULL_NAME', 'text': 'Иванов Иван Иванович', 'start': 0, 'end': 19},
         {'type': 'PERSON_FULL_NAME', 'text': 'Петров Петр Петрович', 'start': 23, 'end': 42},
+    ]
+    mappings, _ = build_mappings_from_resolved(resolve_entities(text, entities))
+    assert len({m['placeholder'] for m in mappings}) == 2
+
+
+def test_import_main_module_compiles():
+    import importlib
+
+    mod = importlib.import_module('app.main')
+    assert hasattr(mod, 'build_mappings_from_resolved')
+
+
+def test_birth_date_placeholder_not_generic_data():
+    text = 'дата рождения 14.07.2018'
+    entities = [{'type': 'DATE', 'text': '14.07.2018', 'start': 14, 'end': 24}]
+    mappings, _ = build_mappings_from_resolved(resolve_entities(text, entities))
+    assert mappings[0]['placeholder'] == 'ДАТА_РОЖДЕНИЯ1'
+
+
+def test_russian_name_forms_share_single_placeholder():
+    text = 'Макаров Антон Сергеевич, Макарова Антона Сергеевича, Макаровым Антоном Сергеевичем'
+    entities = [
+        {'type': 'PERSON_FULL_NAME', 'text': 'Макаров Антон Сергеевич', 'start': 0, 'end': 23},
+        {'type': 'PERSON_FULL_NAME', 'text': 'Макарова Антона Сергеевича', 'start': 25, 'end': 51},
+        {'type': 'PERSON_FULL_NAME', 'text': 'Макаровым Антоном Сергеевичем', 'start': 53, 'end': 81},
+    ]
+    mappings, _ = build_mappings_from_resolved(resolve_entities(text, entities))
+    assert {m['placeholder'] for m in mappings} == {'ФИО1'}
+
+
+def test_different_people_do_not_share_placeholder():
+    text = 'Иванов Иван Иванович и Сидоров Петр Петрович'
+    entities = [
+        {'type': 'PERSON_FULL_NAME', 'text': 'Иванов Иван Иванович', 'start': 0, 'end': 20},
+        {'type': 'PERSON_FULL_NAME', 'text': 'Сидоров Петр Петрович', 'start': 23, 'end': 44},
     ]
     mappings, _ = build_mappings_from_resolved(resolve_entities(text, entities))
     assert len({m['placeholder'] for m in mappings}) == 2
