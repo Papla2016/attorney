@@ -99,9 +99,9 @@ class RegexRuleNerProvider(BaseNerProvider):
             ('SNILS', re.compile(r'\b\d{3}-\d{3}-\d{3}\s?\d{2}\b'), 0.92, 'regex'),
             ('INN', re.compile(r'\b\d{10}(?:\d{2})?\b'), 0.88, 'regex'),
             ('PASSPORT', re.compile(r'\bпаспорт(?:\s+серии)?\s*\d{2}\s?\d{2}(?:\s+номер)?\s*\d{6}\b|\b\d{4}\s?\d{6}\b', flags), 0.88, 'regex'),
-            ('BIRTH_DATE', re.compile(r'\b(?:дата\s+рождения|родивш(?:ийся|аяся))\s*:?[\s\w]*?\d{2}\.\d{2}\.\d{4}\b|\b\d{2}\.\d{2}\.\d{4}\b', flags), 0.86, 'regex'),
+            ('DATE', re.compile(r'\b\d{2}\.\d{2}\.\d{4}\b', flags), 0.86, 'regex'),
             ('PERSON_FULL_NAME', re.compile(fio), 0.85, 'regex'),
-            ('ORGANIZATION', re.compile(r'\b(?:ООО|АО|ПАО|ЗАО|ОАО|ФГБУ|МВД|УМВД|Прокуратура|судебный\s+участок)\s+[«"А-ЯЁA-Z][^,.;\n]+', flags), 0.82, 'rule'),
+            ('ORGANIZATION', re.compile(r'\b(?:ООО|АО|ПАО|ЗАО|ОАО)\s+[«"][^»"]+[»"]', flags), 0.82, 'rule'),
             ('ADDRESS', re.compile(r'\b(?:(?:г\.|город)\s*[А-ЯЁа-яё\- ]+|(?:ул\.|улица)\s*[А-ЯЁа-яё\- ]+|(?:д\.|дом)\s*\d+[А-Яа-я]?)(?:,?\s*(?:(?:ул\.|улица)\s*[А-ЯЁа-яё\- ]+|(?:д\.|дом)\s*\d+[А-Яа-я]?))*', flags), 0.80, 'regex'),
             ('LOCATION', re.compile(r'\b(?:г\.|город)\s*[А-ЯЁа-яё\- ]+', flags), 0.78, 'regex'),
         ]
