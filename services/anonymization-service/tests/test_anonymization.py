@@ -1,4 +1,5 @@
 from app.main import apply_anonymization, make_placeholder
+from app.main import resolve_entities, build_mappings_from_resolved
 
 
 def test_internal_access_denied_without_token():
@@ -174,3 +175,44 @@ def test_patch_delete_merge_and_reanonymize_mappings():
     )
     assert deleted.status_code == 200
     assert all(m['id'] != third_id for m in deleted.json()['mappings'])
+
+
+def test_dates_policy_birth_vs_document_date():
+    text = 'дата рождения 14.07.2018, решение от 30.10.2023, договор от 20.05.2024'
+    entities = [
+        {'type': 'DATE', 'text': '14.07.2018', 'start': 14, 'end': 24},
+        {'type': 'DATE', 'text': '30.10.2023', 'start': 37, 'end': 47},
+        {'type': 'DATE', 'text': '20.05.2024', 'start': 60, 'end': 70},
+    ]
+    resolved = resolve_entities(text, entities)
+    assert resolved[0]['redaction_decision'] == 'REDACT'
+    assert resolved[1]['redaction_decision'] == 'KEEP'
+    assert resolved[2]['redaction_decision'] == 'KEEP'
+
+
+def test_organization_boundary_only_name():
+    text = 'ООО «ТОК» выполнило проект'
+    entities = [{'type': 'ORGANIZATION', 'text': 'ООО «ТОК» выполнило проект', 'start': 0, 'end': 27}]
+    resolved = resolve_entities(text, entities)
+    assert resolved[0]['normalized_value'] == 'ООО «ТОК»'
+
+
+def test_judge_kept_witness_redacted():
+    text = 'Судья Андреева Татьяна Викторовна и свидетель Макаров Антон Сергеевич.'
+    entities = [
+        {'type': 'PERSON_FULL_NAME', 'text': 'Андреева Татьяна Викторовна', 'start': 6, 'end': 33},
+        {'type': 'PERSON_FULL_NAME', 'text': 'Макаров Антон Сергеевич', 'start': 47, 'end': 70},
+    ]
+    resolved = resolve_entities(text, entities)
+    assert resolved[0]['redaction_decision'] == 'KEEP'
+    assert resolved[1]['redaction_decision'] == 'REDACT'
+
+
+def test_placeholder_unique_by_cluster():
+    text = 'Иванов Иван Иванович и Петров Петр Петрович'
+    entities = [
+        {'type': 'PERSON_FULL_NAME', 'text': 'Иванов Иван Иванович', 'start': 0, 'end': 19},
+        {'type': 'PERSON_FULL_NAME', 'text': 'Петров Петр Петрович', 'start': 23, 'end': 42},
+    ]
+    mappings, _ = build_mappings_from_resolved(resolve_entities(text, entities))
+    assert len({m['placeholder'] for m in mappings}) == 2
