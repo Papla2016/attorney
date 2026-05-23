@@ -189,11 +189,14 @@ def make_placeholder(entity_type: str, idx: int) -> str:
         'LOCATION': 'МЕСТО',
         'ORGANIZATION': 'ОРГАНИЗАЦИЯ',
         'PHONE': 'ТЕЛЕФОН',
-        'EMAIL': 'EMAIL',
+        'EMAIL': 'ЭЛЕКТРОННАЯ_ПОЧТА',
         'PASSPORT': 'ПАСПОРТ',
         'SNILS': 'СНИЛС',
         'INN': 'ИНН',
-        'BIRTH_DATE': 'ДАТА',
+        'BIRTH_DATE': 'ДАТА_РОЖДЕНИЯ',
+        'DATE': 'ДАТА',
+        'PLACE': 'АДРЕС',
+        'PERSON': 'ФИО',
         'BANK_ACCOUNT': 'СЧЕТ',
         'CARD_NUMBER': 'КАРТА',
     }
@@ -296,16 +299,21 @@ def build_mappings_from_resolved(resolved: list[dict]) -> tuple[list[dict], list
     for e in resolved:
         if e.get('redaction_decision') != 'REDACT':
             continue
-        key = f\"{e['entity_class']}::{e['normalized_value']}\"
+        key = f"{e['entity_class']}::{e['normalized_value']}"
         if e['entity_class'] == 'PERSON' and e.get('signature', {}).get('initials'):
-            key = f\"PERSON::{e['signature']['surname']}::{e['signature']['initials']}\"
+            key = f"PERSON::{e['signature']['surname']}::{e['signature']['initials']}"
         e['cluster_id'] = key
         grouped[key].append(e)
     mappings = []
     for cluster_id, items in grouped.items():
         sample = items[0]
         entity_class = sample['entity_class']
-        prefix = 'ФИО' if entity_class == 'PERSON' else make_placeholder(entity_class, 0)[:-1]
+        placeholder_type = entity_class
+        if entity_class == 'DATE' and sample.get('context_kind') == 'BIRTH_DATE':
+            placeholder_type = 'BIRTH_DATE'
+        elif entity_class == 'PLACE' and sample.get('context_kind') in {'RESIDENCE_ADDRESS', 'PROPERTY_LOCATION'}:
+            placeholder_type = 'PLACE'
+        prefix = 'ФИО' if entity_class == 'PERSON' else make_placeholder(placeholder_type, 0)[:-1]
         if cluster_id not in cluster_to_placeholder:
             counters[prefix] += 1
             cluster_to_placeholder[cluster_id] = f'{prefix}{counters[prefix]}'
