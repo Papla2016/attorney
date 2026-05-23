@@ -1,182 +1,43 @@
 import { useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
-import {
-  addDocumentMapping,
-  deleteDocumentMapping,
-  mergeDocumentMappings,
-  reanonymizeDocument,
-  saveAnonymization,
-  updateDocumentMapping
-} from '../../api/casesApi';
+import { addDocumentMapping, deleteDocumentMapping, mergeDocumentMappings, reanonymizeDocument, repairPlaceholders, saveAnonymization, updateDocumentMapping } from '../../api/casesApi';
 import type { EntityMapping } from '../../api/types';
-import { ENTITY_TYPE_OPTIONS, getEntityTypeLabel, getSourceLabel } from '../../constants/anonymizationLabels';
+import { DATE_PURPOSE_LABELS, ENTITY_TYPE_OPTIONS, getEntityTypeLabel, getSourceLabel, LOCATION_PURPOSE_LABELS, PERSON_ROLE_LABELS, REDACTION_DECISION_LABELS } from '../../constants/anonymizationLabels';
+import RichDocumentEditor from '../documents/RichDocumentEditor';
 
-const val = (v: any) => v || '—';
+type Props = { documentId: string; caseId?: string; initialData?: any; onSaved?: () => void; sourceContent?: unknown; sourceText?: string };
 const mappingsFrom = (data: any): EntityMapping[] => data?.mappings || data?.entity_mappings || data?.anonymization?.mappings || [];
-const textFrom = (data: any) => data?.anonymized_text || data?.anonymization?.anonymized_text || data?.document?.anonymized_text || '';
-const notSupportedMessage = 'Backend пока не поддерживает изменение таблицы соответствия.';
+const textFrom = (data: any) => data?.anonymized_text || data?.anonymization?.anonymized_text || data?.anonymized_plain_text || '';
+const contentFrom = (data: any) => data?.anonymized_content || null;
 
-type Props = { documentId: string; caseId?: string; initialData?: any; onSaved?: () => void };
-
-export default function AnonymizationWorkspace({ documentId, caseId, initialData, onSaved }: Props) {
-  const [anonymizedText, setAnonymizedText] = useState(textFrom(initialData));
+export default function AnonymizationWorkspace({ documentId, initialData, sourceContent, sourceText }: Props) {
   const [mappings, setMappings] = useState<EntityMapping[]>(mappingsFrom(initialData));
   const [selectedText, setSelectedText] = useState('');
   const [entityType, setEntityType] = useState('PERSON_FULL_NAME');
-  const [mode, setMode] = useState<'new' | 'existing'>('new');
-  const [placeholder, setPlaceholder] = useState('');
-  const [message, setMessage] = useState('');
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState('');
-  const [editId, setEditId] = useState<string | null>(null);
-  const [editForm, setEditForm] = useState({ placeholder: '', original_value: '', entity_type: 'PERSON_FULL_NAME' });
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const [mergeTargetId, setMergeTargetId] = useState('');
-  const [hasUnsavedMappingChanges, setHasUnsavedMappingChanges] = useState(false);
+  const [tab, setTab] = useState<'REDACT'|'KEEP'|'REVIEW'>('REDACT');
+  const [anonymizedText, setAnonymizedText] = useState(textFrom(initialData));
+  const [anonymizedContent, setAnonymizedContent] = useState<any>(contentFrom(initialData));
+  const [warning, setWarning] = useState('');
 
-  const placeholders = Array.from(new Set(mappings.map((m) => m.placeholder).filter(Boolean)));
-  const mappingsWithId = useMemo(() => mappings.map((m, idx) => ({ ...m, id: m.id || `${m.placeholder || 'm'}-${idx}` })), [mappings]);
+  const withId = useMemo(() => mappings.map((m, i) => ({ ...m, id: m.id || `m-${i}` })), [mappings]);
+  const grouped = useMemo(() => ({ REDACT: withId.filter(m => (m.redaction_decision || 'REDACT')==='REDACT'), KEEP: withId.filter(m => m.redaction_decision==='KEEP'), REVIEW: withId.filter(m => m.redaction_decision==='REVIEW') }), [withId]);
+  const conflicts = useMemo(() => { const map = new Map<string, number>(); withId.forEach((m) => { if (!m.placeholder) return; map.set(m.placeholder, (map.get(m.placeholder)||0)+1); }); return new Set([...map.entries()].filter(([,count])=>count>1).map(([key])=>key)); }, [withId]);
 
-  const handleApiError = (fallback: string, e: any) => {
-    if (e?.response?.status === 404 || e?.response?.status === 405) setError(notSupportedMessage);
-    else setError(fallback);
-  };
-
-  const captureSelection = () => {
-    const selection = window.getSelection()?.toString().trim() || '';
-    if (!selection) { setError('Выделите фрагмент обезличенного текста.'); return; }
-    setSelectedText(selection);
-    setError('');
-  };
-
-  const addMapping = async () => {
-    if (!selectedText) { setError('Сначала добавьте выделение.'); return; }
-    if (mode === 'existing' && !placeholder) { setError('Выберите существующее обозначение.'); return; }
-    setBusy('mapping'); setError(''); setMessage('');
-    try {
-      const res = await addDocumentMapping(documentId, { original_value: selectedText, entity_type: entityType, mode, ...(mode === 'existing' ? { placeholder } : {}) });
-      const nextMappings = mappingsFrom(res.data);
-      setMappings(nextMappings.length ? nextMappings : [...mappings, { original_value: selectedText, entity_type: entityType, placeholder: mode === 'existing' ? placeholder : (res.data?.placeholder || 'ФИО1') }]);
-      setAnonymizedText(textFrom(res.data) || anonymizedText);
-      setSelectedText('');
-      setHasUnsavedMappingChanges(true);
-      setMessage('Элемент добавлен в таблицу соответствия.');
-    } catch (e) {
-      handleApiError('Не удалось добавить элемент в таблицу соответствия.', e);
-    } finally { setBusy(''); }
-  };
-
-  const startEdit = (m: EntityMapping & { id: string }) => {
-    setEditId(m.id);
-    setEditForm({ placeholder: m.placeholder || '', original_value: m.original_value || '', entity_type: m.entity_type || 'PERSON_FULL_NAME' });
-  };
-
-  const saveEdit = async () => {
-    if (!editId) return;
-    setBusy('edit'); setError(''); setMessage('');
-    try {
-      const res = await updateDocumentMapping(documentId, editId, editForm);
-      const nextMappings = mappingsFrom(res.data);
-      setMappings(nextMappings.length ? nextMappings : mappings.map((m, idx) => ((m.id || `${m.placeholder || 'm'}-${idx}`) === editId ? { ...m, ...editForm } : m)));
-      setEditId(null);
-      setHasUnsavedMappingChanges(true);
-      setMessage('Элемент таблицы соответствия обновлён.');
-    } catch (e) {
-      handleApiError('Не удалось изменить элемент таблицы соответствия.', e);
-    } finally { setBusy(''); }
-  };
-
-  const deleteMapping = async (mappingId: string) => {
-    if (!window.confirm('Удалить элемент из таблицы соответствия? После удаления рекомендуется выполнить повторное обезличивание.')) return;
-    setBusy(`delete-${mappingId}`); setError(''); setMessage('');
-    try {
-      await deleteDocumentMapping(documentId, mappingId);
-      setMappings(mappingsWithId.filter((m) => m.id !== mappingId));
-      setSelectedIds((prev) => prev.filter((id) => id !== mappingId));
-      if (mergeTargetId === mappingId) setMergeTargetId('');
-      setHasUnsavedMappingChanges(true);
-      setMessage('Элемент удалён из таблицы соответствия.');
-    } catch (e) {
-      handleApiError('Не удалось удалить элемент таблицы соответствия.', e);
-    } finally { setBusy(''); }
-  };
-
-  const mergeMappings = async () => {
-    if (selectedIds.length < 2) { setError('Выберите минимум две записи для объединения.'); return; }
-    if (!mergeTargetId) { setError('Выберите основную запись, в которую нужно объединить остальные.'); return; }
-    const sourceIds = selectedIds.filter((id) => id !== mergeTargetId);
-    if (!sourceIds.length) { setError('Выберите минимум две записи для объединения.'); return; }
-    setBusy('merge'); setError(''); setMessage('');
-    try {
-      const res = await mergeDocumentMappings(documentId, { target_mapping_id: mergeTargetId, source_mapping_ids: sourceIds });
-      setMappings(mappingsFrom(res.data));
-      setSelectedIds([]);
-      setMergeTargetId('');
-      setHasUnsavedMappingChanges(true);
-      setMessage('Записи таблицы соответствия объединены. Теперь можно выполнить повторное обезличивание.');
-    } catch (e) {
-      handleApiError('Не удалось объединить элементы таблицы соответствия.', e);
-    } finally { setBusy(''); }
-  };
-
-  const reanonymize = async () => {
-    setBusy('reanonymize'); setError(''); setMessage('');
-    try {
-      const res = await reanonymizeDocument(documentId, { mappings });
-      setAnonymizedText(textFrom(res.data) || anonymizedText);
-      const nextMappings = mappingsFrom(res.data);
-      if (nextMappings.length) setMappings(nextMappings);
-      setHasUnsavedMappingChanges(false);
-      setMessage('Документ повторно обезличен с учётом изменений таблицы соответствия.');
-    } catch (e) { handleApiError('Не удалось повторно обезличить документ.', e); }
-    finally { setBusy(''); }
-  };
-
-  const save = async () => {
-    if (hasUnsavedMappingChanges && !window.confirm('Таблица соответствия изменена, но повторное обезличивание не выполнено. Сохранить без повторного обезличивания?')) return;
-    setBusy('save'); setError(''); setMessage('');
-    try {
-      await saveAnonymization(documentId, { anonymized_text: anonymizedText, mappings });
-      setMessage('Документ сохранён.');
-      onSaved?.();
-    } catch (e) { handleApiError('Не удалось сохранить документ.', e); }
-    finally { setBusy(''); }
-  };
+  const add = async () => { if (!selectedText) return; const res = await addDocumentMapping(documentId, { original_value: selectedText, entity_type: entityType, mode: 'new' }); setMappings(mappingsFrom(res.data)); setWarning('После изменения таблицы соответствия выполните повторное обезличивание.'); };
+  const reanon = async () => { const res = await reanonymizeDocument(documentId, { mappings }); setMappings(mappingsFrom(res.data)); setAnonymizedText(textFrom(res.data)); setAnonymizedContent(contentFrom(res.data)); setWarning(''); };
 
   return <div className='anonymization-workspace'>
-    {message && <p className='success-message'>{message}</p>}{error && <p className='error-message'>{error}</p>}
-    {hasUnsavedMappingChanges && <div className='warning-message'>Таблица соответствия изменена. Для применения изменений к тексту выполните повторное обезличивание.</div>}
-    <section className='anonymized-text-panel'>
-      <h2>Обезличенный текст</h2>
-      {anonymizedText ? <pre>{anonymizedText}</pre> : <p className='empty-state'>Обезличенный текст пока не готов.</p>}
-      <div className='mapping-actions'><button type='button' className='button button-secondary' onClick={captureSelection}>Добавить выделение в таблицу соответствия</button></div>
-    </section>
-    <section className='selection-panel'>
-      <h3>Ручная разметка</h3>
-      <label>Выделенный текст</label><textarea readOnly rows={3} value={selectedText} />
-      <div className='form-grid'><div><label>Тип сущности</label><select value={entityType} onChange={(e) => setEntityType(e.target.value)}>{ENTITY_TYPE_OPTIONS.map((type) => <option key={type.value} value={type.value}>{type.label}</option>)}</select></div><div><label>Режим</label><select value={mode} onChange={(e) => setMode(e.target.value as 'new' | 'existing')}><option value='new'>Новое условное обозначение</option><option value='existing'>Использовать существующее обозначение</option></select></div>{mode === 'existing' && <div><label>Условное обозначение</label><select value={placeholder} onChange={(e) => setPlaceholder(e.target.value)}><option value=''>Выберите обозначение</option>{placeholders.map((p) => <option key={p} value={p}>{p}</option>)}</select></div>}</div>
-      <button type='button' className='button' disabled={busy === 'mapping'} onClick={addMapping}>Добавить в таблицу соответствия</button>
-    </section>
-    <section>
-      <h2>Таблица соответствия</h2>
-      <div className='mapping-merge-panel'>
-        <h3>Объединение записей</h3>
-        <p>Выбранные элементы: {selectedIds.length}</p>
-        <label>Целевое условное обозначение</label>
-        <select value={mergeTargetId} onChange={(e) => setMergeTargetId(e.target.value)}>
-          <option value=''>Выберите основную запись</option>
-          {mappingsWithId.filter((m) => selectedIds.includes(m.id)).map((m) => <option key={m.id} value={m.id}>{m.placeholder} — {m.original_value}</option>)}
-        </select>
-        <button type='button' className='button button-secondary' disabled={busy === 'merge'} onClick={mergeMappings}>Объединить выбранные</button>
-      </div>
-      <div className='table-card'><table className='mapping-table'><thead><tr><th></th><th>Условное обозначение</th><th>Исходное значение</th><th>Тип данных</th><th>Способ обнаружения</th><th>Действия</th></tr></thead><tbody>{mappingsWithId.map((m) => <tr className={selectedIds.includes(m.id) ? 'selected-row' : ''} key={m.id}><td><input type='checkbox' checked={selectedIds.includes(m.id)} onChange={(e) => setSelectedIds((prev) => e.target.checked ? [...prev, m.id] : prev.filter((id) => id !== m.id))} /></td><td>{val(m.placeholder)}</td><td className='mapping-original'>{val(m.original_value)}</td><td><span className='entity-badge'>{getEntityTypeLabel(m.entity_type)}</span></td><td><span className='source-badge'>{getSourceLabel(m.source)}</span></td><td>{editId === m.id ? <div className='mapping-edit-form'><label>Условное обозначение</label><input value={editForm.placeholder} onChange={(e) => setEditForm((prev) => ({ ...prev, placeholder: e.target.value }))} /><label>Исходное значение</label><textarea rows={3} value={editForm.original_value} onChange={(e) => setEditForm((prev) => ({ ...prev, original_value: e.target.value }))} /><label>Тип данных</label><select value={editForm.entity_type} onChange={(e) => setEditForm((prev) => ({ ...prev, entity_type: e.target.value }))}>{ENTITY_TYPE_OPTIONS.map((type) => <option key={type.value} value={type.value}>{type.label}</option>)}</select><div className='mapping-actions'><button type='button' className='button' disabled={busy === 'edit'} onClick={saveEdit}>Сохранить</button><button type='button' className='button button-secondary' onClick={() => setEditId(null)}>Отмена</button></div></div> : <div className='mapping-actions'><button type='button' className='button button-secondary' onClick={() => startEdit(m)}>Изменить</button><button type='button' className='button danger-button' disabled={busy === `delete-${m.id}`} onClick={() => deleteMapping(m.id)}>Удалить</button></div>}</td></tr>)}{mappingsWithId.length === 0 && <tr><td colSpan={6}>Таблица соответствия пуста.</td></tr>}</tbody></table></div>
-    </section>
-    <section className='document-actions'>
-      <p>Повторное обезличивание применяет ручную таблицу соответствия и заново обрабатывает документ.</p>
-      <button type='button' className='button button-secondary' disabled={!documentId || mappings.length === 0 || busy === 'reanonymize'} onClick={reanonymize}>Повторно обезличить</button>
-      <button type='button' className='button' disabled={!documentId || busy === 'save'} onClick={save}>Сохранить документ</button>
-      {caseId && <><Link className='button button-secondary' to={`/staff/cases/${caseId}`}>Назад к делу</Link><Link className='button button-secondary' to={`/staff/cases/${caseId}`}>Открыть дело</Link></>}
-      <Link className='button button-secondary' to={`/documents/${documentId}`}>Открыть публичную версию</Link>
-    </section>
+    <div className='redaction-mode-card'><h3>Режим обезличивания</h3><select><option value='NORMATIVE'>Нормативный режим публикации судебного акта</option><option value='EXTENDED_SAFE'>Расширенный безопасный режим</option></select><p>После смены режима необходимо повторно выполнить обезличивание.</p></div>
+    {warning && <p className='warning-message'>{warning}</p>}
+    {conflicts.size>0 && <div className='error-message'>Обнаружен конфликт условных обозначений: одно обозначение используется для разных сущностей. Разные сущности не могут иметь одно условное обозначение. Используйте объединение только для вариантов одного человека или объекта.</div>}
+    <button className='button danger-button' type='button' onClick={async()=>{await repairPlaceholders(documentId);}}>Исправить обозначения автоматически</button>
+    <RichDocumentEditor value={anonymizedContent || anonymizedText} editable onSelectionChange={setSelectedText} onChange={()=>setWarning('После изменения исходного текста необходимо повторное обезличивание.')} />
+    <section className='selection-panel'><h3>Выделенный фрагмент</h3><textarea readOnly value={selectedText} /><div className='form-grid'><select value={entityType} onChange={(e)=>setEntityType(e.target.value)}>{ENTITY_TYPE_OPTIONS.map((o)=><option key={o.value} value={o.value}>{o.label}</option>)}</select><button type='button' className='button' onClick={add}>Создать новую скрываемую сущность</button></div></section>
+    <div className='entity-tabs'><button className='button button-secondary' onClick={()=>setTab('REDACT')}>Обезличено</button><button className='button button-secondary' onClick={()=>setTab('KEEP')}>Оставлено в тексте</button><button className='button button-secondary' onClick={()=>setTab('REVIEW')}>Требует проверки</button></div>
+    <table className={`mapping-table ${tab==='KEEP'?'kept-entities-table':''} ${tab==='REVIEW'?'review-entities-table':''}`}><thead><tr><th>Условное обозначение</th><th>Основное значение</th><th>Варианты</th><th>Тип</th><th>Роль/контекст</th><th>Решение</th><th>Причина</th><th>Источник</th><th>Действия</th></tr></thead><tbody>{grouped[tab].map((m)=><tr key={m.id} className={m.placeholder && conflicts.has(m.placeholder)?'placeholder-conflict':''}><td>{m.placeholder||'—'}</td><td>{m.original_value}</td><td><ul className='alias-list'>{(m.aliases||[]).map((a,i)=><li key={i}>{a}</li>)}</ul></td><td>{getEntityTypeLabel(m.entity_type)}</td><td>{PERSON_ROLE_LABELS[m.role || ''] || m.context || DATE_PURPOSE_LABELS[m.date_purpose || ''] || LOCATION_PURPOSE_LABELS[m.location_purpose || ''] || '—'}</td><td><span className={`decision-badge decision-${(m.redaction_decision||'REDACT').toLowerCase()}`}>{REDACTION_DECISION_LABELS[m.redaction_decision || 'REDACT']}</span></td><td>{m.redaction_reason || m.ambiguity_reason || 'Подлежит обезличиванию'}</td><td>{getSourceLabel(m.source || m.detection_method)}</td><td><button className='button button-secondary' onClick={async()=>{ await updateDocumentMapping(documentId,m.id!,{placeholder:m.placeholder||'',original_value:m.original_value,entity_type:m.entity_type});}}>Изменить</button><button className='danger-button' onClick={async()=>{await deleteDocumentMapping(documentId,m.id!);}}>Удалить</button>{tab==='REVIEW'&&<><button className='button'>Скрыть</button><button className='button button-secondary'>Оставить</button></>} </td></tr>)} </tbody></table>
+    <p>После объединения выбранные варианты будут считаться одним лицом или объектом и получат одно условное обозначение.</p>
+    <button className='button button-secondary' onClick={async()=>{ if(withId.length>1){await mergeDocumentMappings(documentId,{target_mapping_id:withId[0].id!,source_mapping_ids:withId.slice(1,2).map(m=>m.id!)});} }}>Объединить с существующим лицом</button>
+    <button className='button button-secondary' onClick={reanon}>Повторно обезличить</button>
+    <button className='button' onClick={async()=>{await saveAnonymization(documentId,{anonymized_text:anonymizedText,mappings});}}>Сохранить документ</button>
+    {sourceText && <p className='warning-message'>Исходный текст изменён. Таблица соответствия может быть неактуальна. Выполните обезличивание повторно.</p>}
   </div>;
 }

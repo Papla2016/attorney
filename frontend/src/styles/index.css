@@ -19,3 +19,12 @@
 .entity-badge,.source-badge{display:inline-flex;align-items:center;background:#eef2f7;color:#243447;border:1px solid #d0d9e3;border-radius:999px;padding:4px 10px;font-size:12px;font-weight:600}
 .selected-row{background:#f4f7fb}
 .warning-message{background:#fff7ed;border:1px solid #fbd6a8;color:#8a4b08;border-radius:10px;padding:10px 12px;font-weight:600}
+.rich-editor,.preview-tab,.markdown-preview,.redaction-mode-card,.entity-cluster-card{background:#fff;border:1px solid #d8dee6;border-radius:12px;padding:12px}
+.rich-editor-toolbar{display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid #e5e7eb;padding-bottom:8px;margin-bottom:8px}
+.rich-editor-content{min-height:220px;max-height:560px;overflow:auto}
+.rich-editor-content .ProseMirror{min-height:220px;outline:none;line-height:1.6}
+.editor-tabs,.entity-tabs{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+.placeholder-conflict{background:#fee2e2}
+.alias-list{margin:0;padding-left:16px}
+.decision-badge{padding:4px 8px;border-radius:999px;font-size:12px;font-weight:700}
+.decision-redact{background:#dbeafe;color:#1e3a8a}.decision-keep{background:#dcfce7;color:#166534}.decision-review{background:#fef3c7;color:#92400e}
