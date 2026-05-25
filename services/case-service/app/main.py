@@ -200,6 +200,9 @@ class UploadDoc(BaseModel):
     title: str
     act_type: str
     text: str
+    content_format: str = 'PLAIN_TEXT'
+    content: dict | None = None
+    publication_redaction_mode: str = 'NORMATIVE'
 
 
 class CourtIn(BaseModel):
@@ -265,6 +268,7 @@ class MergeMappingsIn(BaseModel):
 
 class ReanonymizeIn(BaseModel):
     mappings: list[dict] = []
+    publication_redaction_mode: str = 'NORMATIVE'
 
 
 class SaveAnonymizationIn(BaseModel):
@@ -379,6 +383,9 @@ def sync_doc_from_anonymization(d: dict, payload: dict):
         d['mappings'] = [ensure_mapping_metadata(m) for m in (payload.get('mappings') or [])]
     if 'original_text' in payload:
         d['original_text'] = payload.get('original_text') or d.get('original_text', '')
+    for k in ['recognized_but_kept','review_entities','publication_redaction_mode','content_format','original_content','ner_provider']:
+        if k in payload:
+            d[k]=payload.get(k)
 
 
 def document_metadata(cs: dict):
@@ -586,6 +593,18 @@ async def system_health(authorization: str | None = Header(None)):
     ]}
 
 
+@app.get('/api/cases/admin/ner-health')
+async def ner_health(authorization: str | None = Header(None)):
+    c = claims(authorization)
+    if not allowed(c, ['ADMIN', 'COURT_STAFF', 'JUDGE', 'COURT_CLERK']):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    async with httpx.AsyncClient(timeout=5.0) as cl:
+        r = await cl.get(f'{NER}/health')
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=error_payload('NER_UNAVAILABLE', 'Сервис NER недоступен'))
+    return r.json()
+
+
 @app.get('/api/cases/me/favorites')
 def get_favorites(authorization: str | None = Header(None)):
     c = claims(authorization)
@@ -703,21 +722,24 @@ async def upload(case_id: str, body: UploadDoc, authorization: str | None = Head
     if not cs:
         err('NOT_FOUND', 'Дело не найдено', 404)
     d = {'id': str(uuid.uuid4()), 'case_id': case_id, 'title': body.title, 'act_type': body.act_type, 'status': 'PROCESSING',
-         'document_date': cs.get('document_date'), 'original_text': body.text, 'anonymized_text': body.text, 'mappings': []}
+         'document_date': cs.get('document_date'), 'original_text': body.text, 'anonymized_text': body.text, 'mappings': [], 'content_format': body.content_format, 'original_content': body.content, 'publication_redaction_mode': body.publication_redaction_mode, 'recognized_but_kept': [], 'review_entities': []}
     docs.append(d)
     try:
         async with httpx.AsyncClient() as cl:
-            r = await cl.post(f'{ANON}/internal/anonymization/process', headers={'X-Internal-Service-Token': INTERNAL}, json={'case_id': case_id, 'document_id': d['id'], 'title': body.title, 'text': body.text, 'metadata': {}})
+            r = await cl.post(f'{ANON}/internal/anonymization/process', headers={'X-Internal-Service-Token': INTERNAL}, json={'case_id': case_id, 'document_id': d['id'], 'title': body.title, 'text': body.text, 'metadata': {}, 'content_format': body.content_format, 'original_content': body.content, 'publication_redaction_mode': body.publication_redaction_mode})
         p = r.json()
         d['anonymization_job_id'] = p.get('job_id')
         d['anonymized_text'] = p.get('anonymized_text') or d['anonymized_text']
         d['mappings'] = [ensure_mapping_metadata(m) for m in (p.get('mappings') or [])]
+        d['recognized_but_kept'] = p.get('recognized_but_kept', [])
+        d['review_entities'] = p.get('review_entities', [])
+        d['publication_redaction_mode'] = p.get('publication_redaction_mode', body.publication_redaction_mode)
     except Exception:
         d['anonymization_job_id'] = None
     d['status'] = 'ANONYMIZED'
     d['public_anonymized_document_id'] = d['id']
     audit(c.get('sub'), 'UPLOAD_DOCUMENT', 'DOCUMENT', d['id'], {'case_id': case_id})
-    return {'document_id': d['id'], 'case_id': case_id, 'title': d['title'], 'status': d['status'], 'anonymization_job_id': d.get('anonymization_job_id'), 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
+    return {'document_id': d['id'], 'case_id': case_id, 'title': d['title'], 'status': d['status'], 'anonymization_job_id': d.get('anonymization_job_id'), 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', []), 'recognized_but_kept': d.get('recognized_but_kept', []), 'review_entities': d.get('review_entities', []), 'publication_redaction_mode': d.get('publication_redaction_mode', 'NORMATIVE'), 'ner_provider': d.get('ner_provider')} 
 
 
 @app.delete('/api/cases/{case_id}/documents/{document_id}')
@@ -762,7 +784,7 @@ async def get_document_anonymization(document_id: str, authorization: str | None
     except Exception:
         pass
     ensure_doc_mappings(d)
-    return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
+    return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', []), 'recognized_but_kept': d.get('recognized_but_kept', []), 'review_entities': d.get('review_entities', []), 'publication_redaction_mode': d.get('publication_redaction_mode', 'NORMATIVE'), 'ner_provider': d.get('ner_provider')} 
 
 
 @app.post('/api/cases/documents/{document_id}/mappings')
@@ -778,7 +800,7 @@ async def add_document_mapping(document_id: str, body: MappingIn, authorization:
     payload = r.json()
     sync_doc_from_anonymization(d, payload)
     audit(c.get('sub'), 'ADD_MANUAL_MAPPING', 'DOCUMENT', document_id, {'document_id': document_id, 'case_id': d['case_id'], 'original_value': body.original_value, 'placeholder': body.placeholder, 'mode': body.mode})
-    return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
+    return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', []), 'recognized_but_kept': d.get('recognized_but_kept', []), 'review_entities': d.get('review_entities', []), 'publication_redaction_mode': d.get('publication_redaction_mode', 'NORMATIVE'), 'ner_provider': d.get('ner_provider')} 
 
 @app.patch('/api/cases/documents/{document_id}/mappings/{mapping_id}')
 async def update_document_mapping(document_id: str, mapping_id: str, body: MappingPatchIn, authorization: str | None = Header(None)):
@@ -797,7 +819,7 @@ async def update_document_mapping(document_id: str, mapping_id: str, body: Mappi
     payload = r.json()
     sync_doc_from_anonymization(d, payload)
     audit(c.get('sub'), 'UPDATE_MAPPING', 'DOCUMENT', document_id, {'document_id': document_id, 'case_id': d['case_id'], 'mapping_id': mapping_id})
-    return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
+    return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', []), 'recognized_but_kept': d.get('recognized_but_kept', []), 'review_entities': d.get('review_entities', []), 'publication_redaction_mode': d.get('publication_redaction_mode', 'NORMATIVE'), 'ner_provider': d.get('ner_provider')} 
 
 
 @app.delete('/api/cases/documents/{document_id}/mappings/{mapping_id}')
@@ -813,7 +835,7 @@ async def delete_document_mapping(document_id: str, mapping_id: str, authorizati
     payload = r.json()
     sync_doc_from_anonymization(d, payload)
     audit(c.get('sub'), 'DELETE_MAPPING', 'DOCUMENT', document_id, {'document_id': document_id, 'case_id': d['case_id'], 'mapping_id': mapping_id})
-    return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
+    return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', []), 'recognized_but_kept': d.get('recognized_but_kept', []), 'review_entities': d.get('review_entities', []), 'publication_redaction_mode': d.get('publication_redaction_mode', 'NORMATIVE'), 'ner_provider': d.get('ner_provider')} 
 
 
 @app.post('/api/cases/documents/{document_id}/mappings/merge')
@@ -838,7 +860,23 @@ async def merge_document_mappings(document_id: str, body: MergeMappingsIn, autho
         'target_mapping_id': body.target_mapping_id,
         'source_mapping_ids': body.source_mapping_ids,
     })
-    return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
+    return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', []), 'recognized_but_kept': d.get('recognized_but_kept', []), 'review_entities': d.get('review_entities', []), 'publication_redaction_mode': d.get('publication_redaction_mode', 'NORMATIVE'), 'ner_provider': d.get('ner_provider')} 
+
+
+@app.post('/api/cases/documents/{document_id}/mappings/repair-placeholders')
+async def repair_document_placeholders(document_id: str, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    d, cs = find_document_and_case(document_id)
+    if not can_manage_case(c, cs):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    async with httpx.AsyncClient(timeout=10.0) as cl:
+        r = await cl.post(f'{ANON}/internal/anonymization/documents/{document_id}/mappings/repair-placeholders', headers={'X-Internal-Service-Token': INTERNAL})
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.json())
+    payload = r.json()
+    sync_doc_from_anonymization(d, payload)
+    audit(c.get('sub'), 'REPAIR_PLACEHOLDERS', 'DOCUMENT', document_id, {'document_id': document_id, 'case_id': d['case_id']})
+    return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', []), 'recognized_but_kept': d.get('recognized_but_kept', []), 'review_entities': d.get('review_entities', [])}
 
 
 @app.post('/api/cases/documents/{document_id}/reanonymize')
@@ -855,7 +893,7 @@ async def reanonymize_document(document_id: str, body: ReanonymizeIn, authorizat
     sync_doc_from_anonymization(d, payload)
     d['status'] = 'ANONYMIZED'
     audit(c.get('sub'), 'REANONYMIZE_DOCUMENT', 'DOCUMENT', document_id, {'document_id': document_id, 'case_id': d['case_id']})
-    return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', [])}
+    return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', []), 'recognized_but_kept': d.get('recognized_but_kept', []), 'review_entities': d.get('review_entities', []), 'publication_redaction_mode': d.get('publication_redaction_mode', 'NORMATIVE'), 'ner_provider': d.get('ner_provider')} 
 
 
 @app.post('/api/cases/documents/{document_id}/save-anonymization')

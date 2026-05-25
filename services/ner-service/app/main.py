@@ -13,6 +13,7 @@ LOGGER = logging.getLogger(__name__)
 class Entity(BaseModel):
     type: str
     text: str
+    normalized_text: str | None = None
     start: int
     end: int
     confidence: float
@@ -74,9 +75,13 @@ class NatashaNerProvider(BaseNerProvider):
             span.normalize(self.morph_vocab)
             mapped_type = map_natasha_type(span.type)
             if mapped_type in {'PERSON_FULL_NAME', 'LOCATION', 'ORGANIZATION'}:
+                normalized_text = getattr(span, 'normal', None) or span.text
+                if not getattr(span, 'normal', None):
+                    LOGGER.info('Natasha normalization missing for span: %s', span.text)
                 entities.append(Entity(
                     type=mapped_type,
                     text=span.text,
+                    normalized_text=normalized_text,
                     start=span.start,
                     end=span.stop,
                     confidence=0.90,
@@ -121,10 +126,10 @@ class RegexRuleNerProvider(BaseNerProvider):
             for m in pattern.finditer(text):
                 value = m.group(0).strip(' ,;')
                 start = m.start() + (len(m.group(0)) - len(m.group(0).lstrip(' ,;')))
-                entities.append(Entity(type=etype, text=value, start=start, end=start + len(value), confidence=conf, source=source))
+                entities.append(Entity(type=etype, text=value, normalized_text=None, start=start, end=start + len(value), confidence=conf, source=source))
         for etype, pattern, conf in self.role_patterns:
             for m in pattern.finditer(text):
-                entities.append(Entity(type=etype, text=m.group(1), start=m.start(1), end=m.end(1), confidence=conf, source='rule'))
+                entities.append(Entity(type=etype, text=m.group(1), normalized_text=None, start=m.start(1), end=m.end(1), confidence=conf, source='rule'))
         return deduplicate_entities(entities)
 
 

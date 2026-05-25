@@ -135,23 +135,24 @@ def normalize_person_name(value: str) -> tuple[str, dict]:
     short = re.match(r'^([А-ЯЁ][а-яё]+)\s+([А-ЯЁ])\.\s*([А-ЯЁ])\.$', cleaned)
     if short:
         surname, i1, i2 = short.groups()
-        return cleaned, {'surname': surname, 'initials': f'{i1}{i2}'}
+        return cleaned, {'surname': surname.lower(), 'initials': f'{i1}{i2}'.lower(), 'is_short': True}
     parts = cleaned.split()
     if len(parts) >= 3:
-        surname = parts[0].rstrip('а') if parts[0].endswith(('ова', 'ева')) else parts[0]
         initials = ''.join(p[0] for p in parts[1:3] if p)
-        return f'{surname} {parts[1]} {parts[2]}', {'surname': surname, 'initials': initials.upper()}
-    return cleaned, {'surname': parts[0] if parts else cleaned, 'initials': ''}
+        return f'{parts[0]} {parts[1]} {parts[2]}', {'surname': parts[0].lower(), 'initials': initials.lower(), 'is_short': False}
+    return cleaned, {'surname': (parts[0].lower() if parts else cleaned.lower()), 'initials': '', 'is_short': False}
 
 
 def detect_person_role(text: str, start: int, end: int) -> str:
-    context = text[max(0, start - 80):min(len(text), end + 80)].lower()
-    if 'судья' in context:
+    prefix = text[max(0, start - 120):start].lower()
+    if re.search(r'председательствующего\s+судьи\s*$', prefix) or re.search(r'судьи\s*$', prefix):
         return 'JUDGE'
-    if 'секретар' in context:
+    if re.search(r'при\s+секретаре\s*$', prefix):
         return 'COURT_SECRETARY'
-    if 'свидетел' in context:
-        return 'WITNESS'
+    if re.search(r'(по\s+иску|истцом)\s*$', prefix):
+        return 'PLAINTIFF'
+    if re.search(r'индивидуальным\s+предпринимателем\s*$', prefix):
+        return 'INDIVIDUAL_ENTREPRENEUR'
     return 'UNKNOWN'
 
 
@@ -224,7 +225,7 @@ def resolve_entities(text: str, entities: list[dict], mode: str = 'NORMATIVE') -
         }
         if source_type in {'PERSON_FULL_NAME', 'JUDGE', 'COURT_SECRETARY', 'CASE_PARTICIPANT'}:
             item['entity_class'] = 'PERSON'
-            norm, sign = normalize_person_name(value)
+            norm, sign = normalize_person_name(raw.get('normalized_text') or value)
             item['normalized_value'] = norm
             item['signature'] = sign
             item['person_role'] = detect_person_role(text, item['start'], item['end'])
@@ -292,7 +293,7 @@ def replace_by_mappings(text: str, mappings: list[dict]) -> str:
     return anonymized
 
 
-def build_mappings_from_resolved(resolved: list[dict]) -> tuple[list[dict], list[dict]]:
+def build_mappings_from_resolved(resolved: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
     cluster_to_placeholder: dict[str, str] = {}
     counters: dict[str, int] = defaultdict(int)
     grouped: dict[str, list[dict]] = defaultdict(list)
@@ -327,13 +328,14 @@ def build_mappings_from_resolved(resolved: list[dict]) -> tuple[list[dict], list
             'requires_review': any(i.get('requires_review') for i in items),
             'entity_type': entity_class,
         }))
-    kept = [{'original_value': e['surface_value'], 'entity_class': e['entity_class'], 'person_role': e.get('person_role'), 'redaction_decision': e['redaction_decision'], 'redaction_reason': e['redaction_reason']} for e in resolved if e['redaction_decision'] != 'REDACT']
-    return mappings, kept
+    kept = [{'original_value': e['surface_value'], 'normalized_value': e.get('normalized_value'), 'entity_class': e['entity_class'], 'person_role': e.get('person_role'), 'redaction_decision': e['redaction_decision'], 'redaction_reason': e['redaction_reason'], 'source': e.get('source')} for e in resolved if e['redaction_decision'] == 'KEEP']
+    review = [{'original_value': e['surface_value'], 'entity_class': e['entity_class'], 'redaction_decision': e['redaction_decision'], 'redaction_reason': e['redaction_reason'], 'source': e.get('source')} for e in resolved if e['redaction_decision'] == 'REVIEW']
+    return mappings, kept, review
 
 
 def apply_anonymization(text: str, entities: list[dict]) -> tuple[str, list[dict]]:
     resolved = resolve_entities(text, entities, 'NORMATIVE')
-    mappings, _ = build_mappings_from_resolved(resolved)
+    mappings, _, _ = build_mappings_from_resolved(resolved)
     return replace_by_mappings(text, mappings), mappings
 
 
@@ -392,14 +394,18 @@ async def process(body: ProcessRequest, x_internal_service_token: str | None = H
     entities = await extract_entities(body.text)
 
     resolved = resolve_entities(body.text, entities, body.publication_redaction_mode)
-    mappings, recognized_but_kept = build_mappings_from_resolved(resolved)
+    mappings, recognized_but_kept, review_entities = build_mappings_from_resolved(resolved)
     manual_mappings_by_document_id.setdefault(body.document_id, [])
     mappings = merge_mappings(manual_mappings_by_document_id[body.document_id], mappings)
     anonymized = replace_by_mappings(body.text, mappings)
 
     save_document(body.document_id, body.case_id, body.title, body.text, anonymized, mappings, body.metadata, recognized_but_kept)
     jobs[job_id]['status'] = 'COMPLETED'
-    return {'job_id': job_id, 'status': 'COMPLETED', 'anonymized_document_id': body.document_id, 'anonymized_text': anonymized, 'mappings': mappings, 'recognized_but_kept': recognized_but_kept}
+    restored_docs[body.document_id]['review_entities']=review_entities
+    restored_docs[body.document_id]['publication_redaction_mode']=body.publication_redaction_mode
+    restored_docs[body.document_id]['content_format']=body.content_format
+    restored_docs[body.document_id]['original_content']=body.original_content
+    return {'job_id': job_id, 'status': 'COMPLETED', 'anonymized_document_id': body.document_id, 'anonymized_text': anonymized, 'mappings': mappings, 'recognized_but_kept': recognized_but_kept, 'review_entities': review_entities, 'publication_redaction_mode': body.publication_redaction_mode}
 
 
 @app.get('/internal/anonymization/documents/{document_id}/public')
@@ -520,6 +526,29 @@ def merge_document_mappings(document_id: str, body: MergeMappingsRequest, x_inte
     return {'document_id': document_id, 'anonymized_text': doc.get('anonymized_text', ''), 'mappings': doc['mappings']}
 
 
+
+@app.post('/internal/anonymization/documents/{document_id}/mappings/repair-placeholders')
+def repair_placeholders(document_id: str, x_internal_service_token: str | None = Header(None)):
+    require_internal(x_internal_service_token)
+    if document_id not in restored_docs:
+        _error(404, 'NOT_FOUND', 'Документ не найден')
+    doc = restored_docs[document_id]
+    mappings = ensure_document_mappings(document_id)
+    counters = defaultdict(int)
+    by_cluster = {}
+    for m in mappings:
+        cluster = m.get('cluster_id') or f"{m.get('entity_class','OTHER')}::{m.get('normalized_value', m.get('original_value',''))}"
+        et = m.get('entity_class') or m.get('entity_type') or 'OTHER'
+        prefix = 'ФИО' if et == 'PERSON' else make_placeholder(et, 0)[:-1]
+        if cluster not in by_cluster:
+            counters[prefix]+=1
+            by_cluster[cluster]=f"{prefix}{counters[prefix]}"
+        m['placeholder']=by_cluster[cluster]
+    doc['mappings']=mappings
+    doc['anonymized_text']=replace_by_mappings(doc.get('original_text',''), mappings)
+    audit_log.append({'id': str(uuid.uuid4()), 'document_id': document_id, 'action': 'REPAIR_PLACEHOLDERS', 'created_at': now_iso(), 'details': {}})
+    return {'anonymized_text': doc['anonymized_text'], 'mappings': mappings, 'recognized_but_kept': doc.get('recognized_but_kept', []), 'review_entities': doc.get('review_entities', [])}
+
 @app.post('/internal/anonymization/documents/{document_id}/reanonymize')
 async def reanonymize(document_id: str, body: ReanonymizeRequest, x_internal_service_token: str | None = Header(None)):
     require_internal(x_internal_service_token)
@@ -534,12 +563,14 @@ async def reanonymize(document_id: str, body: ReanonymizeRequest, x_internal_ser
 
     entities = await extract_entities(original_text)
     resolved = resolve_entities(original_text, entities, body.publication_redaction_mode)
-    ner_mappings, recognized_but_kept = build_mappings_from_resolved(resolved)
+    ner_mappings, recognized_but_kept, review_entities = build_mappings_from_resolved(resolved)
     base_mappings = merge_mappings(incoming_mappings, ner_mappings)
     mappings = merge_mappings(manual_mappings_by_document_id[document_id], base_mappings)
     anonymized = replace_by_mappings(original_text, mappings)
     save_document(document_id, doc.get('case_id', ''), doc.get('title', ''), original_text, anonymized, mappings, public_docs.get(document_id, {}).get('metadata', {}), recognized_but_kept)
-    return {'document_id': document_id, 'anonymized_text': anonymized, 'mappings': mappings, 'recognized_but_kept': recognized_but_kept}
+    restored_docs[document_id]['review_entities']=review_entities
+    restored_docs[document_id]['publication_redaction_mode']=body.publication_redaction_mode
+    return {'document_id': document_id, 'anonymized_text': anonymized, 'mappings': mappings, 'recognized_but_kept': recognized_but_kept, 'review_entities': review_entities, 'publication_redaction_mode': body.publication_redaction_mode}
 
 
 @app.delete('/internal/anonymization/documents/{document_id}')
