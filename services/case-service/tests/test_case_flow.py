@@ -340,3 +340,73 @@ def test_entity_types_dictionary():
 
     assert response.status_code == 200
     assert {'value': 'PERSON_FULL_NAME', 'label': 'ФИО'} in response.json()
+
+
+def test_save_anonymization_persists_content_and_pending_fields():
+    client = TestClient(app)
+    doc = {
+        'id': 'test-save-content',
+        'case_id': main.seed_case['id'],
+        'title': 'Сохранение контента',
+        'act_type': 'RULING',
+        'status': 'ANONYMIZED',
+        'document_date': '2026-05-10',
+        'original_text': 'Текст',
+        'anonymized_text': 'Текст',
+        'mappings': [],
+    }
+    main.docs.append(doc)
+    try:
+        payload = {
+            'anonymized_text': 'ФИО1',
+            'anonymized_content': {'type': 'doc', 'content': []},
+            'mappings': [{'placeholder': 'ФИО1', 'original_value': 'Иванов', 'entity_type': 'PERSON_FULL_NAME'}],
+            'pending_review': [{'entity_key': 'PERSON::Иванов'}],
+            'pending_markers': [{'entity_key': 'PERSON::Иванов', 'start': 0, 'end': 6}],
+        }
+        saved = client.post(f'/api/cases/documents/{doc["id"]}/save-anonymization', headers=auth_header(), json=payload)
+        fetched = client.get(f'/api/cases/documents/{doc["id"]}/anonymization', headers=auth_header())
+        assert saved.status_code == 200
+        assert saved.json()['anonymized_content'] == payload['anonymized_content']
+        assert saved.json()['pending_review'] == payload['pending_review']
+        assert fetched.status_code == 200
+        assert fetched.json()['anonymized_content'] == payload['anonymized_content']
+    finally:
+        main.docs.remove(doc)
+
+
+def test_publish_blocked_by_pending_or_review_entities():
+    client = TestClient(app)
+    case = {
+        **main.seed_case,
+        'id': 'test-publish-block-case',
+        'case_number': 'publish-block',
+        'status': 'DRAFT',
+        'staff_user_ids': [JUDGE_ID],
+        'judge_user_ids': [JUDGE_ID],
+    }
+    doc = {
+        'id': 'test-publish-block-doc',
+        'case_id': case['id'],
+        'title': 'Блок публикации',
+        'act_type': 'RULING',
+        'status': 'ANONYMIZED',
+        'document_date': '2026-05-10',
+        'anonymized_text': 'Готово',
+        'pending_review': [],
+        'review_entities': [{'entity_class': 'EMAIL', 'requires_review': True}],
+    }
+    main.cases.append(case)
+    main.case_staff[case['id']] = {JUDGE_ID}
+    main.docs.append(doc)
+    try:
+        response = client.post(f'/api/cases/documents/{doc["id"]}/publish', headers=auth_header())
+        assert response.status_code == 409
+        error = response.json()['error']
+        assert error['code'] == 'PENDING_REDACTION_REVIEW'
+        assert error['details']['pending_count'] == 0
+        assert error['details']['review_count'] == 1
+    finally:
+        main.docs.remove(doc)
+        main.cases.remove(case)
+        main.case_staff.pop(case['id'], None)

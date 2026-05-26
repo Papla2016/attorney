@@ -292,6 +292,8 @@ class SaveAnonymizationIn(BaseModel):
     recognized_but_kept: list[dict] | None = None
     review_entities: list[dict] | None = None
     review_markers: list[dict] | None = None
+    pending_review: list[dict] | None = None
+    pending_markers: list[dict] | None = None
     manual_decisions: list[dict] | None = None
 
 
@@ -417,23 +419,23 @@ def sync_doc_from_anonymization(d: dict, payload: dict):
 apply_doc_sync = sync_doc_from_anonymization
 
 
-def build_anonymization_result(d: dict, cs: dict) -> dict:
+def anonymization_result_response(document: dict, case: dict | None = None) -> dict:
     return {
-        'document_id': d['id'],
-        'case_id': cs['id'],
-        'title': d['title'],
-        'anonymized_text': d.get('anonymized_text', ''),
-        'anonymized_content': d.get('anonymized_content'),
-        'content_format': d.get('content_format', 'PLAIN_TEXT'),
-        'mappings': d.get('mappings', []),
-        'recognized_but_kept': d.get('recognized_but_kept', []),
-        'review_entities': d.get('review_entities', []),
-        'review_markers': d.get('review_markers', []),
-        'pending_review': d.get('pending_review', []),
-        'pending_markers': d.get('pending_markers', []),
-        'manual_decisions': d.get('manual_decisions', []),
-        'publication_redaction_mode': d.get('publication_redaction_mode', 'NORMATIVE'),
-        'ner_provider': d.get('ner_provider', 'hybrid'),
+        'document_id': document['id'],
+        'case_id': document.get('case_id') or (case.get('id') if case else None),
+        'title': document.get('title'),
+        'anonymized_text': document.get('anonymized_text', ''),
+        'anonymized_content': document.get('anonymized_content'),
+        'content_format': document.get('content_format', 'PLAIN_TEXT'),
+        'mappings': document.get('mappings', []),
+        'recognized_but_kept': document.get('recognized_but_kept', []),
+        'review_entities': document.get('review_entities', []),
+        'review_markers': document.get('review_markers', []),
+        'pending_review': document.get('pending_review', []),
+        'pending_markers': document.get('pending_markers', []),
+        'manual_decisions': document.get('manual_decisions', []),
+        'publication_redaction_mode': document.get('publication_redaction_mode', 'NORMATIVE'),
+        'ner_provider': document.get('ner_provider'),
     }
 
 
@@ -788,7 +790,7 @@ async def upload(case_id: str, body: UploadDoc, authorization: str | None = Head
     d['status'] = 'ANONYMIZED'
     d['public_anonymized_document_id'] = d['id']
     audit(c.get('sub'), 'UPLOAD_DOCUMENT', 'DOCUMENT', d['id'], {'case_id': case_id})
-    return build_anonymization_result(d, cs)
+    return anonymization_result_response(d, cs)
 
 
 @app.delete('/api/cases/{case_id}/documents/{document_id}')
@@ -833,7 +835,7 @@ async def get_document_anonymization(document_id: str, authorization: str | None
     except Exception:
         pass
     ensure_doc_mappings(d)
-    return build_anonymization_result(d, cs)
+    return anonymization_result_response(d, cs)
 
 
 @app.post('/api/cases/documents/{document_id}/mappings')
@@ -849,7 +851,7 @@ async def add_document_mapping(document_id: str, body: MappingIn, authorization:
     payload = r.json()
     sync_doc_from_anonymization(d, payload)
     audit(c.get('sub'), 'ADD_MANUAL_MAPPING', 'DOCUMENT', document_id, {'document_id': document_id, 'case_id': d['case_id'], 'original_value': body.original_value, 'placeholder': body.placeholder, 'mode': body.mode})
-    return build_anonymization_result(d, cs)
+    return anonymization_result_response(d, cs)
 
 @app.patch('/api/cases/documents/{document_id}/mappings/{mapping_id}')
 async def update_document_mapping(document_id: str, mapping_id: str, body: MappingPatchIn, authorization: str | None = Header(None)):
@@ -868,7 +870,7 @@ async def update_document_mapping(document_id: str, mapping_id: str, body: Mappi
     payload = r.json()
     sync_doc_from_anonymization(d, payload)
     audit(c.get('sub'), 'UPDATE_MAPPING', 'DOCUMENT', document_id, {'document_id': document_id, 'case_id': d['case_id'], 'mapping_id': mapping_id})
-    return build_anonymization_result(d, cs)
+    return anonymization_result_response(d, cs)
 
 
 @app.delete('/api/cases/documents/{document_id}/mappings/{mapping_id}')
@@ -884,7 +886,7 @@ async def delete_document_mapping(document_id: str, mapping_id: str, authorizati
     payload = r.json()
     sync_doc_from_anonymization(d, payload)
     audit(c.get('sub'), 'DELETE_MAPPING', 'DOCUMENT', document_id, {'document_id': document_id, 'case_id': d['case_id'], 'mapping_id': mapping_id})
-    return build_anonymization_result(d, cs)
+    return anonymization_result_response(d, cs)
 
 
 @app.post('/api/cases/documents/{document_id}/mappings/merge')
@@ -909,7 +911,7 @@ async def merge_document_mappings(document_id: str, body: MergeMappingsIn, autho
         'target_mapping_id': body.target_mapping_id,
         'source_mapping_ids': body.source_mapping_ids,
     })
-    return build_anonymization_result(d, cs)
+    return anonymization_result_response(d, cs)
 
 
 @app.post('/api/cases/documents/{document_id}/mappings/repair-placeholders')
@@ -925,7 +927,7 @@ async def repair_document_placeholders(document_id: str, authorization: str | No
     payload = r.json()
     sync_doc_from_anonymization(d, payload)
     audit(c.get('sub'), 'REPAIR_PLACEHOLDERS', 'DOCUMENT', document_id, {'document_id': document_id, 'case_id': d['case_id']})
-    return build_anonymization_result(d, cs)
+    return anonymization_result_response(d, cs)
 
 
 @app.post('/api/cases/documents/{document_id}/reanonymize')
@@ -942,7 +944,7 @@ async def reanonymize_document(document_id: str, body: ReanonymizeIn, authorizat
     sync_doc_from_anonymization(d, payload)
     d['status'] = 'ANONYMIZED'
     audit(c.get('sub'), 'REANONYMIZE_DOCUMENT', 'DOCUMENT', document_id, {'document_id': document_id, 'case_id': d['case_id']})
-    return build_anonymization_result(d, cs)
+    return anonymization_result_response(d, cs)
 
 
 
@@ -964,7 +966,7 @@ async def redaction_decisions(document_id: str, body: RedactionDecisionIn, autho
         detail = r.json() if r.headers.get('content-type','').startswith('application/json') else error_payload('UPSTREAM_ERROR','Ошибка сервиса обезличивания')
         raise HTTPException(status_code=r.status_code, detail=detail if isinstance(detail, dict) else error_payload('UPSTREAM_ERROR', str(detail)))
     apply_doc_sync(d, r.json())
-    return build_anonymization_result(d, cs)
+    return anonymization_result_response(d, cs)
 @app.post('/api/cases/documents/{document_id}/save-anonymization')
 def save_anonymization(document_id: str, body: SaveAnonymizationIn, authorization: str | None = Header(None)):
     c = claims(authorization)
@@ -975,14 +977,14 @@ def save_anonymization(document_id: str, body: SaveAnonymizationIn, authorizatio
     d['anonymized_content'] = body.anonymized_content
     d['content_format'] = body.content_format
     d['mappings'] = [ensure_mapping_metadata(m) for m in body.mappings]
-    for fld in ['recognized_but_kept', 'review_entities', 'review_markers', 'manual_decisions']:
+    for fld in ['recognized_but_kept', 'review_entities', 'review_markers', 'pending_review', 'pending_markers', 'manual_decisions']:
         val = getattr(body, fld)
         if val is not None:
             d[fld] = val
     if d.get('status') == 'PROCESSING':
         d['status'] = 'ANONYMIZED'
     audit(c.get('sub'), 'SAVE_ANONYMIZATION', 'DOCUMENT', document_id, {'document_id': document_id, 'case_id': d['case_id'], 'action': 'SAVE_EDITED_ANONYMIZED_DOCUMENT'})
-    return build_anonymization_result(d, cs)
+    return anonymization_result_response(d, cs)
 
 
 @app.post('/api/cases/documents/{document_id}/draft-scan')
@@ -1024,9 +1026,10 @@ def publish_document(document_id: str, authorization: str | None = Header(None))
     if d['status'] not in ['ANONYMIZED', 'PUBLISHED']:
         err('BAD_REQUEST', 'Документ должен быть обезличен перед публикацией', 400)
     pending_count = len(d.get('pending_review', []))
-    if pending_count:
+    review_count = len(d.get('review_entities', []))
+    if pending_count or review_count:
         audit(c.get('sub'), 'BLOCK_PUBLICATION_PENDING_REVIEW', 'DOCUMENT', document_id, {'case_id': d['case_id'], 'pending_count': pending_count})
-        err('PENDING_REDACTION_REVIEW', 'Документ содержит сведения, требующие проверки перед публикацией.', 409, {'pending_count': pending_count})
+        err('PENDING_REDACTION_REVIEW', 'Документ содержит сведения, требующие проверки перед публикацией.', 409, {'pending_count': pending_count, 'review_count': review_count})
     d['status'] = 'PUBLISHED'
     if any(doc['case_id'] == cs['id'] and doc['status'] == 'PUBLISHED' for doc in docs):
         cs['status'] = 'PUBLISHED'
