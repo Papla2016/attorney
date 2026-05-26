@@ -1,5 +1,5 @@
 import { client } from './client';
-import type { CreateCaseRequest, UploadDocumentRequest, UpdateCaseRequest, EntityMapping } from './types';
+import type { AnonymizationResult, CreateCaseRequest, UploadDocumentRequest, UpdateCaseRequest, EntityMapping } from './types';
 
 export const searchPublicDocuments = (params: any) => client.get('/cases/public/documents', { params });
 export const getPublicDocument = (id: string) => client.get(`/cases/public/documents/${id}`);
@@ -22,8 +22,8 @@ export const addDocumentMapping = (documentId: string, payload: { original_value
 export const updateDocumentMapping = (documentId: string, mappingId: string, payload: { placeholder: string; original_value: string; entity_type: string }) => client.patch(`/cases/documents/${documentId}/mappings/${mappingId}`, payload);
 export const deleteDocumentMapping = (documentId: string, mappingId: string) => client.delete(`/cases/documents/${documentId}/mappings/${mappingId}`);
 export const mergeDocumentMappings = (documentId: string, payload: { target_mapping_id: string; source_mapping_ids: string[] }) => client.post(`/cases/documents/${documentId}/mappings/merge`, payload);
-export const reanonymizeDocument = (documentId: string, payload: { mappings: EntityMapping[]; publication_redaction_mode: 'NORMATIVE' | 'EXTENDED_SAFE' }) => client.post(`/cases/documents/${documentId}/reanonymize`, payload);
-export const saveAnonymization = (documentId: string, payload: { anonymized_text: string; mappings: EntityMapping[] }) => client.post(`/cases/documents/${documentId}/save-anonymization`, payload);
+export const reanonymizeDocument = (documentId: string, payload: { mappings: EntityMapping[]; publication_redaction_mode: 'NORMATIVE' | 'EXTENDED_SAFE' }) => client.post<AnonymizationResult>(`/cases/documents/${documentId}/reanonymize`, payload);
+export const saveAnonymization = (documentId: string, payload: { anonymized_text: string; anonymized_content?: unknown; mappings: EntityMapping[] }) => client.post<AnonymizationResult>(`/cases/documents/${documentId}/save-anonymization`, payload);
 export const deleteCaseDocument = (caseId: string, documentId: string) => client.delete(`/cases/${caseId}/documents/${documentId}`);
 
 export const repairPlaceholders = (documentId: string) => client.post(`/cases/documents/${documentId}/mappings/repair-placeholders`);
@@ -31,6 +31,7 @@ export const repairPlaceholders = (documentId: string) => client.post(`/cases/do
 export const applyRedactionDecision = (
   documentId: string,
   payload: {
+    entity_key?: string;
     selected_text: string;
     decision: 'REDACT' | 'KEEP' | 'MERGE_WITH_EXISTING';
     entity_class: string;
@@ -38,4 +39,4 @@ export const applyRedactionDecision = (
     target_cluster_id?: string;
     reason?: string;
   }
-) => client.post(`/cases/documents/${documentId}/redaction-decisions`, payload);
+) => client.post<AnonymizationResult>(`/cases/documents/${documentId}/redaction-decisions`, payload);

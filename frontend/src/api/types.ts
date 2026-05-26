@@ -6,7 +6,9 @@ export interface CaseDocument { id: string; title: string; document_number?: str
 export interface PublicDocumentListItem { id: string; title: string; case_number?: string; document_number?: string; court?: string; region?: string; document_date?: string; act_type?: string; instance?: string; law_article?: string; practice_topic?: string; is_favorite?: boolean; favorite?: boolean; }
 export interface PublicDocumentDetails extends PublicDocumentListItem { anonymized_text: string; can_view_restored?: boolean; }
 export type FavoriteDocument = PublicDocumentListItem;
-export interface EntityMapping { id?: string; cluster_id?: string; placeholder?: string; original_value: string; normalized_value?: string; aliases?: string[]; entity_class?: string; entity_type?: string; person_role?: string; context_kind?: string; role?: string; context?: string; redaction_decision?: 'REDACT' | 'KEEP' | 'REVIEW'; redaction_reason?: string; source?: 'natasha' | 'regex' | 'rule' | 'manual'; detection_method?: string; ambiguity_reason?: string; date_purpose?: string; location_purpose?: string; requires_review?: boolean; }
+export type EntityOccurrence = { surface_value: string; start?: number; end?: number; };
+export type MergeCandidate = { cluster_id: string; placeholder?: string; normalized_value: string; };
+export interface EntityMapping { id?: string; entity_key?: string; cluster_id?: string; placeholder?: string; original_value: string; normalized_value?: string; aliases?: string[]; entity_class?: string; entity_type?: string; person_role?: string; context_kind?: string; role?: string; context?: string; redaction_decision?: 'REDACT' | 'KEEP' | 'REVIEW'; redaction_reason?: string; source?: 'natasha' | 'regex' | 'rule' | 'manual'; detection_method?: string; ambiguity_reason?: string; date_purpose?: string; location_purpose?: string; requires_review?: boolean; review_reason?: string; occurrences_count?: number; occurrences?: EntityOccurrence[]; merge_candidates?: MergeCandidate[]; }
 export interface RestoredDocument { id: string; title: string; original_text: string; anonymized_text: string; entity_mappings: EntityMapping[]; }
 export interface RestoredCase { id: string; case_number: string; court?: string; region?: string; documents: RestoredDocument[]; }
 export interface CreateCaseRequest { court_id?: string; case_number: string; document_number?: string; document_date?: string; instance?: string; region?: string; legal_article?: string; judicial_practice?: string; judge_names?: string[]; staff_user_ids?: string[]; }
@@ -22,6 +24,9 @@ export interface AnonymizationResult {
   mappings: EntityMapping[];
   recognized_but_kept: EntityMapping[];
   review_entities: EntityMapping[];
+  review_markers?: ReviewMarker[];
   publication_redaction_mode: 'NORMATIVE' | 'EXTENDED_SAFE';
   ner_provider?: string;
 }
+
+export type ReviewMarker = { entity_key?: string; cluster_id?: string; placeholder?: string; display_text?: string; reason: string; occurrences_count?: number; };

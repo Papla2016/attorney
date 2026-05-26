@@ -40,3 +40,10 @@
 .rich-editor-content .ProseMirror blockquote{border-left:4px solid #94a3b8;padding-left:12px;color:#334155}
 .rich-editor-content .ProseMirror table{border-collapse:collapse;width:100%}
 .rich-editor-content .ProseMirror th,.rich-editor-content .ProseMirror td{border:1px solid #94a3b8;padding:6px}
+.rich-document-viewer .ProseMirror{outline:none;line-height:1.7}
+.review-highlight{background:#fef08a;cursor:pointer;border-radius:2px}
+.review-row{background:#fffbeb}
+.kept-occurrences-count{font-weight:700;color:#1d4ed8}
+.merge-candidates-select{min-width:280px}
+.anonymized-editor-tabs{display:flex;gap:8px;flex-wrap:wrap}
+.manual-decision-warning{background:#fff7ed;border:1px solid #fdba74;color:#9a3412;border-radius:10px;padding:10px 12px;font-weight:600}
