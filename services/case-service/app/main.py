@@ -271,6 +271,19 @@ class ReanonymizeIn(BaseModel):
     publication_redaction_mode: str = 'NORMATIVE'
 
 
+
+
+class RedactionDecisionIn(BaseModel):
+    entity_key: str | None = None
+    selected_text: str
+    decision: str
+    entity_class: str = 'PERSON'
+    target_cluster_id: str | None = None
+    reason: str = 'Решение пользователя'
+
+
+class MergeEntityIn(BaseModel):
+    target_cluster_id: str
 class SaveAnonymizationIn(BaseModel):
     anonymized_text: str
     mappings: list[dict] = []
@@ -896,6 +909,26 @@ async def reanonymize_document(document_id: str, body: ReanonymizeIn, authorizat
     return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'mappings': d.get('mappings', []), 'recognized_but_kept': d.get('recognized_but_kept', []), 'review_entities': d.get('review_entities', []), 'publication_redaction_mode': d.get('publication_redaction_mode', 'NORMATIVE'), 'ner_provider': d.get('ner_provider')} 
 
 
+
+
+@app.post('/api/cases/documents/{document_id}/redaction-decisions')
+async def redaction_decisions(document_id: str, body: RedactionDecisionIn, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    d = next((x for x in docs if x['id'] == document_id), None)
+    if not d:
+        err('NOT_FOUND', 'Документ не найден', 404)
+    cs = next((x for x in cases if x['id'] == d['case_id']), None)
+    if not cs:
+        err('NOT_FOUND', 'Дело не найдено', 404)
+    if not allowed(c, ['ADMIN','JUDGE','COURT_STAFF','COURT_CLERK']) or not can_work_with_case(c, cs):
+        err('ACCESS_DENIED', 'Недостаточно прав', 403)
+    async with httpx.AsyncClient(timeout=30.0) as cl:
+        r = await cl.post(f'{ANON}/internal/anonymization/documents/{document_id}/redaction-decisions', headers={'X-Internal-Service-Token': INTERNAL}, json=body.model_dump(exclude_none=True))
+    if r.status_code >= 400:
+        detail = r.json() if r.headers.get('content-type','').startswith('application/json') else error_payload('UPSTREAM_ERROR','Ошибка сервиса обезличивания')
+        raise HTTPException(status_code=r.status_code, detail=detail if isinstance(detail, dict) else error_payload('UPSTREAM_ERROR', str(detail)))
+    apply_doc_sync(d, r.json())
+    return {'document_id': d['id'], 'case_id': cs['id'], 'title': d['title'], 'anonymized_text': d.get('anonymized_text', ''), 'anonymized_content': d.get('anonymized_content'), 'mappings': d.get('mappings', []), 'recognized_but_kept': d.get('recognized_but_kept', []), 'review_entities': d.get('review_entities', []), 'publication_redaction_mode': d.get('publication_redaction_mode', 'NORMATIVE')}
 @app.post('/api/cases/documents/{document_id}/save-anonymization')
 def save_anonymization(document_id: str, body: SaveAnonymizationIn, authorization: str | None = Header(None)):
     c = claims(authorization)
