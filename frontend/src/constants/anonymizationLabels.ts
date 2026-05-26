@@ -5,6 +5,7 @@ export const ENTITY_TYPE_LABELS: Record<string, string> = {
   COURT_SECRETARY: 'Секретарь судебного заседания',
   ADDRESS: 'Адрес',
   LOCATION: 'Место',
+  PLACE: 'Место',
   ORGANIZATION: 'Организация',
   PHONE: 'Телефон',
   EMAIL: 'Электронная почта',
@@ -13,7 +14,10 @@ export const ENTITY_TYPE_LABELS: Record<string, string> = {
   INN: 'ИНН',
   BIRTH_DATE: 'Дата рождения',
   DATE: 'Дата',
-  OTHER: 'Иные данные'
+  CADASTRAL_NUMBER: 'Кадастровый номер',
+  PROPERTY_IDENTIFIER: 'Кадастровый номер',
+  PERSON: 'ФИО',
+  OTHER: 'Другие сведения'
 };
 
 export const ENTITY_TYPE_OPTIONS = [

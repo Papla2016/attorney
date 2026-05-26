@@ -19,17 +19,17 @@ export interface ApiError { error: { code: string; message: string; details?: Re
 
 export interface AnonymizationResult {
   document_id: string;
-  anonymized_text: string;
+  anonymized_text?: string;
   anonymized_content?: unknown;
   content_format?: 'TIPTAP_JSON' | 'PLAIN_TEXT';
-  mappings: EntityMapping[];
-  recognized_but_kept: EntityMapping[];
-  review_entities: EntityMapping[];
+  mappings?: EntityMapping[];
+  recognized_but_kept?: EntityMapping[];
+  review_entities?: EntityMapping[];
   review_markers?: ReviewMarker[];
   pending_review?: PendingReviewEntity[];
   pending_markers?: PendingMarker[];
   manual_decisions?: unknown[];
-  publication_redaction_mode: 'NORMATIVE' | 'EXTENDED_SAFE';
+  publication_redaction_mode?: 'NORMATIVE' | 'EXTENDED_SAFE';
   ner_provider?: string;
   document_revision?: number;
 }
