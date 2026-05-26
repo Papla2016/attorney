@@ -47,3 +47,20 @@
 .merge-candidates-select{min-width:280px}
 .anonymized-editor-tabs{display:flex;gap:8px;flex-wrap:wrap}
 .manual-decision-warning{background:#fff7ed;border:1px solid #fdba74;color:#9a3412;border-radius:10px;padding:10px 12px;font-weight:600}
+
+.court-document-draft-preview .court-document-header{border-bottom:none;padding-bottom:0;margin-bottom:12px}
+.court-document-draft-preview .court-document-title{text-transform:none;font-size:22px}
+.rich-document-viewer .ProseMirror{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.7;padding:16px;background:#fff;border:1px solid #e2e8f0;border-radius:8px}
+.rich-document-viewer .ProseMirror ul{list-style:disc;padding-left:2rem}
+.rich-document-viewer .ProseMirror ol{list-style:decimal;padding-left:2rem}
+.rich-document-viewer .ProseMirror table{border-collapse:collapse;width:100%}
+.rich-document-viewer .ProseMirror th,.rich-document-viewer .ProseMirror td{border:1px solid #94a3b8;padding:6px}
+.rich-document-viewer .ProseMirror hr{border:none;border-top:1px solid #94a3b8;margin:1rem 0}
+.pending-redaction-highlight{background:#fef3c7;border-bottom:2px dashed #d97706;cursor:pointer}
+.review-highlight{background:#dbeafe;border-bottom:2px solid #f59e0b;cursor:pointer}
+.pending-review-panel{background:#fff;border:1px solid #d8dee6;border-radius:12px;padding:14px}
+.pending-review-row{background:#fffdf5}
+.pending-review-row-active{outline:2px solid #f59e0b}
+.scan-loading{color:#1d4ed8;font-weight:600}
+.publication-blocked-warning{background:#fff1f2;border:1px solid #fecdd3;color:#9f1239;border-radius:10px;padding:10px 12px;font-weight:700}
+.toolbar-group select{max-width:180px}
