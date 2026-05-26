@@ -22,10 +22,14 @@ const lines = (v: string) => v.split('\n').map((x) => x.trim()).filter(Boolean);
 
 const publishErrorMessage = (error: any) => {
   const status = error?.response?.status;
-  if (status === 403) return 'Недостаточно прав для публикации';
-  if (status === 400) return 'Документ ещё не готов к публикации';
-  if (status >= 500) return 'Внутренняя ошибка сервера';
-  return 'Не удалось опубликовать документ';
+  const apiError = error?.response?.data?.error;
+  const code = apiError?.code;
+  const pendingCount = apiError?.details?.pending_count;
+  if (status === 409 && code === 'PENDING_REDACTION_REVIEW') return `Документ нельзя опубликовать: осталось необработанных фрагментов — ${pendingCount ?? 'неизвестно'}. Откройте ручную проверку и обработайте найденные персональные данные.`;
+  if (status === 403) return 'Недостаточно прав для публикации документа.';
+  if (status === 400) return apiError?.message || 'Документ ещё не готов к публикации.';
+  if (status >= 500) return 'Внутренняя ошибка сервера.';
+  return apiError?.message || 'Не удалось опубликовать документ.';
 };
 const caseEditErrorMessage = (error: any) => {
   const status = error?.response?.status;
@@ -56,6 +60,7 @@ export default function CaseDetailsPage() {
   const [caseStatus, setCaseStatus] = useState<CaseStatus>('DRAFT');
   const [message, setMessage] = useState('');
   const [actionError, setActionError] = useState('');
+  const [documentActionErrors, setDocumentActionErrors] = useState<Record<string, string>>({});
   const [isEditing, setIsEditing] = useState(false);
   const [editForm, setEditForm] = useState<UpdateCaseRequest & { judges_text?: string; participants_text?: string }>({});
 
@@ -74,7 +79,7 @@ export default function CaseDetailsPage() {
   }, [c?.id, c?.case_number]);
 
   const refetchCase = async () => { await queryClient.invalidateQueries({ queryKey: ['caseDetails', caseId] }); };
-  const publishMutation = useMutation({ mutationFn: (documentId: string) => publishDocument(documentId), onSuccess: async () => { setActionError(''); setMessage('Документ опубликован.'); await refetchCase(); }, onError: (err) => { setMessage(''); setActionError(publishErrorMessage(err)); } });
+  const publishMutation = useMutation({ mutationFn: (documentId: string) => publishDocument(documentId), onSuccess: async (_, documentId) => { setActionError(''); setDocumentActionErrors((p)=>({ ...p, [documentId]: '' })); setMessage('Документ опубликован.'); await refetchCase(); }, onError: (err, documentId) => { setMessage(''); const msg = publishErrorMessage(err); setActionError(msg); setDocumentActionErrors((p)=>({ ...p, [documentId]: msg })); } });
   const statusMutation = useMutation({ mutationFn: () => updateCaseStatus(caseId, caseStatus), onSuccess: async () => { setActionError(''); setMessage('Статус дела обновлён.'); await refetchCase(); }, onError: (err) => { setMessage(''); setActionError(statusErrorMessage(err)); } });
   const editMutation = useMutation({ mutationFn: () => { const { judges_text, participants_text, ...payload } = editForm; return updateCase(caseId, { ...payload, judge_names: lines(judges_text || ''), participants: lines(participants_text || '') }); }, onSuccess: async () => { setActionError(''); setMessage('Дело обновлено'); setIsEditing(false); await refetchCase(); }, onError: (err) => { setMessage(''); setActionError(caseEditErrorMessage(err)); } });
   const deleteMutation = useMutation({ mutationFn: (documentId: string) => deleteCaseDocument(caseId, documentId), onSuccess: async () => { setActionError(''); setMessage('Документ удалён.'); await refetchCase(); }, onError: (err) => { setMessage(''); setActionError(deleteErrorMessage(err)); } });
@@ -94,7 +99,9 @@ export default function CaseDetailsPage() {
       <section className="case-card"><h2>Основные сведения</h2><div className="case-meta-grid"><p><b>Номер дела:</b> {val(c.case_number)}</p><p><b>Номер документа:</b> {val(c.document_number)}</p><p><b>Дата документа:</b> {val(c.document_date)}</p><p><b>Суд:</b> {val(c.court_name || c.court)}</p><p><b>Регион:</b> {val(c.region)}</p><p><b>Инстанция:</b> {val(c.instance)}</p><p><b>Статья закона:</b> {val(c.legal_article || c.law_article)}</p><p><b>Судебная практика:</b> {val(c.judicial_practice || c.practice_topic)}</p><p><b>Статус дела:</b> <span className="badge">{val(c.status)}</span></p></div></section>
       <section className="case-card"><h2>Состав суда</h2>{judges.length ? <ul>{judges.map((j: any) => <li key={j}>{j}</li>)}</ul> : <p>Судьи дела не указаны.</p>}</section>
       <section className="case-card"><h2>Участники дела</h2>{participants.length ? <div className="case-meta-grid">{participants.map((p: any, idx: number) => <p key={p.id || idx}><b>{val(p.role)}:</b> {val(p.display_name || p.name || p.username || p)}</p>)}</div> : <p>Участники дела не указаны.</p>}</section>
-      <section className="case-card"><h2>Документы дела</h2>{documents.length ? documents.map((d: any) => { const id = docId(d); const documentStatus = statusUpper(d.status); return <article className="document-card" key={id}><div className="document-card-header"><div><h3>{val(d.title)}</h3><p><b>Тип судебного акта:</b> {val(d.act_type || d.document_type)}</p><p><b>Статус:</b> <span className="badge">{val(d.status)}</span></p><p><b>Дата:</b> {val(d.document_date || d.date || c.document_date)}</p></div></div>{['DRAFT', 'ANONYMIZED'].includes(documentStatus) && <p className="status-warning">Документ ещё не опубликован. Публичные пользователи его не увидят.</p>}<div className="case-actions">{id && <Link className="button" to={`/documents/${id}`}>Открыть публичную версию</Link>}{id && canManage && <Link className='button button-secondary' to={`/staff/documents/${id}/anonymization`}>Ручная проверка</Link>}{isAuthenticated && (d.can_view_restored || c.can_view_restored || canManage) && <Link className="button button-secondary" to={`/cases/${caseId}/restored`}>Восстановленные данные</Link>}{canManage && canPublishStatus(d.status) && id && <button type="button" onClick={() => publishMutation.mutate(id)} disabled={publishMutation.isPending}>Опубликовать документ</button>}{canManage && id && <button type='button' className='danger-button' disabled={deleteMutation.isPending} onClick={() => window.confirm('Удалить документ из дела? Это действие будет записано в журнал аудита.') && deleteMutation.mutate(id)}>Удалить документ</button>}</div><CourtDocumentView title={d.title} text={d.anonymized_text || d.text || d.content || d.public_text || d.full_text} caseInfo={caseInfo} /></article>; }) : <div className="empty-state"><p>Документы пока не загружены.</p>{canManage && <Link className="button" to={`/staff/cases/${caseId}/upload`}>Загрузить документ</Link>}</div>}</section>
+      <section className="case-card"><h2>Документы дела</h2>{documents.length ? documents.map((d: any) => { const id = docId(d); const documentStatus = statusUpper(d.status); return <article className="document-card" key={id}><div className="document-card-header"><div><h3>{val(d.title)}</h3><p><b>Тип судебного акта:</b> {val(d.act_type || d.document_type)}</p><p><b>Статус:</b> <span className="badge">{val(d.status)}</span></p><p><b>Дата:</b> {val(d.document_date || d.date || c.document_date)}</p></div></div>{['DRAFT', 'ANONYMIZED'].includes(documentStatus) && <p className="status-warning">Документ ещё не опубликован. Публичные пользователи его не увидят.</p>}<div className="case-actions">{id && documentStatus === 'PUBLISHED' && <Link className="button" to={`/documents/${id}`}>Открыть публичную версию</Link>}
+{id && documentStatus !== 'PUBLISHED' && <Link className="button button-secondary" to={`/staff/documents/${id}/anonymization`}>Предпросмотр рабочей версии</Link>}{id && canManage && <Link className='button button-secondary' to={`/staff/documents/${id}/anonymization`}>Ручная проверка</Link>}{isAuthenticated && (d.can_view_restored || c.can_view_restored || canManage) && <Link className="button button-secondary" to={`/cases/${caseId}/restored`}>Восстановленные данные</Link>}{canManage && canPublishStatus(d.status) && id && <button type="button" onClick={() => publishMutation.mutate(id)} disabled={publishMutation.isPending}>Опубликовать документ</button>}{canManage && id && <button type='button' className='danger-button' disabled={deleteMutation.isPending} onClick={() => window.confirm('Удалить документ из дела? Это действие будет записано в журнал аудита.') && deleteMutation.mutate(id)}>Удалить документ</button>}{id && documentActionErrors[id] && <div className='publication-error-card'><p className='document-action-error'>{documentActionErrors[id]}</p>{documentActionErrors[id].includes('необработанных фрагментов') && <Link className='button button-secondary' to={`/staff/documents/${id}/anonymization`}>Перейти к ручной проверке</Link>}</div>}
+</div><CourtDocumentView title={d.title} text={d.anonymized_text || d.text || d.content || d.public_text || d.full_text} caseInfo={caseInfo} /></article>; }) : <div className="empty-state"><p>Документы пока не загружены.</p>{canManage && <Link className="button" to={`/staff/cases/${caseId}/upload`}>Загрузить документ</Link>}</div>}</section>
     </>}
   </AppLayout>;
 }
