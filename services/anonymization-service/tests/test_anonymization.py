@@ -208,6 +208,23 @@ def test_judge_kept_witness_redacted():
     assert resolved[1]['redaction_decision'] == 'REDACT'
 
 
+def test_mappings_include_multiple_pii_types_not_only_person():
+    text = 'Иванов Иван Иванович, ИНН 123456789012, паспорт 1234 567890, +79991234567, г. Москва'
+    entities = [
+        {'type': 'PERSON_FULL_NAME', 'text': 'Иванов Иван Иванович', 'start': 0, 'end': 19},
+        {'type': 'INN', 'text': '123456789012', 'start': 25, 'end': 37},
+        {'type': 'PASSPORT', 'text': 'паспорт 1234 567890', 'start': 39, 'end': 57},
+        {'type': 'PHONE', 'text': '+79991234567', 'start': 59, 'end': 70},
+        {'type': 'ADDRESS', 'text': 'г. Москва', 'start': 72, 'end': 81},
+    ]
+    mappings, kept, review = build_mappings_from_resolved(resolve_entities(text, entities))
+    entity_types = {m['entity_class'] for m in mappings}
+    assert 'PERSON' in entity_types
+    assert {'INN', 'PASSPORT', 'PHONE', 'PLACE'}.issubset(entity_types)
+    assert isinstance(kept, list)
+    assert isinstance(review, list)
+
+
 def test_placeholder_unique_by_cluster():
     text = 'Иванов Иван Иванович и Петров Петр Петрович'
     entities = [

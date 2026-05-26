@@ -415,6 +415,7 @@ async def extract_entities(text: str) -> list[dict]:
 
 
 def save_document(document_id: str, case_id: str, title: str, original_text: str, anonymized_text: str, mappings: list[dict], metadata: dict | None = None, recognized_but_kept: list[dict] | None = None):
+    existing = restored_docs.get(document_id, {})
     public_docs[document_id] = {
         'document_id': document_id,
         'case_id': case_id,
@@ -431,6 +432,36 @@ def save_document(document_id: str, case_id: str, title: str, original_text: str
         'anonymized_text': anonymized_text,
         'mappings': [ensure_mapping_metadata(m) for m in mappings],
         'recognized_but_kept': recognized_but_kept or [],
+        'content_format': existing.get('content_format', 'PLAIN_TEXT'),
+        'original_content': existing.get('original_content'),
+        'anonymized_content': replace_content_by_mappings(existing.get('original_content'), mappings),
+        'review_entities': existing.get('review_entities', []),
+        'review_markers': existing.get('review_markers', []),
+        'pending_review': existing.get('pending_review', []),
+        'pending_markers': existing.get('pending_markers', []),
+        'manual_decisions': existing.get('manual_decisions', list(manual_decisions_by_document_id.get(document_id, {}).values())),
+        'publication_redaction_mode': existing.get('publication_redaction_mode', 'NORMATIVE'),
+        'ner_provider': existing.get('ner_provider', 'hybrid'),
+    }
+
+
+def anonymization_result_response(document: dict) -> dict:
+    return {
+        'document_id': document['document_id'],
+        'case_id': document.get('case_id'),
+        'title': document.get('title'),
+        'anonymized_text': document.get('anonymized_text', ''),
+        'anonymized_content': document.get('anonymized_content'),
+        'content_format': document.get('content_format', 'PLAIN_TEXT'),
+        'mappings': document.get('mappings', []),
+        'recognized_but_kept': document.get('recognized_but_kept', []),
+        'review_entities': document.get('review_entities', []),
+        'review_markers': document.get('review_markers', []),
+        'pending_review': document.get('pending_review', []),
+        'pending_markers': document.get('pending_markers', []),
+        'manual_decisions': document.get('manual_decisions', []),
+        'publication_redaction_mode': document.get('publication_redaction_mode', 'NORMATIVE'),
+        'ner_provider': document.get('ner_provider', 'hybrid'),
     }
 
 
@@ -614,7 +645,7 @@ def repair_placeholders(document_id: str, x_internal_service_token: str | None =
     doc['mappings']=mappings
     doc['anonymized_text']=replace_by_mappings(doc.get('original_text',''), mappings)
     audit_log.append({'id': str(uuid.uuid4()), 'document_id': document_id, 'action': 'REPAIR_PLACEHOLDERS', 'created_at': now_iso(), 'details': {}})
-    return {'anonymized_text': doc['anonymized_text'], 'mappings': mappings, 'recognized_but_kept': doc.get('recognized_but_kept', []), 'review_entities': doc.get('review_entities', [])}
+    return anonymization_result_response(doc)
 
 @app.post('/internal/anonymization/documents/{document_id}/reanonymize')
 async def reanonymize(document_id: str, body: ReanonymizeRequest, x_internal_service_token: str | None = Header(None)):
@@ -637,7 +668,7 @@ async def reanonymize(document_id: str, body: ReanonymizeRequest, x_internal_ser
     save_document(document_id, doc.get('case_id', ''), doc.get('title', ''), original_text, anonymized, mappings, public_docs.get(document_id, {}).get('metadata', {}), recognized_but_kept)
     restored_docs[document_id]['review_entities']=review_entities
     restored_docs[document_id]['publication_redaction_mode']=body.publication_redaction_mode
-    return {'document_id': document_id, 'anonymized_text': anonymized, 'mappings': mappings, 'recognized_but_kept': recognized_but_kept, 'review_entities': review_entities, 'publication_redaction_mode': body.publication_redaction_mode}
+    return anonymization_result_response(restored_docs[document_id])
 
 
 @app.delete('/internal/anonymization/documents/{document_id}')
@@ -681,7 +712,7 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
     doc['pending_review'] = pending
     doc['pending_markers'] = [{'entity_key': p['entity_key'], 'surface_value': p['surface_value'], 'start': p['start'], 'end': p['end'], 'reason': p['reason']} for p in pending]
     doc['manual_decisions'] = list(decisions.values())
-    return {'document_id': document_id, 'anonymized_text': doc.get('anonymized_text', ''), 'anonymized_content': doc.get('anonymized_content'), 'content_format': doc.get('content_format', 'PLAIN_TEXT'), 'mappings': doc.get('mappings', []), 'recognized_but_kept': doc.get('recognized_but_kept', []), 'review_entities': doc.get('review_entities', []), 'review_markers': doc.get('review_markers', []), 'pending_review': doc.get('pending_review', []), 'pending_markers': doc.get('pending_markers', []), 'manual_decisions': doc.get('manual_decisions', []), 'publication_redaction_mode': doc.get('publication_redaction_mode', 'NORMATIVE'), 'ner_provider': 'hybrid'} 
+    return anonymization_result_response(doc)
 
 
 @app.post('/internal/anonymization/documents/{document_id}/draft-scan')
