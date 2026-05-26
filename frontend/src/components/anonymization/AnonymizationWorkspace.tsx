@@ -1,7 +1,7 @@
-import { useMemo, useState } from 'react';
-import { addDocumentMapping, applyRedactionDecision, deleteDocumentMapping, mergeDocumentMappings, reanonymizeDocument, repairPlaceholders, saveAnonymization, updateDocumentMapping } from '../../api/casesApi';
-import type { EntityMapping, ReviewMarker } from '../../api/types';
-import { DATE_PURPOSE_LABELS, ENTITY_TYPE_OPTIONS, getEntityTypeLabel, getSourceLabel, LOCATION_PURPOSE_LABELS, PERSON_ROLE_LABELS } from '../../constants/anonymizationLabels';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { addDocumentMapping, applyRedactionDecision, reanonymizeDocument, saveAnonymization, scanEditedDraft } from '../../api/casesApi';
+import type { EntityMapping, PendingMarker, PendingReviewEntity, ReviewMarker } from '../../api/types';
+import { ENTITY_TYPE_OPTIONS, getEntityTypeLabel, PERSON_ROLE_LABELS } from '../../constants/anonymizationLabels';
 import RichDocumentEditor from '../documents/RichDocumentEditor';
 import CourtDocumentView from '../documents/CourtDocumentView';
 import { plainTextToTiptapDocument } from '../../utils/tiptapDocument';
@@ -11,6 +11,8 @@ const mappingsFrom = (data: any): EntityMapping[] => data?.mappings || data?.ent
 const keptFrom = (data: any): EntityMapping[] => data?.recognized_but_kept || data?.anonymization?.recognized_but_kept || [];
 const reviewFrom = (data: any): EntityMapping[] => data?.review_entities || data?.anonymization?.review_entities || [];
 const markersFrom = (data: any): ReviewMarker[] => data?.review_markers || data?.anonymization?.review_markers || [];
+const pendingFrom = (data: any): PendingReviewEntity[] => data?.pending_review || [];
+const pendingMarkersFrom = (data: any): PendingMarker[] => data?.pending_markers || [];
 const textFrom = (data: any) => data?.anonymized_text || data?.anonymization?.anonymized_text || data?.anonymized_plain_text || '';
 const contentFrom = (data: any) => data?.anonymized_content || null;
 
@@ -19,6 +21,13 @@ export default function AnonymizationWorkspace({ documentId, initialData, source
   const [recognizedButKept, setRecognizedButKept] = useState<EntityMapping[]>(keptFrom(initialData));
   const [reviewEntities, setReviewEntities] = useState<EntityMapping[]>(reviewFrom(initialData));
   const [reviewMarkers, setReviewMarkers] = useState<ReviewMarker[]>(markersFrom(initialData));
+  const [pendingReview, setPendingReview] = useState<PendingReviewEntity[]>(pendingFrom(initialData));
+  const [pendingMarkers, setPendingMarkers] = useState<PendingMarker[]>(pendingMarkersFrom(initialData));
+  const [contentRevision, setContentRevision] = useState(0);
+  const [draftRevision, setDraftRevision] = useState(0);
+  const [isApplyingServerContent, setIsApplyingServerContent] = useState(false);
+  const [scanLoading, setScanLoading] = useState(false);
+  const [scanError, setScanError] = useState('');
   const [tab, setTab] = useState<'REDACT'|'KEEP'|'REVIEW'>('REDACT');
   const [resultTab, setResultTab] = useState<'EDIT'|'PREVIEW'>('EDIT');
   const [anonymizedText, setAnonymizedText] = useState(textFrom(initialData));
@@ -27,29 +36,48 @@ export default function AnonymizationWorkspace({ documentId, initialData, source
   const [mergeTargets, setMergeTargets] = useState<Record<string, string>>({});
   const [warning, setWarning] = useState(''); const [error, setError] = useState(''); const [message, setMessage] = useState('');
   const [selectedText, setSelectedText] = useState(''); const [entityType, setEntityType] = useState('PERSON_FULL_NAME');
+  const pendingPanelRef = useRef<HTMLDivElement | null>(null);
 
-  const provider = initialData?.ner_provider || 'hybrid';
-  const providerLabel: Record<string,string> = { hybrid: 'Natasha и правила', natasha: 'Natasha', regex: 'Только регулярные выражения', 'regex-fallback': 'Natasha недоступна, используются только правила' };
-  const applyResponse = (data: any) => { setMappings(mappingsFrom(data)); setRecognizedButKept(keptFrom(data)); setReviewEntities(reviewFrom(data)); setReviewMarkers(markersFrom(data)); setAnonymizedText(textFrom(data)); setAnonymizedContent(contentFrom(data)); if (data?.publication_redaction_mode) setDocumentChangedManually(false); };
+  const applyResponse = (data: any) => {
+    setIsApplyingServerContent(true);
+    setMappings(mappingsFrom(data)); setRecognizedButKept(keptFrom(data)); setReviewEntities(reviewFrom(data)); setReviewMarkers(markersFrom(data));
+    setPendingReview(pendingFrom(data)); setPendingMarkers(pendingMarkersFrom(data));
+    setAnonymizedText(textFrom(data)); setAnonymizedContent(contentFrom(data));
+    setContentRevision((v) => v + 1);
+    if (!data?.anonymized_content) setWarning('Сервер не вернул форматированную версию документа. Проверьте поддержку сохранения форматирования на backend.');
+    setTimeout(() => setIsApplyingServerContent(false), 0);
+  };
+
+  useEffect(() => {
+    if (!documentChangedManually || isApplyingServerContent || !anonymizedText.trim()) return;
+    const revision = draftRevision;
+    const t = setTimeout(async () => {
+      try {
+        setScanLoading(true); setScanError('');
+        const res = await scanEditedDraft(documentId, { text: anonymizedText, content: anonymizedContent, content_format: 'TIPTAP_JSON', document_revision: revision });
+        const data = res.data;
+        if (data?.document_revision !== undefined && data.document_revision !== draftRevision) return;
+        setPendingReview(pendingFrom(data));
+        setPendingMarkers(pendingMarkersFrom(data));
+      } catch {
+        setScanError('Не удалось проверить добавленный текст.');
+      } finally { setScanLoading(false); }
+    }, 800);
+    return () => clearTimeout(t);
+  }, [draftRevision]);
+
   const groupedKept = useMemo(() => { const map = new Map<string, EntityMapping[]>(); recognizedButKept.forEach((item) => { const key = item.cluster_id || `${item.entity_class || item.entity_type}:${item.normalized_value || item.original_value}`; map.set(key, [...(map.get(key) || []), item]); }); return [...map.values()]; }, [recognizedButKept]);
 
   return <div className='anonymization-workspace'>
     <h2>Результат обезличивания</h2>
     {warning && <p className='warning-message'>{warning}</p>}{error && <p className='error-message'>{error}</p>}{message && <p className='success-message'>{message}</p>}
-    <div className='recognition-provider-card'><p>Активный режим: {providerLabel[provider] || provider}</p></div>
-
+    {pendingReview.length > 0 && <div className='publication-blocked-warning'>Документ содержит необработанные фрагменты. Сначала обработайте найденные персональные данные.</div>}
     <div className='anonymized-editor-tabs'><button className='button button-secondary' onClick={()=>setResultTab('EDIT')}>Редактирование обезличенного текста</button><button className='button button-secondary' onClick={()=>setResultTab('PREVIEW')}>Предпросмотр обезличенного документа</button></div>
-    {resultTab==='EDIT' ? <RichDocumentEditor value={anonymizedContent || plainTextToTiptapDocument(anonymizedText)} editable onChange={({ json, text }) => { setAnonymizedContent(json); setAnonymizedText(text); setDocumentChangedManually(true); }} onSelectionChange={setSelectedText} reviewMarkers={reviewMarkers} onReviewMarkerClick={() => setTab('REVIEW')} /> : <CourtDocumentView content={anonymizedContent} contentFormat='TIPTAP_JSON' text={anonymizedText} document={{ anonymized_text: anonymizedText, anonymized_content: anonymizedContent, content_format: anonymizedContent ? 'TIPTAP_JSON' : 'PLAIN_TEXT' }} />}
-    {documentChangedManually && <div className='manual-decision-warning'>Обезличенный текст изменён вручную. Перед публикацией сохраните документ.</div>}
+    {resultTab==='EDIT' ? <RichDocumentEditor value={anonymizedContent || plainTextToTiptapDocument(anonymizedText)} contentRevision={contentRevision} editable onChange={({ json, text }) => { setAnonymizedContent(json); setAnonymizedText(text); setDocumentChangedManually(true); if (!isApplyingServerContent) setDraftRevision((v) => v + 1); }} onSelectionChange={setSelectedText} reviewMarkers={reviewMarkers} pendingMarkers={pendingMarkers} onReviewMarkerClick={() => setTab('REVIEW')} onPendingMarkerClick={(entityKey) => { setTimeout(() => pendingPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0); const el = document.getElementById(`pending-row-${entityKey}`); el?.classList.add('pending-review-row-active'); setTimeout(() => el?.classList.remove('pending-review-row-active'), 1200); }} /> : <><div><strong>Рабочая обезличенная версия документа</strong>{pendingReview.length > 0 && <p className='publication-blocked-warning'>Публикация недоступна: есть фрагменты, требующие обработки</p>}{reviewMarkers.length > 0 && <p className='warning-message'>Есть обезличенные значения, требующие подтверждения</p>}</div><CourtDocumentView variant='anonymizedPreview' title='Черновик обезличенного документа' content={anonymizedContent || plainTextToTiptapDocument(anonymizedText)} contentFormat='TIPTAP_JSON' text={anonymizedText} /></>}
 
-    <div className='entity-tabs'><button className='button button-secondary' onClick={()=>setTab('REDACT')}>Обезличено</button><button className='button button-secondary' onClick={()=>setTab('KEEP')}>Оставлено в тексте</button><button className='button button-secondary' onClick={()=>setTab('REVIEW')}>Обезличено, требуется проверка</button></div>
-    {tab==='REDACT' && <table className='mapping-table'><thead><tr><th>Условное обозначение</th><th>Основное значение</th><th>Варианты написания</th><th>Тип данных</th><th>Роль или контекст</th><th>Решение</th><th>Причина</th><th>Действия</th></tr></thead><tbody>{mappings.map((m,i)=><tr key={m.id||i}><td>{m.placeholder || '—'}</td><td>{m.original_value}</td><td>{(m.aliases||[]).join(', ') || '—'}</td><td>{getEntityTypeLabel(m.entity_type)}</td><td>{PERSON_ROLE_LABELS[m.person_role || ''] || m.context_kind || '—'}</td><td>{m.redaction_decision || 'REDACT'}</td><td>{m.redaction_reason || '—'}</td><td><button className='danger-button' onClick={async()=>{ if(!window.confirm('Убрать это значение из обезличивания? Оно будет восстановлено в тексте и не будет автоматически скрываться при повторной обработке, пока вы не измените решение.')) return; try { const r=await applyRedactionDecision(documentId,{entity_key:m.entity_key,selected_text:m.original_value,decision:'KEEP',entity_class:m.entity_class || m.entity_type || 'OTHER',reason:'Оставлено пользователем в тексте'}); applyResponse(r.data); setMessage('Значение оставлено в тексте. Решение будет сохранено при повторном обезличивании.'); } catch { await deleteDocumentMapping(documentId,m.id!); } }}>Оставить в тексте</button></td></tr>)}</tbody></table>}
-    {tab==='KEEP' && (groupedKept.length ? <table className='mapping-table'><thead><tr><th>Значение</th><th>Тип данных</th><th>Роль или контекст</th><th>Причина</th><th>Количество упоминаний</th><th>Действия</th></tr></thead><tbody>{groupedKept.map((group,i)=>{ const m=group[0]; return <tr key={i}><td>{m.original_value}</td><td>{getEntityTypeLabel(m.entity_type)}</td><td>{m.context_kind || '—'}</td><td>{m.redaction_reason || '—'}</td><td className='kept-occurrences-count'>{m.occurrences_count || group.length}</td><td><button className='button' onClick={async()=>{const r=await applyRedactionDecision(documentId,{entity_key:m.entity_key,selected_text:m.original_value,decision:'REDACT',entity_class:m.entity_class || m.entity_type || 'OTHER',reason:'Обезличено пользователем вручную'}); applyResponse(r.data);}}>Обезличить</button></td></tr>;})}</tbody></table> : <div className='empty-state'>Сущности этой категории не найдены.</div>)}
-    {tab==='REVIEW' && <div><p>Эти значения уже скрыты в документе, но система не смогла однозначно определить их тип, роль или связь с другой записью. Проверьте результат перед публикацией.</p>{reviewEntities.length ? <table className='mapping-table'><thead><tr><th>Условное обозначение</th><th>Значение</th><th>Нормализованная форма</th><th>Причина проверки</th><th>Возможные объединения</th><th>Действия</th></tr></thead><tbody>{reviewEntities.map((m,i)=>{ const candidates = m.merge_candidates || []; const selected = mergeTargets[m.entity_key || String(i)] || (candidates.length===1 ? candidates[0].cluster_id : ''); return <tr key={i} className='review-row'><td>{m.placeholder || '—'}</td><td>{m.original_value}</td><td>{m.normalized_value || '—'}</td><td>{m.review_reason || m.ambiguity_reason || 'Требуется ручная проверка'}</td><td>{candidates.length ? <select className='merge-candidates-select' value={selected} onChange={(e)=>setMergeTargets((prev)=>({...prev,[m.entity_key || String(i)]:e.target.value}))}><option value=''>Выберите сущность</option>{candidates.map((c)=> <option key={c.cluster_id} value={c.cluster_id}>{c.placeholder || c.cluster_id} — {c.normalized_value}</option>)}</select> : 'Подходящие записи для объединения не найдены.'}</td><td><button className='button button-secondary' onClick={async()=>{const r=await applyRedactionDecision(documentId,{entity_key:m.entity_key,selected_text:m.original_value,decision:'KEEP',entity_class:m.entity_class || m.entity_type || 'OTHER'});applyResponse(r.data);}}>Оставить в тексте</button> <button className='button' disabled={!selected} onClick={async()=>{if(!selected) return; const r=await applyRedactionDecision(documentId,{entity_key:m.entity_key,selected_text:m.original_value,decision:'MERGE_WITH_EXISTING',entity_class:m.entity_class || m.entity_type || 'OTHER',target_cluster_id:selected,reason:'Связано пользователем с существующей сущностью'});applyResponse(r.data);}}>Объединить с существующей сущностью</button> <button className='button button-secondary' onClick={async()=>{const r=await applyRedactionDecision(documentId,{entity_key:m.entity_key,selected_text:m.original_value,decision:'REDACT',entity_class:m.entity_class || m.entity_type || 'OTHER',reason:'Подтверждено пользователем'});applyResponse(r.data);}}>Подтвердить обезличивание</button></td></tr>;})}</tbody></table> : <div className='empty-state'>Сущности этой категории не найдены.</div>}</div>}
-
-    <section className='selection-panel'><h3>Выделенный фрагмент документа</h3>{selectedText ? <><textarea readOnly value={selectedText} /><div className='form-grid'><select value={entityType} onChange={(e)=>setEntityType(e.target.value)}>{ENTITY_TYPE_OPTIONS.map((o)=><option key={o.value} value={o.value}>{o.label}</option>)}</select><button type='button' className='button' onClick={async()=>{const res=await addDocumentMapping(documentId,{ original_value:selectedText, entity_type:entityType, mode:'new'});setMappings(mappingsFrom(res.data));}}>Создать новую скрываемую сущность</button><button type='button' className='button button-secondary' onClick={async()=>{await applyRedactionDecision(documentId,{selected_text:selectedText,decision:'KEEP',entity_class:entityType});}}>Оставить в тексте</button></div></> : <p>Выделите фрагмент в обезличенном документе для ручной обработки.</p>}</section>
+    <div ref={pendingPanelRef} className='pending-review-panel'><h3>Найдено в изменённом тексте</h3>{scanLoading && <p className='scan-loading'>Проверяем добавленный текст...</p>}{scanError && <p className='error-message'>{scanError}</p>}{!scanLoading && pendingReview.length===0 && <p>Новых фрагментов, требующих обработки, не найдено.</p>}{pendingReview.length>0 && <table className='mapping-table'><thead><tr><th>Фрагмент</th><th>Предполагаемый тип</th><th>Причина</th><th>Возможные связи</th><th>Действия</th></tr></thead><tbody>{pendingReview.map((p,i)=>{const key=p.entity_key || String(i); const selected=mergeTargets[key] || (p.merge_candidates?.length===1 ? p.merge_candidates[0].cluster_id : ''); return <tr id={`pending-row-${p.entity_key}`} key={key} className='pending-review-row'><td>{p.surface_value}</td><td>{getEntityTypeLabel(p.entity_class)}</td><td>{p.reason}</td><td>{p.merge_candidates?.length ? <select value={selected} onChange={(e)=>setMergeTargets((prev)=>({...prev,[key]:e.target.value}))}><option value=''>Выберите сущность</option>{p.merge_candidates?.map((m)=><option key={m.cluster_id} value={m.cluster_id}>{m.placeholder || m.cluster_id} — {m.normalized_value}</option>)}</select> : 'Нет кандидатов'}</td><td><button className='button' onClick={async()=>{const r=await applyRedactionDecision(documentId,{entity_key:p.entity_key,selected_text:p.surface_value,decision:'REDACT',entity_class:p.entity_class,reason:'Обезличено после проверки дописанного текста'});applyResponse(r.data);}}>Обезличить</button> <button className='button button-secondary' onClick={async()=>{const r=await applyRedactionDecision(documentId,{entity_key:p.entity_key,selected_text:p.surface_value,decision:'KEEP',entity_class:p.entity_class,reason:'Оставлено пользователем'});applyResponse(r.data);}}>Оставить в тексте</button> {p.merge_candidates?.length ? <button className='button button-secondary' disabled={!selected} onClick={async()=>{if(!selected) return; const r=await applyRedactionDecision(documentId,{entity_key:p.entity_key,selected_text:p.surface_value,decision:'MERGE_WITH_EXISTING',entity_class:p.entity_class,target_cluster_id:selected,reason:'Связано пользователем с существующей сущностью'});applyResponse(r.data);}}>Связать с существующей записью</button> : null}</td></tr>;})}</tbody></table>}</div>
     <button className='button button-secondary' onClick={async()=>{ const r = await reanonymizeDocument(documentId, { mappings, publication_redaction_mode: 'NORMATIVE' }); applyResponse(r.data); }}>Повторно обезличить</button>
-    <button className='button' onClick={async()=>{const r=await saveAnonymization(documentId,{anonymized_text:anonymizedText,anonymized_content:anonymizedContent,mappings}); applyResponse(r.data); setDocumentChangedManually(false);}}>Сохранить документ</button>
+    <button className='button' onClick={async()=>{const r=await saveAnonymization(documentId,{anonymized_text:anonymizedText,anonymized_content:anonymizedContent,content_format:'TIPTAP_JSON',mappings}); applyResponse(r.data); setDocumentChangedManually(false); setMessage(pendingReview.length ? 'Документ сохранён как рабочая версия. Для публикации необходимо обработать найденные фрагменты.' : 'Изменения обезличенного документа сохранены.');}}>Сохранить документ</button>
     {sourceText && <p className='warning-message'>Исходный текст изменён. Таблица соответствия может быть неактуальна. Выполните обезличивание повторно.</p>}
   </div>;
 }

@@ -21,12 +21,33 @@ export interface AnonymizationResult {
   document_id: string;
   anonymized_text: string;
   anonymized_content?: unknown;
+  content_format?: 'TIPTAP_JSON' | 'PLAIN_TEXT';
   mappings: EntityMapping[];
   recognized_but_kept: EntityMapping[];
   review_entities: EntityMapping[];
   review_markers?: ReviewMarker[];
+  pending_review?: PendingReviewEntity[];
+  pending_markers?: PendingMarker[];
+  manual_decisions?: unknown[];
   publication_redaction_mode: 'NORMATIVE' | 'EXTENDED_SAFE';
   ner_provider?: string;
+  document_revision?: number;
 }
+
+
+export type PendingReviewEntity = {
+  entity_key: string;
+  surface_value: string;
+  normalized_value?: string;
+  entity_class: string;
+  person_role?: string;
+  start?: number;
+  end?: number;
+  reason: string;
+  suggested_action?: 'REDACT' | 'KEEP';
+  merge_candidates?: Array<{ cluster_id: string; placeholder?: string; normalized_value: string; }>;
+};
+
+export type PendingMarker = { entity_key: string; surface_value: string; start?: number; end?: number; reason: string; };
 
 export type ReviewMarker = { entity_key?: string; cluster_id?: string; placeholder?: string; display_text?: string; reason: string; occurrences_count?: number; };
