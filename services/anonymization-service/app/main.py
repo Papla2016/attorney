@@ -19,6 +19,7 @@ public_docs: dict[str, dict] = {}
 restored_docs: dict[str, dict] = {}
 manual_mappings_by_document_id: dict[str, list[dict]] = {}
 manual_decisions_by_document_id: dict[str, dict[str, dict]] = {}
+pending_review_by_document_id: dict[str, list[dict]] = {}
 audit_log: list[dict] = []
 
 
@@ -57,12 +58,20 @@ class ReanonymizeRequest(BaseModel):
 
 
 class RedactionDecisionRequest(BaseModel):
+    entity_key: str | None = None
     selected_text: str
     decision: str
     entity_class: str = 'PERSON'
     person_role: str | None = None
     target_cluster_id: str | None = None
     reason: str = 'Исправлено пользователем'
+
+
+class DraftScanRequest(BaseModel):
+    text: str
+    content: dict | None = None
+    content_format: str = 'TIPTAP_JSON'
+    document_revision: int = 0
 
 
 def error_payload(code: str, message: str, details: dict | None = None):
@@ -294,6 +303,24 @@ def replace_by_mappings(text: str, mappings: list[dict]) -> str:
     return anonymized
 
 
+def replace_content_by_mappings(content: dict | None, mappings: list[dict]) -> dict | None:
+    if not content:
+        return None
+    data = copy.deepcopy(content)
+    def walk(node):
+        if isinstance(node, dict):
+            if isinstance(node.get('text'), str):
+                node['text'] = replace_by_mappings(node['text'], mappings)
+            if isinstance(node.get('content'), list):
+                for ch in node['content']:
+                    walk(ch)
+        elif isinstance(node, list):
+            for ch in node:
+                walk(ch)
+    walk(data)
+    return data
+
+
 def build_mappings_from_resolved(resolved: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
     cluster_to_placeholder: dict[str, str] = {}
     counters: dict[str, int] = defaultdict(int)
@@ -438,7 +465,10 @@ async def process(body: ProcessRequest, x_internal_service_token: str | None = H
     restored_docs[body.document_id]['publication_redaction_mode']=body.publication_redaction_mode
     restored_docs[body.document_id]['content_format']=body.content_format
     restored_docs[body.document_id]['original_content']=body.original_content
-    return {'job_id': job_id, 'status': 'COMPLETED', 'anonymized_document_id': body.document_id, 'anonymized_text': anonymized, 'mappings': mappings, 'recognized_but_kept': recognized_but_kept, 'review_entities': review_entities, 'publication_redaction_mode': body.publication_redaction_mode}
+    restored_docs[body.document_id]['anonymized_content'] = replace_content_by_mappings(body.original_content, mappings)
+    restored_docs[body.document_id]['pending_review'] = []
+    restored_docs[body.document_id]['pending_markers'] = []
+    return {'job_id': job_id, 'status': 'COMPLETED', 'anonymized_document_id': body.document_id, 'anonymized_text': anonymized, 'anonymized_content': restored_docs[body.document_id].get('anonymized_content'), 'content_format': body.content_format, 'mappings': mappings, 'recognized_but_kept': recognized_but_kept, 'review_entities': review_entities, 'review_markers': [], 'pending_review': [], 'pending_markers': [], 'manual_decisions': list(manual_decisions_by_document_id.get(body.document_id, {}).values()), 'publication_redaction_mode': body.publication_redaction_mode, 'ner_provider': 'hybrid'}
 
 
 @app.get('/internal/anonymization/documents/{document_id}/public')
@@ -628,7 +658,7 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
         _error(400, 'BAD_REQUEST', 'Недопустимое решение', {'allowed': ['REDACT', 'KEEP', 'MERGE_WITH_EXISTING']})
     audit_log.append({'id': str(uuid.uuid4()), 'document_id': document_id, 'action': 'REDACTION_DECISION', 'details': body.model_dump(), 'created_at': now_iso()})
     doc = restored_docs[document_id]
-    entity_key = f"{body.entity_class}::{normalize_spaces(body.selected_text)}"
+    entity_key = body.entity_key or f"{body.entity_class}::{normalize_spaces(body.selected_text)}"
     decisions = manual_decisions_by_document_id.setdefault(document_id, {})
     if body.decision == 'REDACT':
         decisions[entity_key] = {'entity_key': entity_key, 'decision': 'FORCE_REDACT', 'target_cluster_id': body.target_cluster_id, 'reason': body.reason, 'created_at': now_iso(), 'updated_at': now_iso()}
@@ -637,9 +667,47 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
     elif body.decision == 'KEEP':
         decisions[entity_key] = {'entity_key': entity_key, 'decision': 'FORCE_KEEP', 'target_cluster_id': body.target_cluster_id, 'reason': body.reason, 'created_at': now_iso(), 'updated_at': now_iso()}
         doc['mappings'] = [m for m in doc.get('mappings', []) if m.get('original_value') != body.selected_text]
+    elif body.decision == 'MERGE_WITH_EXISTING':
+        target = next((m for m in doc.get('mappings', []) if m.get('cluster_id') == body.target_cluster_id), None)
+        if not target:
+            _error(400, 'BAD_REQUEST', 'Целевой cluster не найден')
+        decisions[entity_key] = {'entity_key': entity_key, 'decision': 'MERGE_WITH_CLUSTER', 'target_cluster_id': body.target_cluster_id, 'reason': body.reason, 'created_at': now_iso(), 'updated_at': now_iso()}
+        doc.setdefault('mappings', []).append(ensure_mapping_metadata({'original_value': body.selected_text, 'entity_type': body.entity_class, 'entity_class': body.entity_class, 'cluster_id': body.target_cluster_id, 'placeholder': target.get('placeholder'), 'source': 'manual'}))
     original_text = doc.get('original_text', '')
     doc['anonymized_text'] = replace_by_mappings(original_text, doc.get('mappings', []))
-    return {'document_id': document_id, 'anonymized_text': doc.get('anonymized_text', ''), 'anonymized_content': doc.get('anonymized_content'), 'mappings': doc.get('mappings', []), 'recognized_but_kept': doc.get('recognized_but_kept', []), 'review_entities': doc.get('review_entities', []), 'publication_redaction_mode': doc.get('publication_redaction_mode', 'NORMATIVE')} 
+    doc['anonymized_content'] = replace_content_by_mappings(doc.get('original_content'), doc.get('mappings', []))
+    pending = [p for p in pending_review_by_document_id.get(document_id, []) if p.get('entity_key') != entity_key]
+    pending_review_by_document_id[document_id] = pending
+    doc['pending_review'] = pending
+    doc['pending_markers'] = [{'entity_key': p['entity_key'], 'surface_value': p['surface_value'], 'start': p['start'], 'end': p['end'], 'reason': p['reason']} for p in pending]
+    doc['manual_decisions'] = list(decisions.values())
+    return {'document_id': document_id, 'anonymized_text': doc.get('anonymized_text', ''), 'anonymized_content': doc.get('anonymized_content'), 'content_format': doc.get('content_format', 'PLAIN_TEXT'), 'mappings': doc.get('mappings', []), 'recognized_but_kept': doc.get('recognized_but_kept', []), 'review_entities': doc.get('review_entities', []), 'review_markers': doc.get('review_markers', []), 'pending_review': doc.get('pending_review', []), 'pending_markers': doc.get('pending_markers', []), 'manual_decisions': doc.get('manual_decisions', []), 'publication_redaction_mode': doc.get('publication_redaction_mode', 'NORMATIVE'), 'ner_provider': 'hybrid'} 
+
+
+@app.post('/internal/anonymization/documents/{document_id}/draft-scan')
+async def draft_scan(document_id: str, body: DraftScanRequest, x_internal_service_token: str | None = Header(None)):
+    require_internal(x_internal_service_token)
+    if document_id not in restored_docs:
+        _error(404, 'NOT_FOUND', 'Документ не найден')
+    entities = await extract_entities(body.text)
+    pending = []
+    decisions = manual_decisions_by_document_id.get(document_id, {})
+    mappings = restored_docs[document_id].get('mappings', [])
+    for e in resolve_entities(body.text, entities, 'NORMATIVE'):
+        if e.get('entity_class') != 'PERSON':
+            continue
+        surface = e.get('surface_value', '')
+        if re.fullmatch(r'ФИО\d+', surface):
+            continue
+        key = f"PERSON::{normalize_spaces(surface)}"
+        if decisions.get(key, {}).get('decision') == 'FORCE_KEEP':
+            continue
+        merge_candidates = [{'cluster_id': m.get('cluster_id'), 'placeholder': m.get('placeholder'), 'normalized_value': m.get('normalized_value')} for m in mappings if m.get('entity_class') == 'PERSON' and m.get('cluster_id')]
+        pending.append({'entity_key': key, 'surface_value': surface, 'normalized_value': e.get('normalized_value', surface), 'entity_class': 'PERSON', 'person_role': e.get('person_role', 'UNKNOWN'), 'start': e.get('start', 0), 'end': e.get('end', 0), 'reason': 'В изменённом тексте найдено возможное ФИО, ещё не включённое в таблицу соответствия', 'suggested_action': 'REDACT', 'merge_candidates': merge_candidates})
+    pending_review_by_document_id[document_id] = pending
+    restored_docs[document_id]['pending_review'] = pending
+    restored_docs[document_id]['pending_markers'] = [{'entity_key': p['entity_key'], 'surface_value': p['surface_value'], 'start': p['start'], 'end': p['end'], 'reason': p['reason']} for p in pending]
+    return {'document_id': document_id, 'document_revision': body.document_revision, 'pending_review': pending, 'pending_markers': restored_docs[document_id]['pending_markers']}
 
 
 @app.get('/internal/anonymization/documents/{document_id}/preview')
