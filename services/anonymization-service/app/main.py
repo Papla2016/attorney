@@ -18,6 +18,7 @@ jobs: dict[str, dict] = {}
 public_docs: dict[str, dict] = {}
 restored_docs: dict[str, dict] = {}
 manual_mappings_by_document_id: dict[str, list[dict]] = {}
+manual_decisions_by_document_id: dict[str, dict[str, dict]] = {}
 audit_log: list[dict] = []
 
 
@@ -164,7 +165,7 @@ def decide_redaction(entity: dict, mode: str) -> tuple[str, str, bool]:
         if role in {'JUDGE', 'COURT_SECRETARY'}:
             return 'KEEP', 'ФИО судьи/секретаря оставлено в нормативном режиме', False
         if role == 'UNKNOWN':
-            return 'REVIEW', 'Не удалось определить процессуальную роль лица', True
+            return 'REDACT', 'ФИО лица подлежит обезличиванию', True
         return 'REDACT', 'ФИО лица подлежит обезличиванию', False
     if etype == 'ORGANIZATION':
         return 'KEEP', 'Организация не обезличивается в нормативном режиме', False
@@ -172,14 +173,14 @@ def decide_redaction(entity: dict, mode: str) -> tuple[str, str, bool]:
         if ctx == 'BIRTH_DATE':
             return 'REDACT', 'Дата рождения подлежит обезличиванию', False
         if ctx == 'UNKNOWN_DATE':
-            return 'REVIEW', 'Неоднозначная дата', True
+            return 'REDACT', 'Дата скрыта до ручной проверки', True
         return 'KEEP', 'Обычная дата документа/события', False
     if etype == 'EMAIL':
         if mode == 'EXTENDED_SAFE':
             return 'REDACT', 'Email скрыт в расширенном режиме', False
-        return 'REVIEW', 'Email требует ручной проверки в нормативном режиме', True
+        return 'REDACT', 'Email скрыт до ручной проверки', True
     if etype == 'PLACE' and entity.get('context_kind') == 'UNKNOWN_LOCATION':
-        return 'REVIEW', 'Неоднозначный адрес/место', True
+        return 'REDACT', 'Адрес/место скрыто до ручной проверки', True
     return ('REDACT', 'Сведения подлежат обезличиванию', False) if etype in {'PHONE', 'SNILS', 'PASSPORT', 'INN'} else ('KEEP', 'Оставлено политикой публикации', False)
 
 def make_placeholder(entity_type: str, idx: int) -> str:
@@ -328,11 +329,43 @@ def build_mappings_from_resolved(resolved: list[dict]) -> tuple[list[dict], list
             'requires_review': any(i.get('requires_review') for i in items),
             'entity_type': entity_class,
         }))
-    kept = [{'original_value': e['surface_value'], 'normalized_value': e.get('normalized_value'), 'entity_class': e['entity_class'], 'person_role': e.get('person_role'), 'redaction_decision': e['redaction_decision'], 'redaction_reason': e['redaction_reason'], 'source': e.get('source')} for e in resolved if e['redaction_decision'] == 'KEEP']
-    review = [{'original_value': e['surface_value'], 'entity_class': e['entity_class'], 'redaction_decision': e['redaction_decision'], 'redaction_reason': e['redaction_reason'], 'source': e.get('source')} for e in resolved if e['redaction_decision'] == 'REVIEW']
+    kept=[]
+    kept_grouped={}
+    for e in resolved:
+        if e['redaction_decision']!='KEEP':
+            continue
+        key=f"{e['entity_class']}::{e.get('normalized_value',e['surface_value'])}"
+        bucket=kept_grouped.setdefault(key,{'cluster_id':key,'original_value':e['surface_value'],'normalized_value':e.get('normalized_value'),'entity_class':e['entity_class'],'redaction_decision':'KEEP','redaction_reason':e['redaction_reason'],'occurrences':[],'source':e.get('source')})
+        bucket['occurrences'].append({'surface_value':e['surface_value'],'start':e.get('start',0),'end':e.get('end',0)})
+    kept=[{**v,'occurrences_count':len(v['occurrences'])} for v in kept_grouped.values()]
+    review = [{'original_value': e['surface_value'], 'normalized_value': e.get('normalized_value'), 'entity_class': e['entity_class'], 'redaction_decision': e['redaction_decision'], 'requires_review': e.get('requires_review', False), 'review_reason': e['redaction_reason'], 'source': e.get('source')} for e in resolved if e.get('requires_review')]
     return mappings, kept, review
 
 
+
+
+def apply_manual_decisions(document_id: str, resolved: list[dict]) -> list[dict]:
+    decisions = manual_decisions_by_document_id.get(document_id, {})
+    for e in resolved:
+        key = e.get('cluster_id') or f"{e['entity_class']}::{e.get('normalized_value', e['surface_value'])}"
+        d = decisions.get(key)
+        if not d:
+            continue
+        if d['decision'] == 'FORCE_KEEP':
+            e['redaction_decision'] = 'KEEP'
+            e['requires_review'] = False
+            e['redaction_reason'] = 'Оставлено пользователем'
+        elif d['decision'] == 'FORCE_REDACT':
+            e['redaction_decision'] = 'REDACT'
+            e['redaction_reason'] = 'Обезличено пользователем'
+            e['requires_review'] = False
+    return resolved
+
+
+def rebuild_document(document_id: str, mode: str):
+    doc = restored_docs[document_id]
+    text = doc.get('original_text', '')
+    return text
 def apply_anonymization(text: str, entities: list[dict]) -> tuple[str, list[dict]]:
     resolved = resolve_entities(text, entities, 'NORMATIVE')
     mappings, _, _ = build_mappings_from_resolved(resolved)
@@ -489,9 +522,13 @@ def delete_mapping(document_id: str, mapping_id: str, x_internal_service_token: 
         _error(404, 'NOT_FOUND', 'Документ не найден')
     doc = restored_docs[document_id]
     mappings = ensure_document_mappings(document_id)
-    if not any(m.get('id') == mapping_id for m in mappings):
+    mapping = next((m for m in mappings if m.get('id') == mapping_id), None)
+    if not mapping:
         _error(404, 'NOT_FOUND', 'Элемент таблицы соответствия не найден')
+    entity_key = mapping.get('cluster_id') or f"{mapping.get('entity_class', mapping.get('entity_type','OTHER'))}::{mapping.get('normalized_value', mapping.get('original_value',''))}"
+    manual_decisions_by_document_id.setdefault(document_id, {})[entity_key] = {'entity_key': entity_key, 'decision': 'FORCE_KEEP', 'target_cluster_id': None, 'reason': 'Оставлено пользователем', 'created_at': now_iso(), 'updated_at': now_iso()}
     doc['mappings'] = [m for m in mappings if m.get('id') != mapping_id]
+    doc['anonymized_text'] = replace_by_mappings(doc.get('original_text',''), doc['mappings'])
     manual_mappings_by_document_id[document_id] = [m for m in doc['mappings'] if m.get('source') == 'manual']
     return {'document_id': document_id, 'anonymized_text': doc.get('anonymized_text', ''), 'mappings': doc['mappings']}
 
@@ -590,10 +627,19 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
     if body.decision not in {'REDACT', 'KEEP', 'MERGE_WITH_EXISTING'}:
         _error(400, 'BAD_REQUEST', 'Недопустимое решение', {'allowed': ['REDACT', 'KEEP', 'MERGE_WITH_EXISTING']})
     audit_log.append({'id': str(uuid.uuid4()), 'document_id': document_id, 'action': 'REDACTION_DECISION', 'details': body.model_dump(), 'created_at': now_iso()})
+    doc = restored_docs[document_id]
+    entity_key = f"{body.entity_class}::{normalize_spaces(body.selected_text)}"
+    decisions = manual_decisions_by_document_id.setdefault(document_id, {})
     if body.decision == 'REDACT':
-        mapping = ensure_mapping_metadata({'original_value': body.selected_text, 'entity_type': body.entity_class, 'placeholder': next_placeholder(body.entity_class, restored_docs[document_id].get('mappings', [])), 'source': 'manual'})
-        restored_docs[document_id].setdefault('mappings', []).append(mapping)
-    return {'ok': True, 'audit_count': len(audit_log)}
+        decisions[entity_key] = {'entity_key': entity_key, 'decision': 'FORCE_REDACT', 'target_cluster_id': body.target_cluster_id, 'reason': body.reason, 'created_at': now_iso(), 'updated_at': now_iso()}
+        mapping = ensure_mapping_metadata({'original_value': body.selected_text, 'entity_type': body.entity_class, 'entity_class': body.entity_class, 'placeholder': next_placeholder(body.entity_class, doc.get('mappings', [])), 'source': 'manual'})
+        doc.setdefault('mappings', []).append(mapping)
+    elif body.decision == 'KEEP':
+        decisions[entity_key] = {'entity_key': entity_key, 'decision': 'FORCE_KEEP', 'target_cluster_id': body.target_cluster_id, 'reason': body.reason, 'created_at': now_iso(), 'updated_at': now_iso()}
+        doc['mappings'] = [m for m in doc.get('mappings', []) if m.get('original_value') != body.selected_text]
+    original_text = doc.get('original_text', '')
+    doc['anonymized_text'] = replace_by_mappings(original_text, doc.get('mappings', []))
+    return {'document_id': document_id, 'anonymized_text': doc.get('anonymized_text', ''), 'anonymized_content': doc.get('anonymized_content'), 'mappings': doc.get('mappings', []), 'recognized_but_kept': doc.get('recognized_but_kept', []), 'review_entities': doc.get('review_entities', []), 'publication_redaction_mode': doc.get('publication_redaction_mode', 'NORMATIVE')} 
 
 
 @app.get('/internal/anonymization/documents/{document_id}/preview')
