@@ -544,6 +544,57 @@ def anonymize_text_by_mentions(text: str, entities: list[dict]) -> str:
     return out
 
 
+def build_mappings_from_entities(entities: list[dict]) -> list[dict]:
+    mappings = []
+    for e in entities:
+        if e.get('redaction_decision') != 'REDACT':
+            continue
+        mappings.append(ensure_mapping_metadata({
+            'id': e['entity_id'],
+            'placeholder': e.get('placeholder'),
+            'original_value': e.get('canonical_value'),
+            'normalized_value': e.get('normalized_value'),
+            'entity_class': e.get('entity_class'),
+            'entity_type': e.get('entity_class'),
+            'aliases': [m.get('surface_value') for m in e.get('mentions', []) if m.get('surface_value') != e.get('canonical_value')],
+        }))
+    return mappings
+
+
+def rebuild_document_from_entities(document_id: str, entities: list[dict], original_text: str, original_content: dict | None):
+    # stable placeholders by first mention position
+    counters: dict[str, int] = defaultdict(int)
+    for e in sorted(entities, key=lambda x: min((m.get('start') or 0) for m in x.get('mentions', []) or [0])):
+        prefix = 'ФИО' if e.get('entity_class') == 'PERSON' else make_placeholder(e.get('entity_class', 'OTHER'), 0)[:-1]
+        counters[prefix] += 1
+        e['placeholder'] = f'{prefix}{counters[prefix]}'
+        for m in e.get('mentions', []):
+            m['replacement_value'] = e['placeholder']
+    anonymized_text = anonymize_text_by_mentions(original_text, entities)
+    anonymized_content = anonymize_content_by_mentions(original_content, entities)
+    mappings = build_mappings_from_entities(entities)
+    kept_entities = [e for e in entities if e.get('redaction_decision') == 'KEEP']
+    review_entities = [e for e in entities if e.get('requires_review')]
+    pending_entities = restored_docs.get(document_id, {}).get('pending_review', [])
+    doc = restored_docs.get(document_id, {})
+    doc.update({
+        'entities': entities,
+        'anonymized_text': anonymized_text,
+        'anonymized_content': anonymized_content,
+        'mappings': mappings,
+        'kept_entities': kept_entities,
+        'recognized_but_kept': kept_entities,
+        'review_entities': review_entities,
+        'pending_entities': pending_entities,
+    })
+    restored_docs[document_id] = doc
+    if document_id in public_docs:
+        public_docs[document_id]['anonymized_text'] = anonymized_text
+        public_docs[document_id]['anonymized_content'] = anonymized_content
+        public_docs[document_id]['content_format'] = doc.get('content_format', 'PLAIN_TEXT')
+    return doc
+
+
 def anonymize_content_by_mentions(content: dict | None, entities: list[dict]) -> dict | None:
     if not content:
         return None
@@ -725,9 +776,9 @@ async def process(body: ProcessRequest, x_internal_service_token: str | None = H
 
     resolved = resolve_entities(body.text, entities, body.publication_redaction_mode)
     entities, recognized_but_kept, review_entities = build_entities_from_resolved(body.document_id, resolved, body.publication_redaction_mode)
-    mappings=[ensure_mapping_metadata({'id':e['entity_id'],'placeholder':e['placeholder'],'original_value':e['canonical_value'],'normalized_value':e['normalized_value'],'entity_class':e['entity_class'],'entity_type':e['entity_class'],'aliases':[m['surface_value'] for m in e.get('mentions',[]) if m['surface_value']!=e['canonical_value']]}) for e in entities]
-    anonymized = anonymize_text_by_mentions(body.text, entities)
-
+    rebuilt = rebuild_document_from_entities(body.document_id, entities + recognized_but_kept, body.text, body.original_content)
+    mappings = rebuilt.get('mappings', [])
+    anonymized = rebuilt.get('anonymized_text', '')
     save_document(body.document_id, body.case_id, body.title, body.text, anonymized, mappings, body.metadata, recognized_but_kept)
     jobs[job_id]['status'] = 'COMPLETED'
     restored_docs[body.document_id]['entities']=entities
@@ -735,7 +786,7 @@ async def process(body: ProcessRequest, x_internal_service_token: str | None = H
     restored_docs[body.document_id]['publication_redaction_mode']=body.publication_redaction_mode
     restored_docs[body.document_id]['content_format']=body.content_format
     restored_docs[body.document_id]['original_content']=body.original_content
-    restored_docs[body.document_id]['anonymized_content'] = anonymize_content_by_mentions(body.original_content, entities)
+    restored_docs[body.document_id]['anonymized_content'] = rebuilt.get('anonymized_content')
     restored_docs[body.document_id]['pending_review'] = []
     restored_docs[body.document_id]['pending_markers'] = []
     return {
@@ -932,11 +983,12 @@ async def reanonymize(document_id: str, body: ReanonymizeRequest, x_internal_ser
             ent['redaction_decision'] = 'KEEP'
         if ent and d.get('decision') == 'FORCE_REDACT':
             ent['redaction_decision'] = 'REDACT'
-    mappings=[ensure_mapping_metadata({'id':e['entity_id'],'placeholder':e['placeholder'],'original_value':e['canonical_value'],'normalized_value':e['normalized_value'],'entity_class':e['entity_class'],'entity_type':e['entity_class'],'aliases':[m['surface_value'] for m in e.get('mentions',[]) if m['surface_value']!=e['canonical_value']]}) for e in entities_view]
-    anonymized = anonymize_text_by_mentions(original_text, entities_view)
+    rebuilt = rebuild_document_from_entities(document_id, entities_view + recognized_but_kept, original_text, doc.get('original_content'))
+    mappings = rebuilt.get('mappings', [])
+    anonymized = rebuilt.get('anonymized_text', '')
     save_document(document_id, doc.get('case_id', ''), doc.get('title', ''), original_text, anonymized, mappings, public_docs.get(document_id, {}).get('metadata', {}), recognized_but_kept)
-    restored_docs[document_id]['entities'] = entities_view
-    restored_docs[document_id]['anonymized_content'] = anonymize_content_by_mentions(doc.get('original_content'), entities_view)
+    restored_docs[document_id]['entities'] = rebuilt.get('entities', [])
+    restored_docs[document_id]['anonymized_content'] = rebuilt.get('anonymized_content')
     restored_docs[document_id]['review_entities']=review_entities
     restored_docs[document_id]['publication_redaction_mode']=body.publication_redaction_mode
     return anonymization_result_response(restored_docs[document_id])
@@ -1040,6 +1092,11 @@ def patch_entity(document_id: str, entity_id: str, body: EntityPatchRequest, x_i
         _error(404, 'NOT_FOUND', 'Сущность не найдена')
     for k, v in body.model_dump(exclude_unset=True).items():
         ent[k] = v
+    manual_decisions_by_document_id.setdefault(document_id, {})[f'UPDATE_ENTITY_ROLE::{entity_id}'] = {
+        'decision_id': str(uuid.uuid4()), 'document_id': document_id, 'decision_type': 'UPDATE_ENTITY_ROLE',
+        'entity_id': entity_id, 'payload': body.model_dump(exclude_unset=True), 'created_at': now_iso(), 'updated_at': now_iso(),
+    }
+    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('original_text', ''), doc.get('original_content'))
     return anonymization_result_response(doc)
 
 
@@ -1062,8 +1119,11 @@ def merge_entities(document_id: str, body: EntityMergeRequest, x_internal_servic
             m['replacement_value'] = target['placeholder']
             target.setdefault('mentions', []).append(m)
         entities.remove(src)
-    doc['anonymized_text'] = anonymize_text_by_mentions(doc.get('original_text', ''), entities)
-    doc['anonymized_content'] = anonymize_content_by_mentions(doc.get('original_content'), entities)
+    manual_decisions_by_document_id.setdefault(document_id, {})[f'MERGE_ENTITIES::{target["entity_id"]}'] = {
+        'decision_id': str(uuid.uuid4()), 'document_id': document_id, 'decision_type': 'MERGE_ENTITIES',
+        'entity_id': target['entity_id'], 'payload': {'source_entity_ids': body.source_entity_ids}, 'created_at': now_iso(), 'updated_at': now_iso(),
+    }
+    rebuild_document_from_entities(document_id, entities, doc.get('original_text', ''), doc.get('original_content'))
     return anonymization_result_response(doc)
 
 
@@ -1087,6 +1147,9 @@ def split_mention(document_id: str, entity_id: str, mention_id: str, x_internal_
     mention['replacement_value'] = new_ent['placeholder']
     new_ent['mentions'] = [mention]
     doc['entities'].append(new_ent)
-    doc['anonymized_text'] = anonymize_text_by_mentions(doc.get('original_text', ''), doc.get('entities', []))
-    doc['anonymized_content'] = anonymize_content_by_mentions(doc.get('original_content'), doc.get('entities', []))
+    manual_decisions_by_document_id.setdefault(document_id, {})[f'SPLIT_MENTION::{mention_id}'] = {
+        'decision_id': str(uuid.uuid4()), 'document_id': document_id, 'decision_type': 'SPLIT_MENTION',
+        'entity_id': entity_id, 'mention_id': mention_id, 'target_entity_id': new_ent['entity_id'], 'payload': {}, 'created_at': now_iso(), 'updated_at': now_iso(),
+    }
+    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('original_text', ''), doc.get('original_content'))
     return anonymization_result_response(doc)

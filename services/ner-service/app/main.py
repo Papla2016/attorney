@@ -105,7 +105,7 @@ class RussianPersonNormalizer:
         except Exception:
             pass
         try:
-            from pymorphy2 import MorphAnalyzer
+            from pymorphy3 import MorphAnalyzer
             m = MorphAnalyzer()
             p = m.parse(word)[0]
             return p.normal_form.capitalize()
