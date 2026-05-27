@@ -17,23 +17,27 @@ export interface UploadDocumentRequest { title: string; act_type: string; text?:
 export interface PaginatedResponse<T> { items: T[]; total: number; page: number; page_size: number; }
 export interface ApiError { error: { code: string; message: string; details?: Record<string, unknown> }; }
 
-export interface AnonymizationResult {
+export type AnonymizationResult = {
   document_id: string;
   anonymized_text?: string;
   anonymized_content?: unknown;
   content_format?: 'TIPTAP_JSON' | 'PLAIN_TEXT';
   entities?: RedactionEntity[];
-  mappings?: EntityMapping[];
-  recognized_but_kept?: EntityMapping[];
-  review_entities?: EntityMapping[];
+  kept_entities?: RedactionEntity[];
+  review_entities?: RedactionEntity[];
+  pending_entities?: RedactionEntity[];
   review_markers?: ReviewMarker[];
-  pending_review?: PendingReviewEntity[];
   pending_markers?: PendingMarker[];
-  manual_decisions?: unknown[];
   publication_redaction_mode?: 'NORMATIVE' | 'EXTENDED_SAFE';
   ner_provider?: string;
+
+  // временная обратная совместимость:
+  mappings?: EntityMapping[];
+  recognized_but_kept?: EntityMapping[];
+  pending_review?: PendingReviewEntity[];
+  manual_decisions?: unknown[];
   document_revision?: number;
-}
+};
 
 
 export type PendingReviewEntity = {
@@ -54,5 +58,49 @@ export type PendingMarker = { entity_key: string; surface_value: string; start?:
 export type ReviewMarker = { entity_key?: string; cluster_id?: string; placeholder?: string; display_text?: string; reason: string; occurrences_count?: number; };
 
 
-export interface RedactionMention { mention_id: string; entity_id: string; surface_value: string; start?: number; end?: number; format?: string; replacement_value?: string; requires_review?: boolean; review_reason?: string; }
-export interface RedactionEntity { entity_id: string; placeholder: string; entity_class: string; canonical_value: string; normalized_value?: string; person_role?: string; redaction_decision: 'REDACT' | 'KEEP' | 'REVIEW'; requires_review?: boolean; review_reason?: string | null; mentions_count?: number; mentions: RedactionMention[]; }
+export type EntityMention = {
+  mention_id: string;
+  entity_id: string;
+  surface_value: string;
+  normalized_value?: string;
+  start?: number;
+  end?: number;
+  format?: 'FULL' | 'INITIALS' | 'OTHER';
+  grammatical_case?: string;
+  word_order?: string;
+  replacement_value?: string;
+  source?: string;
+  requires_review?: boolean;
+  review_reason?: string | null;
+};
+
+export type RedactionEntity = {
+  entity_id: string;
+  document_id?: string;
+  placeholder?: string;
+  entity_class: string;
+  canonical_value: string;
+  normalized_value?: string;
+  person_role?: string;
+  context_kind?: string;
+  redaction_decision: 'REDACT' | 'KEEP';
+  requires_review?: boolean;
+  review_reason?: string | null;
+  source?: string;
+  mentions_count?: number;
+  mentions: EntityMention[];
+  merge_candidates?: Array<{
+    entity_id: string;
+    placeholder?: string;
+    canonical_value: string;
+  }>;
+};
+
+export type PublicationValidationDetails = {
+  pending_entity_count?: number;
+  pending_mention_count?: number;
+  review_entity_count?: number;
+  review_mention_count?: number;
+  pending_count?: number;
+  review_count?: number;
+};

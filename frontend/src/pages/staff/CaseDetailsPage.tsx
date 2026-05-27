@@ -9,7 +9,7 @@ import { useAuth } from '../../auth/useAuth';
 import { isStaff } from '../../utils/roles';
 import { INSTANCE_OPTIONS } from '../../constants/instances';
 import { RUSSIAN_REGIONS } from '../../constants/regions';
-import type { UpdateCaseRequest } from '../../api/types';
+import type { PublicationValidationDetails, UpdateCaseRequest } from '../../api/types';
 
 type CaseStatus = 'DRAFT' | 'PUBLISHED' | 'ARCHIVED';
 const val = (v: any) => v || '—';
@@ -24,8 +24,19 @@ const publishErrorMessage = (error: any) => {
   const status = error?.response?.status;
   const apiError = error?.response?.data?.error;
   const code = apiError?.code;
-  const pendingCount = apiError?.details?.pending_count;
-  if (status === 409 && code === 'PENDING_REDACTION_REVIEW') return `Документ нельзя опубликовать: осталось необработанных фрагментов — ${pendingCount ?? 'неизвестно'}. Откройте ручную проверку и обработайте найденные персональные данные.`;
+  const details: PublicationValidationDetails = apiError?.details || {};
+  const pendingEntities = details.pending_entity_count ?? details.pending_count ?? 0;
+  const pendingMentions = details.pending_mention_count;
+  const reviewEntities = details.review_entity_count ?? details.review_count ?? 0;
+  const reviewMentions = details.review_mention_count;
+  if (status === 409 && code === 'PENDING_REDACTION_REVIEW') {
+    const lines = ['Документ нельзя опубликовать: проверка обезличивания не завершена.'];
+    if (pendingEntities > 0) lines.push(`Новых необработанных сущностей в изменённом тексте: ${pendingEntities}.`);
+    if ((pendingMentions || 0) > 0) lines.push(`Упоминаний этих сущностей: ${pendingMentions}.`);
+    if (reviewEntities > 0) lines.push(`Обезличенных значений, требующих подтверждения: ${reviewEntities}.`);
+    if ((reviewMentions || 0) > 0) lines.push(`Упоминаний, требующих проверки: ${reviewMentions}.`);
+    return lines.join(' ');
+  }
   if (status === 403) return 'Недостаточно прав для публикации документа.';
   if (status === 400) return apiError?.message || 'Документ ещё не готов к публикации.';
   if (status >= 500) return 'Внутренняя ошибка сервера.';
