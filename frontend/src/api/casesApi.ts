@@ -21,6 +21,10 @@ export const addDocumentMapping = (documentId: string, payload: { original_value
 
 export const updateDocumentMapping = (documentId: string, mappingId: string, payload: { placeholder: string; original_value: string; entity_type: string }) => client.patch(`/cases/documents/${documentId}/mappings/${mappingId}`, payload);
 export const deleteDocumentMapping = (documentId: string, mappingId: string) => client.delete(`/cases/documents/${documentId}/mappings/${mappingId}`);
+
+export const mergeDocumentEntities = (documentId: string, payload: { target_entity_id: string; source_entity_ids: string[] }) => client.post(`/cases/documents/${documentId}/entities/merge`, payload);
+export const splitEntityMention = (documentId: string, entityId: string, mentionId: string) => client.post(`/cases/documents/${documentId}/entities/${entityId}/mentions/${mentionId}/split`);
+
 export const mergeDocumentMappings = (documentId: string, payload: { target_mapping_id: string; source_mapping_ids: string[] }) => client.post(`/cases/documents/${documentId}/mappings/merge`, payload);
 export const reanonymizeDocument = (documentId: string, payload: { mappings: EntityMapping[]; publication_redaction_mode: 'NORMATIVE' | 'EXTENDED_SAFE' }) => client.post<AnonymizationResult>(`/cases/documents/${documentId}/reanonymize`, payload);
 export const saveAnonymization = (documentId: string, payload: { anonymized_text: string; anonymized_content?: unknown; content_format?: 'TIPTAP_JSON'; mappings: EntityMapping[] }) => client.post<AnonymizationResult>(`/cases/documents/${documentId}/save-anonymization`, payload);
