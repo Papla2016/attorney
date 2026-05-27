@@ -442,6 +442,25 @@ def anonymization_result_response(document: dict, case: dict | None = None) -> d
     }
 
 
+def _strip_redaction_marks(content: dict | None) -> dict | None:
+    if not content:
+        return content
+    import copy
+    data = copy.deepcopy(content)
+    def walk(node):
+        if isinstance(node, dict):
+            if isinstance(node.get('marks'), list):
+                node['marks'] = [m for m in node['marks'] if m.get('type') != 'redactionMention']
+            if isinstance(node.get('content'), list):
+                for ch in node['content']:
+                    walk(ch)
+        elif isinstance(node, list):
+            for ch in node:
+                walk(ch)
+    walk(data)
+    return data
+
+
 def document_metadata(cs: dict):
     return {
         'case_number': cs.get('case_number'),
@@ -783,16 +802,55 @@ async def upload(case_id: str, body: UploadDoc, authorization: str | None = Head
             r = await cl.post(f'{ANON}/internal/anonymization/process', headers={'X-Internal-Service-Token': INTERNAL}, json={'case_id': case_id, 'document_id': d['id'], 'title': body.title, 'text': body.text, 'metadata': {}, 'content_format': body.content_format, 'original_content': body.content, 'publication_redaction_mode': body.publication_redaction_mode})
         p = r.json()
         d['anonymization_job_id'] = p.get('job_id')
-        d['anonymized_text'] = p.get('anonymized_text') or d['anonymized_text']
-        d['mappings'] = [ensure_mapping_metadata(m) for m in (p.get('mappings') or [])]
-        d['recognized_but_kept'] = p.get('recognized_but_kept', [])
-        d['review_entities'] = p.get('review_entities', [])
+        sync_doc_from_anonymization(d, p)
         d['publication_redaction_mode'] = p.get('publication_redaction_mode', body.publication_redaction_mode)
     except Exception:
         d['anonymization_job_id'] = None
     d['status'] = 'ANONYMIZED'
     d['public_anonymized_document_id'] = d['id']
     audit(c.get('sub'), 'UPLOAD_DOCUMENT', 'DOCUMENT', d['id'], {'case_id': case_id})
+    return anonymization_result_response(d, cs)
+
+
+@app.patch('/api/cases/documents/{document_id}/entities/{entity_id}')
+async def update_document_entity(document_id: str, entity_id: str, body: dict, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    d, cs = find_document_and_case(document_id)
+    if not can_manage_case(c, cs):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    async with httpx.AsyncClient(timeout=10.0) as cl:
+        r = await cl.patch(f'{ANON}/internal/anonymization/documents/{document_id}/entities/{entity_id}', headers={'X-Internal-Service-Token': INTERNAL}, json=body)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.json())
+    sync_doc_from_anonymization(d, r.json())
+    return anonymization_result_response(d, cs)
+
+
+@app.post('/api/cases/documents/{document_id}/entities/merge')
+async def merge_entities(document_id: str, body: dict, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    d, cs = find_document_and_case(document_id)
+    if not can_manage_case(c, cs):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    async with httpx.AsyncClient(timeout=10.0) as cl:
+        r = await cl.post(f'{ANON}/internal/anonymization/documents/{document_id}/entities/merge', headers={'X-Internal-Service-Token': INTERNAL}, json=body)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.json())
+    sync_doc_from_anonymization(d, r.json())
+    return anonymization_result_response(d, cs)
+
+
+@app.post('/api/cases/documents/{document_id}/entities/{entity_id}/mentions/{mention_id}/split')
+async def split_mention(document_id: str, entity_id: str, mention_id: str, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    d, cs = find_document_and_case(document_id)
+    if not can_manage_case(c, cs):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    async with httpx.AsyncClient(timeout=10.0) as cl:
+        r = await cl.post(f'{ANON}/internal/anonymization/documents/{document_id}/entities/{entity_id}/mentions/{mention_id}/split', headers={'X-Internal-Service-Token': INTERNAL})
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.json())
+    sync_doc_from_anonymization(d, r.json())
     return anonymization_result_response(d, cs)
 
 
@@ -1079,7 +1137,7 @@ async def pub_doc(document_id: str):
         'case_id': cs['id'],
         'title': d['title'],
         'anonymized_text': anonymized_text,
-        'anonymized_content': d.get('anonymized_content'),
+        'anonymized_content': _strip_redaction_marks(d.get('anonymized_content')),
         'content_format': d.get('content_format', 'PLAIN_TEXT'),
         'metadata': document_metadata(cs),
     }

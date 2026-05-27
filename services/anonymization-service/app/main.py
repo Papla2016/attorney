@@ -738,7 +738,25 @@ async def process(body: ProcessRequest, x_internal_service_token: str | None = H
     restored_docs[body.document_id]['anonymized_content'] = anonymize_content_by_mentions(body.original_content, entities)
     restored_docs[body.document_id]['pending_review'] = []
     restored_docs[body.document_id]['pending_markers'] = []
-    return {'job_id': job_id, 'status': 'COMPLETED', 'anonymized_document_id': body.document_id, 'anonymized_text': anonymized, 'anonymized_content': restored_docs[body.document_id].get('anonymized_content'), 'content_format': body.content_format, 'mappings': mappings, 'recognized_but_kept': recognized_but_kept, 'review_entities': review_entities, 'review_markers': [], 'pending_review': [], 'pending_markers': [], 'manual_decisions': list(manual_decisions_by_document_id.get(body.document_id, {}).values()), 'publication_redaction_mode': body.publication_redaction_mode, 'ner_provider': 'hybrid'}
+    return {
+        'job_id': job_id,
+        'status': 'COMPLETED',
+        'anonymized_document_id': body.document_id,
+        'anonymized_text': anonymized,
+        'anonymized_content': restored_docs[body.document_id].get('anonymized_content'),
+        'content_format': body.content_format,
+        'entities': entities,
+        'kept_entities': recognized_but_kept,
+        'review_entities': review_entities,
+        'mappings': mappings,
+        'recognized_but_kept': recognized_but_kept,
+        'review_markers': [],
+        'pending_review': [],
+        'pending_markers': [],
+        'manual_decisions': list(manual_decisions_by_document_id.get(body.document_id, {}).values()),
+        'publication_redaction_mode': body.publication_redaction_mode,
+        'ner_provider': 'hybrid',
+    }
 
 
 @app.get('/internal/anonymization/documents/{document_id}/public')
