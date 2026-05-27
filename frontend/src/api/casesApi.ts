@@ -27,7 +27,7 @@ export const splitEntityMention = (documentId: string, entityId: string, mention
 
 export const mergeDocumentMappings = (documentId: string, payload: { target_mapping_id: string; source_mapping_ids: string[] }) => client.post(`/cases/documents/${documentId}/mappings/merge`, payload);
 export const reanonymizeDocument = (documentId: string, payload: { mappings: EntityMapping[]; publication_redaction_mode: 'NORMATIVE' | 'EXTENDED_SAFE' }) => client.post<AnonymizationResult>(`/cases/documents/${documentId}/reanonymize`, payload);
-export const saveAnonymization = (documentId: string, payload: { anonymized_text: string; anonymized_content?: unknown; content_format?: 'TIPTAP_JSON'; mappings: EntityMapping[] }) => client.post<AnonymizationResult>(`/cases/documents/${documentId}/save-anonymization`, payload);
+export const saveAnonymization = (documentId: string, payload: { anonymized_text: string; anonymized_content?: unknown; content_format?: 'TIPTAP_JSON'; mappings?: EntityMapping[]; entities?: unknown[] }) => client.post<AnonymizationResult>(`/cases/documents/${documentId}/save-anonymization`, payload);
 export const deleteCaseDocument = (caseId: string, documentId: string) => client.delete(`/cases/${caseId}/documents/${documentId}`);
 
 export const repairPlaceholders = (documentId: string) => client.post(`/cases/documents/${documentId}/mappings/repair-placeholders`);
@@ -50,3 +50,5 @@ export const scanEditedDraft = (
   documentId: string,
   payload: { text: string; content: unknown; content_format: 'TIPTAP_JSON'; document_revision: number }
 ) => client.post<AnonymizationResult>(`/cases/documents/${documentId}/draft-scan`, payload);
+
+export const updateDocumentEntity = (documentId: string, entityId: string, payload: { canonical_value: string; person_role?: string; context_label?: string }) => client.patch(`/cases/documents/${documentId}/entities/${entityId}`, payload);
