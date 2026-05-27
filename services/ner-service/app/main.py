@@ -41,6 +41,59 @@ def map_natasha_type(span_type: str) -> str:
     }.get(span_type, span_type)
 
 
+
+
+class RussianPersonNormalizer:
+    def __init__(self, morph_vocab=None):
+        self.morph_vocab = morph_vocab
+        self.initials_patterns = [
+            re.compile(r'^([А-ЯЁ][а-яё]+)\s+([А-ЯЁ])\.\s*([А-ЯЁ])\.$'),
+            re.compile(r'^([А-ЯЁ])\.\s*([А-ЯЁ])\.\s*([А-ЯЁ][а-яё]+)$'),
+        ]
+
+    def normalize(self, text: str) -> tuple[str | None, dict]:
+        value = re.sub(r'\s+', ' ', text or '').strip().replace(' .', '.')
+        meta = {'format': 'FULL', 'word_order': 'SURNAME_NAME_PATRONYMIC', 'initials': None, 'surname_normalized': None}
+        for p in self.initials_patterns:
+            m = p.match(value)
+            if m:
+                if p.pattern.startswith('^([А-ЯЁ][а-яё]+)'):
+                    surname, i1, i2 = m.groups(); order='SURNAME_INITIALS'
+                else:
+                    i1, i2, surname = m.groups(); order='INITIALS_SURNAME'
+                sn = self._normalize_word(surname)
+                meta.update({'format':'INITIALS','word_order':order,'initials':f'{i1}{i2}','surname_normalized':sn})
+                return f'{sn} {i1}.{i2}.', meta
+        parts = value.split()
+        if len(parts) >= 3:
+            s, n, p = parts[:3]
+            sn = self._normalize_word(s)
+            nn = self._normalize_word(n)
+            pn = self._normalize_word(p)
+            meta.update({'surname_normalized': sn, 'initials': f'{nn[0]}{pn[0]}', 'word_order': 'SURNAME_NAME_PATRONYMIC'})
+            return f'{sn} {nn} {pn}', meta
+        return None, meta
+
+    def _normalize_word(self, word: str) -> str:
+        if not word:
+            return word
+        if self.morph_vocab is None:
+            return word
+        try:
+            from natasha import Doc
+            d = Doc(word)
+            d.segment(lambda x: None)
+        except Exception:
+            pass
+        try:
+            from pymorphy2 import MorphAnalyzer
+            m = MorphAnalyzer()
+            p = m.parse(word)[0]
+            return p.normal_form.capitalize()
+        except Exception:
+            return word
+
+
 class NatashaNerProvider(BaseNerProvider):
     name = 'natasha'
 
@@ -62,6 +115,7 @@ class NatashaNerProvider(BaseNerProvider):
         self.morph_tagger = NewsMorphTagger(self.emb)
         self.syntax_parser = NewsSyntaxParser(self.emb)
         self.ner_tagger = NewsNERTagger(self.emb)
+        self.person_normalizer = RussianPersonNormalizer(self.morph_vocab)
 
     def extract(self, text: str) -> list[Entity]:
         doc = self.doc_cls(text)
@@ -76,6 +130,8 @@ class NatashaNerProvider(BaseNerProvider):
             mapped_type = map_natasha_type(span.type)
             if mapped_type in {'PERSON_FULL_NAME', 'LOCATION', 'ORGANIZATION'}:
                 normalized_text = getattr(span, 'normal', None) or span.text
+                if mapped_type == 'PERSON_FULL_NAME':
+                    normalized_text = self.person_normalizer.normalize(normalized_text)[0] or normalized_text
                 if not getattr(span, 'normal', None):
                     LOGGER.info('Natasha normalization missing for span: %s', span.text)
                 entities.append(Entity(
@@ -98,6 +154,7 @@ class RegexRuleNerProvider(BaseNerProvider):
         fio_full = r'[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+'
         fio_initials = r'[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\.'
         fio = rf'(?:{fio_full}|{fio_initials})'
+        self.person_normalizer = RussianPersonNormalizer()
         self.patterns = [
             ('EMAIL', re.compile(r'(?<![\w.-])[\w.+-]+@[\w.-]+\.[A-Za-zА-Яа-яЁё]{2,}\b'), 0.95, 'regex'),
             ('PHONE', re.compile(r'(?<!\d)(?:\+7|8)[\s\-()]?\d{3}[\s\-()]?\d{3}[\s\-()]?\d{2}[\s\-()]?\d{2}(?!\d)'), 0.93, 'regex'),
@@ -126,10 +183,15 @@ class RegexRuleNerProvider(BaseNerProvider):
             for m in pattern.finditer(text):
                 value = m.group(0).strip(' ,;')
                 start = m.start() + (len(m.group(0)) - len(m.group(0).lstrip(' ,;')))
-                entities.append(Entity(type=etype, text=value, normalized_text=None, start=start, end=start + len(value), confidence=conf, source=source))
+                normalized = None
+                if etype in {'PERSON_FULL_NAME','JUDGE','COURT_SECRETARY','CASE_PARTICIPANT'}:
+                    normalized = self.person_normalizer.normalize(value)[0] or value
+                entities.append(Entity(type=etype, text=value, normalized_text=normalized, start=start, end=start + len(value), confidence=conf, source=source))
         for etype, pattern, conf in self.role_patterns:
             for m in pattern.finditer(text):
-                entities.append(Entity(type=etype, text=m.group(1), normalized_text=None, start=m.start(1), end=m.end(1), confidence=conf, source='rule'))
+                person_text = m.group(1)
+                normalized = self.person_normalizer.normalize(person_text)[0] or person_text
+                entities.append(Entity(type=etype, text=person_text, normalized_text=normalized, start=m.start(1), end=m.end(1), confidence=conf, source='rule'))
         return deduplicate_entities(entities)
 
 
