@@ -411,7 +411,7 @@ def sync_doc_from_anonymization(d: dict, payload: dict):
         d['mappings'] = [ensure_mapping_metadata(m) for m in (payload.get('mappings') or [])]
     if 'original_text' in payload:
         d['original_text'] = payload.get('original_text') or d.get('original_text', '')
-    for k in ['recognized_but_kept','review_entities','publication_redaction_mode','content_format','original_content','ner_provider','anonymized_content','review_markers','pending_review','pending_markers','manual_decisions']:
+    for k in ['entities','recognized_but_kept','review_entities','publication_redaction_mode','content_format','original_content','ner_provider','anonymized_content','review_markers','pending_review','pending_markers','manual_decisions']:
         if k in payload:
             d[k]=payload.get(k)
 
@@ -1025,11 +1025,15 @@ def publish_document(document_id: str, authorization: str | None = Header(None))
         err('DOCUMENT_TEXT_NOT_READY', 'Текст документа ещё не готов', 409)
     if d['status'] not in ['ANONYMIZED', 'PUBLISHED']:
         err('BAD_REQUEST', 'Документ должен быть обезличен перед публикацией', 400)
-    pending_count = len(d.get('pending_review', []))
-    review_count = len(d.get('review_entities', []))
-    if pending_count or review_count:
-        audit(c.get('sub'), 'BLOCK_PUBLICATION_PENDING_REVIEW', 'DOCUMENT', document_id, {'case_id': d['case_id'], 'pending_count': pending_count})
-        err('PENDING_REDACTION_REVIEW', 'Документ содержит сведения, требующие проверки перед публикацией.', 409, {'pending_count': pending_count, 'review_count': review_count})
+    pending_entities = d.get('pending_review', [])
+    review_entities = d.get('review_entities', [])
+    pending_entity_count = len(pending_entities)
+    pending_mention_count = sum(int(x.get('mentions_count') or 1) for x in pending_entities)
+    review_entity_count = len(review_entities)
+    review_mention_count = sum(len(x.get('mentions', [])) if isinstance(x.get('mentions'), list) and x.get('mentions') else int(x.get('occurrences_count') or 1) for x in review_entities)
+    if pending_entity_count > 0 or review_entity_count > 0:
+        audit(c.get('sub'), 'BLOCK_PUBLICATION_REVIEW_REQUIRED', 'DOCUMENT', document_id, {'case_id': d['case_id'], 'pending_entity_count': pending_entity_count, 'review_entity_count': review_entity_count})
+        err('PENDING_REDACTION_REVIEW', 'Документ содержит сведения, требующие проверки перед публикацией.', 409, {'pending_entity_count': pending_entity_count, 'pending_mention_count': pending_mention_count, 'review_entity_count': review_entity_count, 'review_mention_count': review_mention_count})
     d['status'] = 'PUBLISHED'
     if any(doc['case_id'] == cs['id'] and doc['status'] == 'PUBLISHED' for doc in docs):
         cs['status'] = 'PUBLISHED'
