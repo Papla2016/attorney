@@ -149,7 +149,9 @@ def normalize_person_name(value: str) -> tuple[str, dict]:
     parts = cleaned.split()
     if len(parts) >= 3:
         initials = ''.join(p[0] for p in parts[1:3] if p)
-        return f'{parts[0]} {parts[1]} {parts[2]}', {'surname': parts[0].lower(), 'initials': initials.lower(), 'is_short': False}
+        def title(word: str) -> str:
+            return word[:1].upper() + word[1:].lower() if word else word
+        return f'{title(parts[0])} {title(parts[1])} {title(parts[2])}', {'surname': parts[0].lower(), 'initials': initials.lower(), 'is_short': False}
     return cleaned, {'surname': (parts[0].lower() if parts else cleaned.lower()), 'initials': '', 'is_short': False}
 
 
@@ -394,8 +396,16 @@ def _mention_payload(entity: dict, mention: dict) -> dict:
 def build_entities_from_resolved(document_id: str, resolved: list[dict], mode: str = 'NORMATIVE') -> tuple[list[dict], list[dict], list[dict]]:
     entities=[]
     by_key={}
-    placeholder_counters=defaultdict(int)
-    for e in resolved:
+    person_full_keys_by_signature: dict[tuple[str, str], list[str]] = defaultdict(list)
+    person_key_first_pos: dict[str, int] = {}
+
+    redacted = [e for e in resolved if e.get('redaction_decision') == 'REDACT']
+    person_full = [e for e in redacted if e.get('entity_class') == 'PERSON' and not (e.get('signature') or {}).get('is_short')]
+    person_short = [e for e in redacted if e.get('entity_class') == 'PERSON' and (e.get('signature') or {}).get('is_short')]
+    others = [e for e in redacted if e.get('entity_class') != 'PERSON']
+
+    ordered = person_full + person_short + others
+    for e in ordered:
         if e.get('redaction_decision')!='REDACT':
             continue
         cls=e.get('entity_class','OTHER')
@@ -405,25 +415,25 @@ def build_entities_from_resolved(document_id: str, resolved: list[dict], mode: s
         mention_format='FULL'
         if cls=='PERSON' and sig.get('is_short'):
             mention_format='INITIALS'
-            full_candidates=[x for x in entities if x['entity_class']=='PERSON' and not x.get('is_short_person') and (x.get('signature') or {}).get('surname')==sig.get('surname') and (x.get('signature') or {}).get('initials')==sig.get('initials')]
+            signature_key = (sig.get('surname') or '', sig.get('initials') or '')
+            full_candidates = person_full_keys_by_signature.get(signature_key, [])
             if len(full_candidates)==1:
-                key=full_candidates[0]['entity_id']
+                key=full_candidates[0]
             elif len(full_candidates)>1:
                 key=f"{cls}::short-amb::{norm.lower()}::{e.get('start')}"
                 e['requires_review']=True
                 e['redaction_reason']='Сокращённое ФИО соответствует нескольким найденным лицам'
+                e['merge_candidates'] = full_candidates
             else:
                 key=f"{cls}::short-alone::{norm.lower()}::{e.get('start')}"
-                e['requires_review']=True
-                e['redaction_reason']='Для сокращённого ФИО не найдена однозначная полная форма'
+                e['requires_review']=False
+                e['redaction_reason']=None
         ent=by_key.get(key)
         if not ent:
-            prefix='ФИО' if cls=='PERSON' else make_placeholder(cls,0)[:-1]
-            placeholder_counters[prefix]+=1
             ent={
                 'entity_id': str(uuid.uuid4()),
                 'document_id': document_id,
-                'placeholder': f"{prefix}{placeholder_counters[prefix]}",
+                'placeholder': '',
                 'entity_class': cls,
                 'canonical_value': norm,
                 'normalized_value': norm,
@@ -440,6 +450,10 @@ def build_entities_from_resolved(document_id: str, resolved: list[dict], mode: s
             }
             by_key[key]=ent
             entities.append(ent)
+            if cls == 'PERSON' and not ent.get('is_short_person'):
+                sig_key = ((ent.get('signature') or {}).get('surname') or '', (ent.get('signature') or {}).get('initials') or '')
+                person_full_keys_by_signature[sig_key].append(key)
+            person_key_first_pos[key] = e.get('start') or 0
             audit_log.append({'action':'CREATE_REDACTION_ENTITY','document_id':document_id,'entity_id':ent['entity_id'],'entity_class':cls,'placeholder':ent['placeholder'],'mentions_count':0,'created_at':now_iso()})
         mention={
             'mention_id': str(uuid.uuid4()),
@@ -457,10 +471,21 @@ def build_entities_from_resolved(document_id: str, resolved: list[dict], mode: s
             'review_reason': e.get('redaction_reason') if e.get('requires_review') else None,
         }
         ent['mentions'].append(mention)
+        person_key_first_pos[key] = min(person_key_first_pos.get(key, mention.get('start') or 0), mention.get('start') or 0)
         ent['requires_review']=ent['requires_review'] or mention['requires_review']
         if mention['review_reason']:
             ent['review_reason']=mention['review_reason']
         audit_log.append({'action':'ADD_ENTITY_MENTION','document_id':document_id,'entity_id':ent['entity_id'],'entity_class':cls,'placeholder':ent['placeholder'],'mentions_count':len(ent['mentions']),'created_at':now_iso()})
+    # stable placeholder numbering by first mention position
+    per_class_counter: dict[str, int] = defaultdict(int)
+    for ent in sorted(entities, key=lambda x: min((m.get('start') or 0) for m in x.get('mentions', []) or [0])):
+        cls = ent.get('entity_class', 'OTHER')
+        prefix = 'ФИО' if cls == 'PERSON' else make_placeholder(cls, 0)[:-1]
+        per_class_counter[prefix] += 1
+        ent['placeholder'] = f'{prefix}{per_class_counter[prefix]}'
+        for m in ent.get('mentions', []):
+            m['replacement_value'] = ent['placeholder']
+
     kept=[]
     review=[]
     for ent in entities:

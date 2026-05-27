@@ -268,3 +268,32 @@ def test_different_people_do_not_share_placeholder():
     ]
     mappings, _ = build_mappings_from_resolved(resolve_entities(text, entities))
     assert len({m['placeholder'] for m in mappings}) == 2
+
+
+def test_initials_before_full_name_merge_into_single_entity():
+    from app.main import build_entities_from_resolved, anonymize_text_by_mentions
+    text = 'Макаров А.С. подал заявление. Позднее Макаров Антон Сергеевич поддержал требования.'
+    resolved = resolve_entities(text, [
+        {'type': 'PERSON_FULL_NAME', 'text': 'Макаров А.С.', 'normalized_text': 'Макаров А.С.', 'start': 0, 'end': 11, 'source': 'rule'},
+        {'type': 'PERSON_FULL_NAME', 'text': 'Макаров Антон Сергеевич', 'normalized_text': 'Макаров Антон Сергеевич', 'start': 38, 'end': 61, 'source': 'natasha'},
+    ])
+    entities, _, _ = build_entities_from_resolved('doc-1', resolved)
+    assert len(entities) == 1
+    assert entities[0]['placeholder'] == 'ФИО1'
+    assert len(entities[0]['mentions']) == 2
+    assert anonymize_text_by_mentions(text, entities).count('ФИО1') == 2
+
+
+def test_ambiguous_initials_are_redacted_and_marked_for_review():
+    from app.main import build_entities_from_resolved
+    text = 'Макаров Антон Сергеевич и Макаров Алексей Сидорович присутствовали. Макаров А.С. подписал документ.'
+    resolved = resolve_entities(text, [
+        {'type': 'PERSON_FULL_NAME', 'text': 'Макаров Антон Сергеевич', 'normalized_text': 'Макаров Антон Сергеевич', 'start': 0, 'end': 23},
+        {'type': 'PERSON_FULL_NAME', 'text': 'Макаров Алексей Сидорович', 'normalized_text': 'Макаров Алексей Сидорович', 'start': 26, 'end': 51},
+        {'type': 'PERSON_FULL_NAME', 'text': 'Макаров А.С.', 'normalized_text': 'Макаров А.С.', 'start': 68, 'end': 79, 'source': 'rule'},
+    ])
+    entities, _, review = build_entities_from_resolved('doc-2', resolved)
+    assert len(entities) == 3
+    ambiguous = next(e for e in entities if e['canonical_value'] == 'Макаров А.С.')
+    assert ambiguous['requires_review'] is True
+    assert len(review) == 1
