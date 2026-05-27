@@ -17,3 +17,24 @@ def test_extract_court_entities_have_offsets_confidence_and_source():
     assert all(isinstance(entity['start'], int) and isinstance(entity['end'], int) for entity in entities)
     assert all('confidence' in entity and entity['confidence'] > 0 for entity in entities)
     assert all(entity['source'] in {'natasha', 'regex', 'rule'} for entity in entities)
+
+
+def test_person_normalization_cases_and_initials_signature():
+    from app.main import RussianPersonNormalizer
+
+    n = RussianPersonNormalizer()
+    full_cases = [
+        'Макарова Антона Сергеевича',
+        'Макаровым Антоном Сергеевичем',
+        'макаровым антоном сергеевичем',
+    ]
+    for case in full_cases:
+        normalized, meta = n.normalize(case)
+        assert normalized is not None
+        assert 'Антон' in normalized or 'антон' in normalized.lower()
+        assert meta['format'] == 'FULL'
+
+    normalized_short, meta_short = n.normalize('Макаров А.С.')
+    assert normalized_short
+    assert meta_short['format'] == 'INITIALS'
+    assert meta_short['initials'].lower() == 'ас'

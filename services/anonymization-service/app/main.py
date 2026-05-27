@@ -559,45 +559,51 @@ def anonymize_content_by_mentions(content: dict | None, entities: list[dict]) ->
     idx = 0
     offset = 0
 
-    def walk(node):
+    def split_text_node(node: dict) -> list[dict]:
         nonlocal idx, offset
-        if isinstance(node, dict):
-            if isinstance(node.get('content'), list):
-                for ch in node['content']:
+        text = node.get('text') or ''
+        marks = node.get('marks', [])
+        start_local = offset
+        end_local = start_local + len(text)
+        out: list[dict] = []
+        cursor = 0
+        while idx < len(mentions):
+            ms, me, entity_id, mention_id, placeholder = mentions[idx]
+            if ms >= end_local:
+                break
+            if me <= start_local:
+                idx += 1
+                continue
+            if ms < start_local or me > end_local:
+                break
+            rel_s, rel_e = ms - start_local, me - start_local
+            if rel_s > cursor:
+                out.append({'type': 'text', 'text': text[cursor:rel_s], 'marks': copy.deepcopy(marks)})
+            out.append({
+                'type': 'text',
+                'text': placeholder,
+                'marks': copy.deepcopy(marks) + [{'type': 'redactionMention', 'attrs': {'entityId': entity_id, 'mentionId': mention_id, 'placeholder': placeholder}}],
+            })
+            cursor = rel_e
+            idx += 1
+        if cursor == 0:
+            offset = end_local
+            return [node]
+        if cursor < len(text):
+            out.append({'type': 'text', 'text': text[cursor:], 'marks': copy.deepcopy(marks)})
+        offset = end_local
+        return out
+
+    def walk(node):
+        if isinstance(node, dict) and isinstance(node.get('content'), list):
+            new_content = []
+            for ch in node['content']:
+                if isinstance(ch, dict) and ch.get('type') == 'text' and isinstance(ch.get('text'), str):
+                    new_content.extend(split_text_node(ch))
+                else:
                     walk(ch)
-            elif isinstance(node.get('text'), str):
-                text = node['text']
-                start_local = offset
-                end_local = start_local + len(text)
-                out = []
-                cursor = 0
-                while idx < len(mentions):
-                    ms, me, entity_id, mention_id, placeholder = mentions[idx]
-                    if ms >= end_local:
-                        break
-                    if me <= start_local:
-                        idx += 1
-                        continue
-                    if ms < start_local or me > end_local:
-                        break
-                    rel_s, rel_e = ms - start_local, me - start_local
-                    if rel_s > cursor:
-                        out.append({'type': 'text', 'text': text[cursor:rel_s]})
-                    out.append({
-                        'type': 'text',
-                        'text': placeholder,
-                        'marks': [{'type': 'redactionMention', 'attrs': {'entityId': entity_id, 'mentionId': mention_id, 'placeholder': placeholder}}],
-                    })
-                    cursor = rel_e
-                    idx += 1
-                if cursor == 0:
-                    offset = end_local
-                    return
-                if cursor < len(text):
-                    out.append({'type': 'text', 'text': text[cursor:]})
-                node.clear()
-                node.update({'type': 'fragment', 'content': out})
-                offset = end_local
+                    new_content.append(ch)
+            node['content'] = new_content
         elif isinstance(node, list):
             for ch in node:
                 walk(ch)

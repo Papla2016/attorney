@@ -10,6 +10,7 @@ import Placeholder from '@tiptap/extension-placeholder';
 import HorizontalRule from '@tiptap/extension-horizontal-rule';
 import { useEffect, useRef } from 'react';
 import { Extension } from '@tiptap/core';
+import { Mark } from '@tiptap/core';
 import { Decoration, DecorationSet } from '@tiptap/pm/view';
 import { Plugin, PluginKey } from '@tiptap/pm/state';
 import type { PendingMarker, ReviewMarker } from '../../api/types';
@@ -74,13 +75,25 @@ const ReviewHighlight = Extension.create<any>({
   },
 });
 
+const RedactionMentionMark = Mark.create({
+  name: 'redactionMention',
+  inclusive: false,
+  addAttributes() {
+    return { entityId: { default: null }, mentionId: { default: null }, placeholder: { default: null } };
+  },
+  parseHTML() { return [{ tag: 'span[data-redaction-mention]' }]; },
+  renderHTML({ HTMLAttributes }) {
+    return ['span', { ...HTMLAttributes, 'data-redaction-mention': '1' }, 0];
+  },
+});
+
 type Props = { value?: any; contentRevision?: number | string; onChange?: (payload: { json: any; text: string }) => void; placeholder?: string; editable?: boolean; onSelectionChange?: (text: string) => void; showToolbar?: boolean; reviewMarkers?: ReviewMarker[]; pendingMarkers?: PendingMarker[]; redactionMarkers?: RedactionMarker[]; showSensitiveTooltips?: boolean; onReviewMarkerClick?: (clusterId: string, placeholder: string) => void; onPendingMarkerClick?: (entityKey: string, surfaceValue: string) => void; onRedactionMarkerClick?: (entityId: string) => void; };
 
 export default function RichDocumentEditor({ value, contentRevision, onChange, placeholder, editable = true, onSelectionChange, showToolbar = true, reviewMarkers = [], pendingMarkers = [], redactionMarkers = [], showSensitiveTooltips = false, onReviewMarkerClick, onPendingMarkerClick, onRedactionMarkerClick }: Props) {
   const lastAppliedRevision = useRef<number | string | undefined>(undefined);
   const editor = useEditor({
     editable, shouldRerenderOnTransaction: false,
-    extensions: [StarterKit.configure({ bulletList: { keepMarks: true }, orderedList: { keepMarks: true } }), Underline, HorizontalRule, TextAlign.configure({ types: ['heading', 'paragraph'] }), Table.configure({ resizable: true }), TableRow, TableHeader, TableCell, Placeholder.configure({ placeholder: placeholder || 'Введите текст документа...' }), ReviewHighlight.configure({ onReviewClick: onReviewMarkerClick, onPendingClick: onPendingMarkerClick, onRedactionClick: onRedactionMarkerClick, showSensitiveTooltips })],
+    extensions: [StarterKit.configure({ bulletList: { keepMarks: true }, orderedList: { keepMarks: true } }), Underline, HorizontalRule, TextAlign.configure({ types: ['heading', 'paragraph'] }), Table.configure({ resizable: true }), TableRow, TableHeader, TableCell, Placeholder.configure({ placeholder: placeholder || 'Введите текст документа...' }), RedactionMentionMark, ReviewHighlight.configure({ onReviewClick: onReviewMarkerClick, onPendingClick: onPendingMarkerClick, onRedactionClick: onRedactionMarkerClick, showSensitiveTooltips })],
     content: value || '<p></p>', onUpdate: ({ editor: ed }) => onChange?.({ json: ed.getJSON(), text: ed.getText() }), onSelectionUpdate: ({ editor: ed }) => onSelectionChange?.(ed.state.doc.textBetween(ed.state.selection.from, ed.state.selection.to, ' ').trim()),
   });
 
