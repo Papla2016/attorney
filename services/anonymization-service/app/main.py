@@ -371,6 +371,114 @@ def build_mappings_from_resolved(resolved: list[dict]) -> tuple[list[dict], list
 
 
 
+
+
+def _mention_payload(entity: dict, mention: dict) -> dict:
+    return {
+        'mention_id': mention['mention_id'],
+        'entity_id': entity['entity_id'],
+        'surface_value': mention['surface_value'],
+        'normalized_value': mention.get('normalized_value'),
+        'start': mention.get('start'),
+        'end': mention.get('end'),
+        'format': mention.get('format', 'FULL'),
+        'grammatical_case': mention.get('grammatical_case', 'UNKNOWN'),
+        'word_order': mention.get('word_order', 'UNKNOWN'),
+        'replacement_value': mention.get('replacement_value', entity['placeholder']),
+        'source': mention.get('source', entity.get('source', 'natasha')),
+        'requires_review': mention.get('requires_review', False),
+        'review_reason': mention.get('review_reason'),
+    }
+
+
+def build_entities_from_resolved(document_id: str, resolved: list[dict], mode: str = 'NORMATIVE') -> tuple[list[dict], list[dict], list[dict]]:
+    entities=[]
+    by_key={}
+    placeholder_counters=defaultdict(int)
+    for e in resolved:
+        if e.get('redaction_decision')!='REDACT':
+            continue
+        cls=e.get('entity_class','OTHER')
+        norm=e.get('normalized_value') or e.get('surface_value')
+        key=f"{cls}::{norm.lower()}"
+        sig=e.get('signature') or {}
+        mention_format='FULL'
+        if cls=='PERSON' and sig.get('is_short'):
+            mention_format='INITIALS'
+            full_candidates=[x for x in entities if x['entity_class']=='PERSON' and not x.get('is_short_person') and (x.get('signature') or {}).get('surname')==sig.get('surname') and (x.get('signature') or {}).get('initials')==sig.get('initials')]
+            if len(full_candidates)==1:
+                key=full_candidates[0]['entity_id']
+            elif len(full_candidates)>1:
+                key=f"{cls}::short-amb::{norm.lower()}::{e.get('start')}"
+                e['requires_review']=True
+                e['redaction_reason']='Сокращённое ФИО соответствует нескольким найденным лицам'
+            else:
+                key=f"{cls}::short-alone::{norm.lower()}::{e.get('start')}"
+                e['requires_review']=True
+                e['redaction_reason']='Для сокращённого ФИО не найдена однозначная полная форма'
+        ent=by_key.get(key)
+        if not ent:
+            prefix='ФИО' if cls=='PERSON' else make_placeholder(cls,0)[:-1]
+            placeholder_counters[prefix]+=1
+            ent={
+                'entity_id': str(uuid.uuid4()),
+                'document_id': document_id,
+                'placeholder': f"{prefix}{placeholder_counters[prefix]}",
+                'entity_class': cls,
+                'canonical_value': norm,
+                'normalized_value': norm,
+                'person_role': e.get('person_role'),
+                'redaction_decision': 'REDACT',
+                'requires_review': e.get('requires_review', False),
+                'review_reason': e.get('redaction_reason') if e.get('requires_review') else None,
+                'source': e.get('source','natasha'),
+                'created_at': now_iso(),
+                'updated_at': now_iso(),
+                'mentions': [],
+                'signature': e.get('signature'),
+                'is_short_person': bool(sig.get('is_short')),
+            }
+            by_key[key]=ent
+            entities.append(ent)
+            audit_log.append({'action':'CREATE_REDACTION_ENTITY','document_id':document_id,'entity_id':ent['entity_id'],'entity_class':cls,'placeholder':ent['placeholder'],'mentions_count':0,'created_at':now_iso()})
+        mention={
+            'mention_id': str(uuid.uuid4()),
+            'entity_id': ent['entity_id'],
+            'surface_value': e.get('surface_value'),
+            'normalized_value': e.get('normalized_value'),
+            'start': e.get('start'),
+            'end': e.get('end'),
+            'format': mention_format,
+            'grammatical_case': 'UNKNOWN',
+            'word_order': 'UNKNOWN',
+            'replacement_value': ent['placeholder'],
+            'source': e.get('source','natasha'),
+            'requires_review': e.get('requires_review',False),
+            'review_reason': e.get('redaction_reason') if e.get('requires_review') else None,
+        }
+        ent['mentions'].append(mention)
+        ent['requires_review']=ent['requires_review'] or mention['requires_review']
+        if mention['review_reason']:
+            ent['review_reason']=mention['review_reason']
+        audit_log.append({'action':'ADD_ENTITY_MENTION','document_id':document_id,'entity_id':ent['entity_id'],'entity_class':cls,'placeholder':ent['placeholder'],'mentions_count':len(ent['mentions']),'created_at':now_iso()})
+    kept=[]
+    review=[]
+    for ent in entities:
+        if ent['requires_review']:
+            review.append(ent)
+    return entities, kept, review
+
+
+def anonymize_text_by_mentions(text: str, entities: list[dict]) -> str:
+    mentions=[]
+    for ent in entities:
+        if ent.get('redaction_decision')!='REDACT':
+            continue
+        mentions.extend(ent.get('mentions',[]))
+    out=text
+    for m in sorted([x for x in mentions if isinstance(x.get('start'), int) and isinstance(x.get('end'), int)], key=lambda x: x['start'], reverse=True):
+        out=out[:m['start']] + (m.get('replacement_value') or '') + out[m['end']:]
+    return out
 def apply_manual_decisions(document_id: str, resolved: list[dict]) -> list[dict]:
     decisions = manual_decisions_by_document_id.get(document_id, {})
     for e in resolved:
@@ -453,6 +561,7 @@ def anonymization_result_response(document: dict) -> dict:
         'anonymized_text': document.get('anonymized_text', ''),
         'anonymized_content': document.get('anonymized_content'),
         'content_format': document.get('content_format', 'PLAIN_TEXT'),
+        'entities': document.get('entities', []),
         'mappings': document.get('mappings', []),
         'recognized_but_kept': document.get('recognized_but_kept', []),
         'review_entities': document.get('review_entities', []),
@@ -485,13 +594,13 @@ async def process(body: ProcessRequest, x_internal_service_token: str | None = H
     entities = await extract_entities(body.text)
 
     resolved = resolve_entities(body.text, entities, body.publication_redaction_mode)
-    mappings, recognized_but_kept, review_entities = build_mappings_from_resolved(resolved)
-    manual_mappings_by_document_id.setdefault(body.document_id, [])
-    mappings = merge_mappings(manual_mappings_by_document_id[body.document_id], mappings)
-    anonymized = replace_by_mappings(body.text, mappings)
+    entities, recognized_but_kept, review_entities = build_entities_from_resolved(body.document_id, resolved, body.publication_redaction_mode)
+    mappings=[ensure_mapping_metadata({'id':e['entity_id'],'placeholder':e['placeholder'],'original_value':e['canonical_value'],'normalized_value':e['normalized_value'],'entity_class':e['entity_class'],'entity_type':e['entity_class'],'aliases':[m['surface_value'] for m in e.get('mentions',[]) if m['surface_value']!=e['canonical_value']]}) for e in entities]
+    anonymized = anonymize_text_by_mentions(body.text, entities)
 
     save_document(body.document_id, body.case_id, body.title, body.text, anonymized, mappings, body.metadata, recognized_but_kept)
     jobs[job_id]['status'] = 'COMPLETED'
+    restored_docs[body.document_id]['entities']=entities
     restored_docs[body.document_id]['review_entities']=review_entities
     restored_docs[body.document_id]['publication_redaction_mode']=body.publication_redaction_mode
     restored_docs[body.document_id]['content_format']=body.content_format
@@ -724,17 +833,16 @@ async def draft_scan(document_id: str, body: DraftScanRequest, x_internal_servic
     pending = []
     decisions = manual_decisions_by_document_id.get(document_id, {})
     mappings = restored_docs[document_id].get('mappings', [])
+    placeholder_patterns = [r'ФИО\d+', r'ПАСПОРТ\d+', r'ИНН\d+', r'АДРЕС\d+', r'ДАТА\d+', r'ТЕЛЕФОН\d+', r'СНИЛС\d+', r'ЭЛЕКТРОННАЯ_ПОЧТА\d+']
     for e in resolve_entities(body.text, entities, 'NORMATIVE'):
-        if e.get('entity_class') != 'PERSON':
-            continue
         surface = e.get('surface_value', '')
-        if re.fullmatch(r'ФИО\d+', surface):
+        if any(re.fullmatch(pat, surface) for pat in placeholder_patterns):
             continue
-        key = f"PERSON::{normalize_spaces(surface)}"
+        key = f"{e.get('entity_class','OTHER')}::{normalize_spaces(surface)}"
         if decisions.get(key, {}).get('decision') == 'FORCE_KEEP':
             continue
-        merge_candidates = [{'cluster_id': m.get('cluster_id'), 'placeholder': m.get('placeholder'), 'normalized_value': m.get('normalized_value')} for m in mappings if m.get('entity_class') == 'PERSON' and m.get('cluster_id')]
-        pending.append({'entity_key': key, 'surface_value': surface, 'normalized_value': e.get('normalized_value', surface), 'entity_class': 'PERSON', 'person_role': e.get('person_role', 'UNKNOWN'), 'start': e.get('start', 0), 'end': e.get('end', 0), 'reason': 'В изменённом тексте найдено возможное ФИО, ещё не включённое в таблицу соответствия', 'suggested_action': 'REDACT', 'merge_candidates': merge_candidates})
+        merge_candidates = [{'cluster_id': m.get('cluster_id'), 'placeholder': m.get('placeholder'), 'normalized_value': m.get('normalized_value')} for m in mappings if m.get('entity_class') == e.get('entity_class') and m.get('cluster_id')]
+        pending.append({'entity_key': key, 'surface_value': surface, 'normalized_value': e.get('normalized_value', surface), 'entity_class': e.get('entity_class', 'OTHER'), 'person_role': e.get('person_role', 'UNKNOWN'), 'start': e.get('start', 0), 'end': e.get('end', 0), 'reason': 'В изменённом тексте найдено новое значение, требующее проверки', 'suggested_action': 'REDACT', 'merge_candidates': merge_candidates})
     pending_review_by_document_id[document_id] = pending
     restored_docs[document_id]['pending_review'] = pending
     restored_docs[document_id]['pending_markers'] = [{'entity_key': p['entity_key'], 'surface_value': p['surface_value'], 'start': p['start'], 'end': p['end'], 'reason': p['reason']} for p in pending]

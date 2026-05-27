@@ -22,6 +22,7 @@ export interface AnonymizationResult {
   anonymized_text?: string;
   anonymized_content?: unknown;
   content_format?: 'TIPTAP_JSON' | 'PLAIN_TEXT';
+  entities?: RedactionEntity[];
   mappings?: EntityMapping[];
   recognized_but_kept?: EntityMapping[];
   review_entities?: EntityMapping[];
@@ -51,3 +52,7 @@ export type PendingReviewEntity = {
 export type PendingMarker = { entity_key: string; surface_value: string; start?: number; end?: number; reason: string; };
 
 export type ReviewMarker = { entity_key?: string; cluster_id?: string; placeholder?: string; display_text?: string; reason: string; occurrences_count?: number; };
+
+
+export interface RedactionMention { mention_id: string; entity_id: string; surface_value: string; start?: number; end?: number; format?: string; replacement_value?: string; requires_review?: boolean; review_reason?: string; }
+export interface RedactionEntity { entity_id: string; placeholder: string; entity_class: string; canonical_value: string; normalized_value?: string; person_role?: string; redaction_decision: 'REDACT' | 'KEEP' | 'REVIEW'; requires_review?: boolean; review_reason?: string | null; mentions_count?: number; mentions: RedactionMention[]; }
