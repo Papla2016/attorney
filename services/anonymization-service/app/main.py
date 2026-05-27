@@ -167,25 +167,27 @@ def normalize_person_name(value: str) -> tuple[str, dict]:
 
 
 def detect_person_role(text: str, start: int, end: int) -> str:
-    window = text[max(0, start - 80):min(len(text), end + 80)].lower()
     prefix = text[max(0, start - 120):start].lower()
-    if re.search(r'председательствующ\w*\s+суд\w*', window) or re.search(r'\bсудья\b', window):
-        return 'JUDGE'
-    if re.search(r'при\s+секретар\w*', window):
-        return 'COURT_SECRETARY'
-    if re.search(r'\bсвидетел\w*\b', window):
-        return 'WITNESS'
-    if re.search(r'\bист(ец|цом|ца)\b', window) or re.search(r'(по\s+иску)\s*$', prefix):
-        return 'PLAINTIFF'
-    if re.search(r'\bответчик\w*\b', window):
-        return 'DEFENDANT'
-    if re.search(r'\bпредставител\w*\b', window):
-        return 'REPRESENTATIVE'
-    if re.search(r'\bзаявител\w*\b', window):
-        return 'APPLICANT'
-    if re.search(r'\bпотерпевш\w*\b', window):
-        return 'VICTIM'
-    if re.search(r'индивидуальным\s+предпринимателем\s*$', prefix):
+    parts = re.split(r'[,.;\n]', prefix)
+    local = parts[-1].strip() if parts else prefix.strip()
+    role_patterns = [
+        ('JUDGE', r'председательствующ\w*\s+суд\w*|\bсудья\b'),
+        ('COURT_SECRETARY', r'при\s+секретар\w*'),
+        ('WITNESS', r'\bсвидетел\w*\b'),
+        ('PLAINTIFF', r'\bист(ец|цом|ца)\b|по\s+иску'),
+        ('DEFENDANT', r'\bответчик\w*\b'),
+        ('REPRESENTATIVE', r'\bпредставител\w*\b'),
+        ('APPLICANT', r'\bзаявител\w*\b'),
+        ('VICTIM', r'\bпотерпевш\w*\b'),
+    ]
+    best = ('UNKNOWN', -1)
+    for role, pattern in role_patterns:
+        for m in re.finditer(pattern, local):
+            if m.end() > best[1]:
+                best = (role, m.end())
+    if best[0] != 'UNKNOWN':
+        return best[0]
+    if re.search(r'индивидуальным\s+предпринимателем\s*$', local):
         return 'INDIVIDUAL_ENTREPRENEUR'
     return 'UNKNOWN'
 
@@ -270,7 +272,8 @@ def resolve_entities(text: str, entities: list[dict], mode: str = 'NORMATIVE') -
                 item['surface_value'] = m.group(0)
         elif source_type in {'BIRTH_DATE', 'DATE'}:
             item['entity_class'] = 'DATE'
-            ctx = text[max(0, item['start'] - 40): item['end'] + 10].lower()
+            full_prefix = text[:item['start']].lower()
+            ctx = re.split(r'[.;\n,]', full_prefix)[-1][-60:]
             if re.search(r'дата рождения|родил[а-я]+|года рождения', ctx):
                 item['context_kind'] = 'BIRTH_DATE'
             elif re.search(r'решение от|постановление от|договор от|акт от|определение от|судебн\w+\s+заседан|дата договора|дата решения', ctx):
