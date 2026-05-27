@@ -297,3 +297,16 @@ def test_ambiguous_initials_are_redacted_and_marked_for_review():
     ambiguous = next(e for e in entities if e['canonical_value'] == 'Макаров А.С.')
     assert ambiguous['requires_review'] is True
     assert len(review) == 1
+
+
+def test_exact_restoration_text_roundtrip():
+    from app.main import build_entities_from_resolved, anonymize_text_by_mentions
+    text = 'Макарова Антона Сергеевича вызвали. Макаровым Антоном Сергеевичем представлены документы. Макаров А.С. пояснил.'
+    resolved = resolve_entities(text, [
+        {'type': 'PERSON_FULL_NAME', 'text': 'Макарова Антона Сергеевича', 'normalized_text': 'Макаров Антон Сергеевич', 'start': 0, 'end': 26},
+        {'type': 'PERSON_FULL_NAME', 'text': 'Макаровым Антоном Сергеевичем', 'normalized_text': 'Макаров Антон Сергеевич', 'start': 35, 'end': 63},
+        {'type': 'PERSON_FULL_NAME', 'text': 'Макаров А.С.', 'normalized_text': 'Макаров А.С.', 'start': 89, 'end': 100},
+    ])
+    entities, _, _ = build_entities_from_resolved('doc-3', resolved)
+    anonymized = anonymize_text_by_mentions(text, entities)
+    assert anonymized.count('ФИО1') == 3

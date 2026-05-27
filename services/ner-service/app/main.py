@@ -46,6 +46,13 @@ def map_natasha_type(span_type: str) -> str:
 class RussianPersonNormalizer:
     def __init__(self, morph_vocab=None):
         self.morph_vocab = morph_vocab
+        self.names_extractor = None
+        if morph_vocab is not None:
+            try:
+                from natasha import NamesExtractor
+                self.names_extractor = NamesExtractor(morph_vocab)
+            except Exception:
+                self.names_extractor = None
         self.initials_patterns = [
             re.compile(r'^([А-ЯЁ][а-яё]+)\s+([А-ЯЁ])\.\s*([А-ЯЁ])\.$'),
             re.compile(r'^([А-ЯЁ])\.\s*([А-ЯЁ])\.\s*([А-ЯЁ][а-яё]+)$'),
@@ -67,12 +74,24 @@ class RussianPersonNormalizer:
         parts = value.split()
         if len(parts) >= 3:
             s, n, p = parts[:3]
-            sn = self._normalize_word(s)
-            nn = self._normalize_word(n)
-            pn = self._normalize_word(p)
+            sn, nn, pn = self._normalize_full_name_parts(value, s, n, p)
             meta.update({'surname_normalized': sn, 'initials': f'{nn[0]}{pn[0]}', 'word_order': 'SURNAME_NAME_PATRONYMIC'})
             return f'{sn} {nn} {pn}', meta
         return None, meta
+
+    def _normalize_full_name_parts(self, text: str, s: str, n: str, p: str) -> tuple[str, str, str]:
+        if self.names_extractor is not None:
+            try:
+                matches = list(self.names_extractor(text))
+                if matches:
+                    fact = matches[0].fact
+                    sn = (fact.last or s)
+                    nn = (fact.first or n)
+                    pn = (fact.middle or p)
+                    return self._normalize_word(sn), self._normalize_word(nn), self._normalize_word(pn)
+            except Exception:
+                pass
+        return self._normalize_word(s), self._normalize_word(n), self._normalize_word(p)
 
     def _normalize_word(self, word: str) -> str:
         if not word:
@@ -154,7 +173,11 @@ class RegexRuleNerProvider(BaseNerProvider):
         fio_full = r'[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+'
         fio_initials = r'[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\.'
         fio = rf'(?:{fio_full}|{fio_initials})'
-        self.person_normalizer = RussianPersonNormalizer()
+        try:
+            from natasha import MorphVocab
+            self.person_normalizer = RussianPersonNormalizer(MorphVocab())
+        except Exception:
+            self.person_normalizer = RussianPersonNormalizer()
         self.patterns = [
             ('EMAIL', re.compile(r'(?<![\w.-])[\w.+-]+@[\w.-]+\.[A-Za-zА-Яа-яЁё]{2,}\b'), 0.95, 'regex'),
             ('PHONE', re.compile(r'(?<!\d)(?:\+7|8)[\s\-()]?\d{3}[\s\-()]?\d{3}[\s\-()]?\d{2}[\s\-()]?\d{2}(?!\d)'), 0.93, 'regex'),

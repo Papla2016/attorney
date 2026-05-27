@@ -74,6 +74,17 @@ class DraftScanRequest(BaseModel):
     document_revision: int = 0
 
 
+class EntityPatchRequest(BaseModel):
+    canonical_value: str | None = None
+    person_role: str | None = None
+    context_label: str | None = None
+
+
+class EntityMergeRequest(BaseModel):
+    target_entity_id: str
+    source_entity_ids: list[str]
+
+
 def error_payload(code: str, message: str, details: dict | None = None):
     return {'error': {'code': code, 'message': message, 'details': details or {}}}
 
@@ -470,11 +481,15 @@ def build_entities_from_resolved(document_id: str, resolved: list[dict], mode: s
             'requires_review': e.get('requires_review',False),
             'review_reason': e.get('redaction_reason') if e.get('requires_review') else None,
         }
+        if e.get('merge_candidates'):
+            mention['merge_candidates'] = e.get('merge_candidates')
         ent['mentions'].append(mention)
         person_key_first_pos[key] = min(person_key_first_pos.get(key, mention.get('start') or 0), mention.get('start') or 0)
         ent['requires_review']=ent['requires_review'] or mention['requires_review']
         if mention['review_reason']:
             ent['review_reason']=mention['review_reason']
+        if mention.get('merge_candidates'):
+            ent['merge_candidates'] = mention['merge_candidates']
         audit_log.append({'action':'ADD_ENTITY_MENTION','document_id':document_id,'entity_id':ent['entity_id'],'entity_class':cls,'placeholder':ent['placeholder'],'mentions_count':len(ent['mentions']),'created_at':now_iso()})
     # stable placeholder numbering by first mention position
     per_class_counter: dict[str, int] = defaultdict(int)
@@ -487,6 +502,29 @@ def build_entities_from_resolved(document_id: str, resolved: list[dict], mode: s
             m['replacement_value'] = ent['placeholder']
 
     kept=[]
+    for e in resolved:
+        if e.get('redaction_decision') != 'KEEP':
+            continue
+        kept.append({
+            'entity_id': str(uuid.uuid4()),
+            'document_id': document_id,
+            'entity_class': e.get('entity_class', 'OTHER'),
+            'canonical_value': e.get('normalized_value') or e.get('surface_value'),
+            'normalized_value': e.get('normalized_value') or e.get('surface_value'),
+            'person_role': e.get('person_role'),
+            'redaction_decision': 'KEEP',
+            'requires_review': False,
+            'source': e.get('source', 'natasha'),
+            'mentions_count': 1,
+            'mentions': [{
+                'mention_id': str(uuid.uuid4()),
+                'surface_value': e.get('surface_value'),
+                'normalized_value': e.get('normalized_value'),
+                'start': e.get('start'),
+                'end': e.get('end'),
+                'replacement_value': e.get('surface_value'),
+            }]
+        })
     review=[]
     for ent in entities:
         if ent['requires_review']:
@@ -504,6 +542,67 @@ def anonymize_text_by_mentions(text: str, entities: list[dict]) -> str:
     for m in sorted([x for x in mentions if isinstance(x.get('start'), int) and isinstance(x.get('end'), int)], key=lambda x: x['start'], reverse=True):
         out=out[:m['start']] + (m.get('replacement_value') or '') + out[m['end']:]
     return out
+
+
+def anonymize_content_by_mentions(content: dict | None, entities: list[dict]) -> dict | None:
+    if not content:
+        return None
+    data = copy.deepcopy(content)
+    mentions = []
+    for ent in entities:
+        if ent.get('redaction_decision') != 'REDACT':
+            continue
+        for m in ent.get('mentions', []):
+            if isinstance(m.get('start'), int) and isinstance(m.get('end'), int):
+                mentions.append((m['start'], m['end'], ent['entity_id'], m['mention_id'], ent['placeholder']))
+    mentions.sort(key=lambda x: x[0])
+    idx = 0
+    offset = 0
+
+    def walk(node):
+        nonlocal idx, offset
+        if isinstance(node, dict):
+            if isinstance(node.get('content'), list):
+                for ch in node['content']:
+                    walk(ch)
+            elif isinstance(node.get('text'), str):
+                text = node['text']
+                start_local = offset
+                end_local = start_local + len(text)
+                out = []
+                cursor = 0
+                while idx < len(mentions):
+                    ms, me, entity_id, mention_id, placeholder = mentions[idx]
+                    if ms >= end_local:
+                        break
+                    if me <= start_local:
+                        idx += 1
+                        continue
+                    if ms < start_local or me > end_local:
+                        break
+                    rel_s, rel_e = ms - start_local, me - start_local
+                    if rel_s > cursor:
+                        out.append({'type': 'text', 'text': text[cursor:rel_s]})
+                    out.append({
+                        'type': 'text',
+                        'text': placeholder,
+                        'marks': [{'type': 'redactionMention', 'attrs': {'entityId': entity_id, 'mentionId': mention_id, 'placeholder': placeholder}}],
+                    })
+                    cursor = rel_e
+                    idx += 1
+                if cursor == 0:
+                    offset = end_local
+                    return
+                if cursor < len(text):
+                    out.append({'type': 'text', 'text': text[cursor:]})
+                node.clear()
+                node.update({'type': 'fragment', 'content': out})
+                offset = end_local
+        elif isinstance(node, list):
+            for ch in node:
+                walk(ch)
+    walk(data)
+    return data
 def apply_manual_decisions(document_id: str, resolved: list[dict]) -> list[dict]:
     decisions = manual_decisions_by_document_id.get(document_id, {})
     for e in resolved:
@@ -630,7 +729,7 @@ async def process(body: ProcessRequest, x_internal_service_token: str | None = H
     restored_docs[body.document_id]['publication_redaction_mode']=body.publication_redaction_mode
     restored_docs[body.document_id]['content_format']=body.content_format
     restored_docs[body.document_id]['original_content']=body.original_content
-    restored_docs[body.document_id]['anonymized_content'] = replace_content_by_mappings(body.original_content, mappings)
+    restored_docs[body.document_id]['anonymized_content'] = anonymize_content_by_mentions(body.original_content, entities)
     restored_docs[body.document_id]['pending_review'] = []
     restored_docs[body.document_id]['pending_markers'] = []
     return {'job_id': job_id, 'status': 'COMPLETED', 'anonymized_document_id': body.document_id, 'anonymized_text': anonymized, 'anonymized_content': restored_docs[body.document_id].get('anonymized_content'), 'content_format': body.content_format, 'mappings': mappings, 'recognized_but_kept': recognized_but_kept, 'review_entities': review_entities, 'review_markers': [], 'pending_review': [], 'pending_markers': [], 'manual_decisions': list(manual_decisions_by_document_id.get(body.document_id, {}).values()), 'publication_redaction_mode': body.publication_redaction_mode, 'ner_provider': 'hybrid'}
@@ -641,7 +740,19 @@ def public(document_id: str, x_internal_service_token: str | None = Header(None)
     require_internal(x_internal_service_token)
     if document_id not in public_docs:
         _error(404, 'NOT_FOUND', 'Документ не найден')
-    return public_docs[document_id]
+    payload = copy.deepcopy(public_docs[document_id])
+    def strip_marks(node):
+        if isinstance(node, dict):
+            if isinstance(node.get('marks'), list):
+                node['marks'] = [m for m in node['marks'] if m.get('type') != 'redactionMention']
+            if isinstance(node.get('content'), list):
+                for ch in node['content']:
+                    strip_marks(ch)
+        elif isinstance(node, list):
+            for ch in node:
+                strip_marks(ch)
+    strip_marks(payload.get('anonymized_content'))
+    return payload
 
 
 @app.get('/internal/anonymization/documents/{document_id}/restored')
@@ -788,18 +899,20 @@ async def reanonymize(document_id: str, body: ReanonymizeRequest, x_internal_ser
         _error(404, 'NOT_FOUND', 'Документ не найден')
     doc = restored_docs[document_id]
     original_text = doc.get('original_text', '')
-    ensure_document_mappings(document_id)
-    incoming_mappings = [ensure_mapping_metadata(m) for m in (body.mappings or doc.get('mappings', []))]
-    manual = [m for m in incoming_mappings if m.get('source') == 'manual']
-    manual_mappings_by_document_id[document_id] = merge_mappings(manual_mappings_by_document_id.get(document_id, []), manual)
-
     entities = await extract_entities(original_text)
     resolved = resolve_entities(original_text, entities, body.publication_redaction_mode)
-    ner_mappings, recognized_but_kept, review_entities = build_mappings_from_resolved(resolved)
-    base_mappings = merge_mappings(incoming_mappings, ner_mappings)
-    mappings = merge_mappings(manual_mappings_by_document_id[document_id], base_mappings)
-    anonymized = replace_by_mappings(original_text, mappings)
+    entities_view, recognized_but_kept, review_entities = build_entities_from_resolved(document_id, resolved, body.publication_redaction_mode)
+    for d in manual_decisions_by_document_id.get(document_id, {}).values():
+        ent = next((e for e in entities_view if e['entity_id'] == d.get('entity_id') or e.get('canonical_value') == d.get('canonical_value')), None)
+        if ent and d.get('decision') == 'FORCE_KEEP':
+            ent['redaction_decision'] = 'KEEP'
+        if ent and d.get('decision') == 'FORCE_REDACT':
+            ent['redaction_decision'] = 'REDACT'
+    mappings=[ensure_mapping_metadata({'id':e['entity_id'],'placeholder':e['placeholder'],'original_value':e['canonical_value'],'normalized_value':e['normalized_value'],'entity_class':e['entity_class'],'entity_type':e['entity_class'],'aliases':[m['surface_value'] for m in e.get('mentions',[]) if m['surface_value']!=e['canonical_value']]}) for e in entities_view]
+    anonymized = anonymize_text_by_mentions(original_text, entities_view)
     save_document(document_id, doc.get('case_id', ''), doc.get('title', ''), original_text, anonymized, mappings, public_docs.get(document_id, {}).get('metadata', {}), recognized_but_kept)
+    restored_docs[document_id]['entities'] = entities_view
+    restored_docs[document_id]['anonymized_content'] = anonymize_content_by_mentions(doc.get('original_content'), entities_view)
     restored_docs[document_id]['review_entities']=review_entities
     restored_docs[document_id]['publication_redaction_mode']=body.publication_redaction_mode
     return anonymization_result_response(restored_docs[document_id])
@@ -890,3 +1003,66 @@ def job(job_id: str, x_internal_service_token: str | None = Header(None)):
     if job_id not in jobs:
         _error(404, 'NOT_FOUND', 'Задание не найдено')
     return jobs[job_id]
+
+
+@app.patch('/internal/anonymization/documents/{document_id}/entities/{entity_id}')
+def patch_entity(document_id: str, entity_id: str, body: EntityPatchRequest, x_internal_service_token: str | None = Header(None)):
+    require_internal(x_internal_service_token)
+    doc = restored_docs.get(document_id)
+    if not doc:
+        _error(404, 'NOT_FOUND', 'Документ не найден')
+    ent = next((e for e in doc.get('entities', []) if e.get('entity_id') == entity_id), None)
+    if not ent:
+        _error(404, 'NOT_FOUND', 'Сущность не найдена')
+    for k, v in body.model_dump(exclude_unset=True).items():
+        ent[k] = v
+    return anonymization_result_response(doc)
+
+
+@app.post('/internal/anonymization/documents/{document_id}/entities/merge')
+def merge_entities(document_id: str, body: EntityMergeRequest, x_internal_service_token: str | None = Header(None)):
+    require_internal(x_internal_service_token)
+    doc = restored_docs.get(document_id)
+    if not doc:
+        _error(404, 'NOT_FOUND', 'Документ не найден')
+    entities = doc.get('entities', [])
+    target = next((e for e in entities if e.get('entity_id') == body.target_entity_id), None)
+    if not target:
+        _error(404, 'NOT_FOUND', 'Целевая сущность не найдена')
+    for sid in body.source_entity_ids:
+        src = next((e for e in entities if e.get('entity_id') == sid), None)
+        if not src:
+            continue
+        for m in src.get('mentions', []):
+            m['entity_id'] = target['entity_id']
+            m['replacement_value'] = target['placeholder']
+            target.setdefault('mentions', []).append(m)
+        entities.remove(src)
+    doc['anonymized_text'] = anonymize_text_by_mentions(doc.get('original_text', ''), entities)
+    doc['anonymized_content'] = anonymize_content_by_mentions(doc.get('original_content'), entities)
+    return anonymization_result_response(doc)
+
+
+@app.post('/internal/anonymization/documents/{document_id}/entities/{entity_id}/mentions/{mention_id}/split')
+def split_mention(document_id: str, entity_id: str, mention_id: str, x_internal_service_token: str | None = Header(None)):
+    require_internal(x_internal_service_token)
+    doc = restored_docs.get(document_id)
+    if not doc:
+        _error(404, 'NOT_FOUND', 'Документ не найден')
+    src = next((e for e in doc.get('entities', []) if e.get('entity_id') == entity_id), None)
+    if not src:
+        _error(404, 'NOT_FOUND', 'Сущность не найдена')
+    mention = next((m for m in src.get('mentions', []) if m.get('mention_id') == mention_id), None)
+    if not mention:
+        _error(404, 'NOT_FOUND', 'Упоминание не найдено')
+    src['mentions'] = [m for m in src.get('mentions', []) if m.get('mention_id') != mention_id]
+    new_ent = copy.deepcopy(src)
+    new_ent['entity_id'] = str(uuid.uuid4())
+    new_ent['placeholder'] = next_placeholder('PERSON', [{'placeholder': e.get('placeholder')} for e in doc.get('entities', [])])
+    mention['entity_id'] = new_ent['entity_id']
+    mention['replacement_value'] = new_ent['placeholder']
+    new_ent['mentions'] = [mention]
+    doc['entities'].append(new_ent)
+    doc['anonymized_text'] = anonymize_text_by_mentions(doc.get('original_text', ''), doc.get('entities', []))
+    doc['anonymized_content'] = anonymize_content_by_mentions(doc.get('original_content'), doc.get('entities', []))
+    return anonymization_result_response(doc)
