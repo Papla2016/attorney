@@ -422,6 +422,7 @@ apply_doc_sync = sync_doc_from_anonymization
 def anonymization_result_response(document: dict, case: dict | None = None) -> dict:
     return {
         'document_id': document['id'],
+        'status': document.get('status'),
         'case_id': document.get('case_id') or (case.get('id') if case else None),
         'title': document.get('title'),
         'anonymized_text': document.get('anonymized_text', ''),
@@ -458,6 +459,7 @@ def _strip_redaction_marks(content: dict | None) -> dict | None:
             for ch in node:
                 walk(ch)
     walk(data)
+    return data
     return data
 
 
@@ -1094,7 +1096,11 @@ def publish_document(document_id: str, authorization: str | None = Header(None))
     review_mention_count = sum(len(x.get('mentions', [])) if isinstance(x.get('mentions'), list) and x.get('mentions') else int(x.get('occurrences_count') or 1) for x in review_entities)
     if pending_entity_count > 0 or review_entity_count > 0:
         audit(c.get('sub'), 'BLOCK_PUBLICATION_REVIEW_REQUIRED', 'DOCUMENT', document_id, {'case_id': d['case_id'], 'pending_entity_count': pending_entity_count, 'review_entity_count': review_entity_count})
-        err('PENDING_REDACTION_REVIEW', 'Документ содержит сведения, требующие проверки перед публикацией.', 409, {'pending_entity_count': pending_entity_count, 'pending_mention_count': pending_mention_count, 'review_entity_count': review_entity_count, 'review_mention_count': review_mention_count})
+        err('PENDING_REDACTION_REVIEW', 'Документ содержит сведения, требующие проверки перед публикацией.', 409, {
+            'pending_entity_count': pending_entity_count, 'pending_mention_count': pending_mention_count,
+            'review_entity_count': review_entity_count, 'review_mention_count': review_mention_count,
+            'pending_count': pending_entity_count, 'review_count': review_entity_count,
+        })
     d['status'] = 'PUBLISHED'
     if any(doc['case_id'] == cs['id'] and doc['status'] == 'PUBLISHED' for doc in docs):
         cs['status'] = 'PUBLISHED'

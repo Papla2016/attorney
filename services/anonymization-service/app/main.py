@@ -167,13 +167,24 @@ def normalize_person_name(value: str) -> tuple[str, dict]:
 
 
 def detect_person_role(text: str, start: int, end: int) -> str:
+    window = text[max(0, start - 80):min(len(text), end + 80)].lower()
     prefix = text[max(0, start - 120):start].lower()
-    if re.search(r'председательствующего\s+судьи\s*$', prefix) or re.search(r'судьи\s*$', prefix):
+    if re.search(r'председательствующ\w*\s+суд\w*', window) or re.search(r'\bсудья\b', window):
         return 'JUDGE'
-    if re.search(r'при\s+секретаре\s*$', prefix):
+    if re.search(r'при\s+секретар\w*', window):
         return 'COURT_SECRETARY'
-    if re.search(r'(по\s+иску|истцом)\s*$', prefix):
+    if re.search(r'\bсвидетел\w*\b', window):
+        return 'WITNESS'
+    if re.search(r'\bист(ец|цом|ца)\b', window) or re.search(r'(по\s+иску)\s*$', prefix):
         return 'PLAINTIFF'
+    if re.search(r'\bответчик\w*\b', window):
+        return 'DEFENDANT'
+    if re.search(r'\bпредставител\w*\b', window):
+        return 'REPRESENTATIVE'
+    if re.search(r'\bзаявител\w*\b', window):
+        return 'APPLICANT'
+    if re.search(r'\bпотерпевш\w*\b', window):
+        return 'VICTIM'
     if re.search(r'индивидуальным\s+предпринимателем\s*$', prefix):
         return 'INDIVIDUAL_ENTREPRENEUR'
     return 'UNKNOWN'
@@ -262,7 +273,7 @@ def resolve_entities(text: str, entities: list[dict], mode: str = 'NORMATIVE') -
             ctx = text[max(0, item['start'] - 40): item['end'] + 10].lower()
             if re.search(r'дата рождения|родил[а-я]+|года рождения', ctx):
                 item['context_kind'] = 'BIRTH_DATE'
-            elif re.search(r'решение от|постановление от|договор от|акт от|определение от|судебн\w+\s+заседан', ctx):
+            elif re.search(r'решение от|постановление от|договор от|акт от|определение от|судебн\w+\s+заседан|дата договора|дата решения', ctx):
                 item['context_kind'] = 'DOCUMENT_DATE'
             else:
                 item['context_kind'] = 'UNKNOWN_DATE'
@@ -909,7 +920,10 @@ def delete_mapping(document_id: str, mapping_id: str, x_internal_service_token: 
     entity_key = mapping.get('cluster_id') or f"{mapping.get('entity_class', mapping.get('entity_type','OTHER'))}::{mapping.get('normalized_value', mapping.get('original_value',''))}"
     manual_decisions_by_document_id.setdefault(document_id, {})[entity_key] = {'entity_key': entity_key, 'decision': 'FORCE_KEEP', 'target_cluster_id': None, 'reason': 'Оставлено пользователем', 'created_at': now_iso(), 'updated_at': now_iso()}
     doc['mappings'] = [m for m in mappings if m.get('id') != mapping_id]
-    doc['anonymized_text'] = replace_by_mappings(doc.get('original_text',''), doc['mappings'])
+    for e in doc.get('entities', []):
+        if e.get('entity_id') == mapping_id:
+            e['redaction_decision'] = 'KEEP'
+    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('original_text', ''), doc.get('original_content'))
     manual_mappings_by_document_id[document_id] = [m for m in doc['mappings'] if m.get('source') == 'manual']
     return {'document_id': document_id, 'anonymized_text': doc.get('anonymized_text', ''), 'mappings': doc['mappings']}
 
@@ -963,7 +977,7 @@ def repair_placeholders(document_id: str, x_internal_service_token: str | None =
             by_cluster[cluster]=f"{prefix}{counters[prefix]}"
         m['placeholder']=by_cluster[cluster]
     doc['mappings']=mappings
-    doc['anonymized_text']=replace_by_mappings(doc.get('original_text',''), mappings)
+    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('original_text', ''), doc.get('original_content'))
     audit_log.append({'id': str(uuid.uuid4()), 'document_id': document_id, 'action': 'REPAIR_PLACEHOLDERS', 'created_at': now_iso(), 'details': {}})
     return anonymization_result_response(doc)
 
@@ -1027,9 +1041,13 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
             _error(400, 'BAD_REQUEST', 'Целевой cluster не найден')
         decisions[entity_key] = {'entity_key': entity_key, 'decision': 'MERGE_WITH_CLUSTER', 'target_cluster_id': body.target_cluster_id, 'reason': body.reason, 'created_at': now_iso(), 'updated_at': now_iso()}
         doc.setdefault('mappings', []).append(ensure_mapping_metadata({'original_value': body.selected_text, 'entity_type': body.entity_class, 'entity_class': body.entity_class, 'cluster_id': body.target_cluster_id, 'placeholder': target.get('placeholder'), 'source': 'manual'}))
-    original_text = doc.get('original_text', '')
-    doc['anonymized_text'] = replace_by_mappings(original_text, doc.get('mappings', []))
-    doc['anonymized_content'] = replace_content_by_mappings(doc.get('original_content'), doc.get('mappings', []))
+    for e in doc.get('entities', []):
+        if e.get('canonical_value') == body.selected_text or e.get('normalized_value') == body.selected_text:
+            if body.decision == 'KEEP':
+                e['redaction_decision'] = 'KEEP'
+            elif body.decision in {'REDACT', 'MERGE_WITH_EXISTING'}:
+                e['redaction_decision'] = 'REDACT'
+    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('original_text', ''), doc.get('original_content'))
     pending = [p for p in pending_review_by_document_id.get(document_id, []) if p.get('entity_key') != entity_key]
     pending_review_by_document_id[document_id] = pending
     doc['pending_review'] = pending
