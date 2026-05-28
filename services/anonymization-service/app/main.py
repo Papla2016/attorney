@@ -575,10 +575,11 @@ def build_mappings_from_entities(entities: list[dict]) -> list[dict]:
     return mappings
 
 
-def rebuild_document_from_entities(document_id: str, entities: list[dict], original_text: str, original_content: dict | None):
+def rebuild_document_from_entities(document_id: str, redacted_entities: list[dict], kept_entities: list[dict], original_text: str, original_content: dict | None):
     # stable placeholders by first mention position
     counters: dict[str, int] = defaultdict(int)
-    for e in sorted(entities, key=lambda x: min((m.get('start') or 0) for m in x.get('mentions', []) or [0])):
+    entities = redacted_entities + kept_entities
+    for e in sorted(redacted_entities, key=lambda x: min((m.get('start') or 0) for m in x.get('mentions', []) or [0])):
         prefix = 'ФИО' if e.get('entity_class') == 'PERSON' else make_placeholder(e.get('entity_class', 'OTHER'), 0)[:-1]
         counters[prefix] += 1
         e['placeholder'] = f'{prefix}{counters[prefix]}'
@@ -586,13 +587,12 @@ def rebuild_document_from_entities(document_id: str, entities: list[dict], origi
             m['replacement_value'] = e['placeholder']
     anonymized_text = anonymize_text_by_mentions(original_text, entities)
     anonymized_content = anonymize_content_by_mentions(original_content, entities)
-    mappings = build_mappings_from_entities(entities)
-    kept_entities = [e for e in entities if e.get('redaction_decision') == 'KEEP']
-    review_entities = [e for e in entities if e.get('requires_review')]
+    mappings = build_mappings_from_entities(redacted_entities)
+    review_entities = [e for e in redacted_entities if e.get('requires_review')]
     pending_entities = restored_docs.get(document_id, {}).get('pending_review', [])
     doc = restored_docs.get(document_id, {})
     doc.update({
-        'entities': entities,
+        'entities': redacted_entities,
         'anonymized_text': anonymized_text,
         'anonymized_content': anonymized_content,
         'mappings': mappings,
@@ -823,7 +823,7 @@ async def process(body: ProcessRequest, x_internal_service_token: str | None = H
 
     resolved = resolve_entities(body.text, entities, body.publication_redaction_mode)
     entities, recognized_but_kept, review_entities = build_entities_from_resolved(body.document_id, resolved, body.publication_redaction_mode)
-    rebuilt = rebuild_document_from_entities(body.document_id, entities + recognized_but_kept, body.text, body.original_content)
+    rebuilt = rebuild_document_from_entities(body.document_id, entities, recognized_but_kept, body.text, body.original_content)
     mappings = rebuilt.get('mappings', [])
     anonymized = rebuilt.get('anonymized_text', '')
     save_document(
@@ -907,21 +907,24 @@ def add_mapping(document_id: str, body: MappingRequest, x_internal_service_token
         _error(404, 'NOT_FOUND', 'Документ не найден')
 
     doc = restored_docs[document_id]
-    existing = ensure_document_mappings(document_id)
-    manual = manual_mappings_by_document_id.setdefault(document_id, [m for m in existing if m.get('source') == 'manual'])
     validate_non_empty(body.original_value, 'original_value')
     validate_non_empty(body.entity_type, 'entity_type')
-    validate_non_empty(body.placeholder, 'placeholder')
-    if any(m.get('original_value') == body.original_value for m in manual + existing):
-        return {'document_id': document_id, 'anonymized_text': doc.get('anonymized_text', ''), 'mappings': existing}
-
-    placeholder = body.placeholder if body.mode == 'existing' else next_placeholder(body.entity_type, existing + manual)
-    if not placeholder:
-        _error(400, 'BAD_REQUEST', 'placeholder is required for existing mode')
-    manual_mapping = ensure_mapping_metadata({'placeholder': placeholder, 'original_value': body.original_value, 'entity_type': body.entity_type, 'source': 'manual'})
-    manual.append(manual_mapping)
-    doc['mappings'] = merge_mappings(manual, existing)
-    return {'document_id': document_id, 'anonymized_text': doc.get('anonymized_text', ''), 'mappings': doc['mappings']}
+    positions = [m.start() for m in re.finditer(re.escape(body.original_value), doc.get('original_text', ''))]
+    if not positions:
+        return anonymization_result_response(doc)
+    if body.mode == 'existing':
+        target = next((e for e in doc.get('entities', []) if e.get('placeholder') == body.placeholder or e.get('entity_id') == body.placeholder), None)
+        if not target:
+            _error(400, 'BAD_REQUEST', 'Целевая сущность не найдена')
+        for pos in positions:
+            target.setdefault('mentions', []).append({'mention_id': str(uuid.uuid4()), 'entity_id': target['entity_id'], 'surface_value': body.original_value, 'start': pos, 'end': pos + len(body.original_value), 'replacement_value': target.get('placeholder')})
+    else:
+        ent = {'entity_id': str(uuid.uuid4()), 'document_id': document_id, 'entity_class': body.entity_type, 'canonical_value': body.original_value, 'normalized_value': body.original_value, 'redaction_decision': 'REDACT', 'mentions': []}
+        for pos in positions:
+            ent['mentions'].append({'mention_id': str(uuid.uuid4()), 'entity_id': ent['entity_id'], 'surface_value': body.original_value, 'start': pos, 'end': pos + len(body.original_value), 'replacement_value': ''})
+        doc.setdefault('entities', []).append(ent)
+    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
+    return anonymization_result_response(doc)
 
 @app.patch('/internal/anonymization/documents/{document_id}/mappings/{mapping_id}')
 def update_mapping(document_id: str, mapping_id: str, body: MappingPatchRequest, x_internal_service_token: str | None = Header(None)):
@@ -932,19 +935,16 @@ def update_mapping(document_id: str, mapping_id: str, body: MappingPatchRequest,
     validate_non_empty(body.original_value, 'original_value')
     validate_non_empty(body.entity_type, 'entity_type')
     doc = restored_docs[document_id]
-    mappings = ensure_document_mappings(document_id)
-    mapping = next((m for m in mappings if m.get('id') == mapping_id), None)
-    if not mapping:
+    target = next((e for e in doc.get('entities', []) if e.get('entity_id') == mapping_id), None)
+    if not target:
         _error(404, 'NOT_FOUND', 'Элемент таблицы соответствия не найден')
     data = body.model_dump(exclude_unset=True)
-    for field in ['placeholder', 'original_value', 'entity_type']:
-        if field in data:
-            mapping[field] = data[field].strip()
-    mapping['source'] = 'manual'
-    ensure_mapping_metadata(mapping, touch_updated=True)
-    doc['mappings'] = merge_mappings([m for m in mappings if m.get('source') == 'manual'], [m for m in mappings if m.get('source') != 'manual'])
-    manual_mappings_by_document_id[document_id] = [m for m in doc['mappings'] if m.get('source') == 'manual']
-    return {'document_id': document_id, 'anonymized_text': doc.get('anonymized_text', ''), 'mappings': doc['mappings']}
+    if data.get('original_value'):
+        target['canonical_value'] = data['original_value'].strip()
+    if data.get('entity_type'):
+        target['entity_class'] = data['entity_type'].strip()
+    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
+    return anonymization_result_response(doc)
 
 
 @app.delete('/internal/anonymization/documents/{document_id}/mappings/{mapping_id}')
@@ -963,7 +963,7 @@ def delete_mapping(document_id: str, mapping_id: str, x_internal_service_token: 
     for e in doc.get('entities', []):
         if e.get('entity_id') == mapping_id:
             e['redaction_decision'] = 'KEEP'
-    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('original_text', ''), doc.get('original_content'))
+    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
     manual_mappings_by_document_id[document_id] = [m for m in doc['mappings'] if m.get('source') == 'manual']
     return {'document_id': document_id, 'anonymized_text': doc.get('anonymized_text', ''), 'mappings': doc['mappings']}
 
@@ -974,28 +974,20 @@ def merge_document_mappings(document_id: str, body: MergeMappingsRequest, x_inte
     if document_id not in restored_docs:
         _error(404, 'NOT_FOUND', 'Документ не найден')
     doc = restored_docs[document_id]
-    mappings = ensure_document_mappings(document_id)
-    target = next((m for m in mappings if m.get('id') == body.target_mapping_id), None)
+    target = next((e for e in doc.get('entities', []) if e.get('entity_id') == body.target_mapping_id), None)
     if not target:
         _error(404, 'NOT_FOUND', 'Целевой элемент таблицы соответствия не найден')
     if not body.source_mapping_ids:
         _error(400, 'BAD_REQUEST', 'source_mapping_ids не должен быть пустым')
     source_ids = set(body.source_mapping_ids)
-    sources = [m for m in mappings if m.get('id') in source_ids]
+    sources = [e for e in doc.get('entities', []) if e.get('entity_id') in source_ids]
     if len(sources) != len(source_ids):
         _error(404, 'NOT_FOUND', 'Один или несколько исходных элементов таблицы соответствия не найдены')
-    target_placeholder = target.get('placeholder')
-    target_type = target.get('entity_type') or 'UNKNOWN'
-    for m in sources:
-        m['placeholder'] = target_placeholder
-        m['entity_type'] = m.get('entity_type') or target_type
-        m['source'] = 'manual'
-        ensure_mapping_metadata(m, touch_updated=True)
-    target['source'] = 'manual'
-    ensure_mapping_metadata(target, touch_updated=True)
-    doc['mappings'] = merge_mappings([m for m in mappings if m.get('source') == 'manual'], [m for m in mappings if m.get('source') != 'manual'])
-    manual_mappings_by_document_id[document_id] = [m for m in doc['mappings'] if m.get('source') == 'manual']
-    return {'document_id': document_id, 'anonymized_text': doc.get('anonymized_text', ''), 'mappings': doc['mappings']}
+    for src in sources:
+        target.setdefault('mentions', []).extend(src.get('mentions', []))
+        doc['entities'].remove(src)
+    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
+    return anonymization_result_response(doc)
 
 
 
@@ -1017,7 +1009,7 @@ def repair_placeholders(document_id: str, x_internal_service_token: str | None =
             by_cluster[cluster]=f"{prefix}{counters[prefix]}"
         m['placeholder']=by_cluster[cluster]
     doc['mappings']=mappings
-    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('original_text', ''), doc.get('original_content'))
+    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
     audit_log.append({'id': str(uuid.uuid4()), 'document_id': document_id, 'action': 'REPAIR_PLACEHOLDERS', 'created_at': now_iso(), 'details': {}})
     return anonymization_result_response(doc)
 
@@ -1037,7 +1029,7 @@ async def reanonymize(document_id: str, body: ReanonymizeRequest, x_internal_ser
             ent['redaction_decision'] = 'KEEP'
         if ent and d.get('decision') == 'FORCE_REDACT':
             ent['redaction_decision'] = 'REDACT'
-    rebuilt = rebuild_document_from_entities(document_id, entities_view + recognized_but_kept, original_text, doc.get('original_content'))
+    rebuilt = rebuild_document_from_entities(document_id, entities_view, recognized_but_kept, original_text, doc.get('original_content'))
     mappings = rebuilt.get('mappings', [])
     anonymized = rebuilt.get('anonymized_text', '')
     save_document(
@@ -1091,7 +1083,7 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
                 e['redaction_decision'] = 'KEEP'
             elif body.decision in {'REDACT', 'MERGE_WITH_EXISTING'}:
                 e['redaction_decision'] = 'REDACT'
-    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('original_text', ''), doc.get('original_content'))
+    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
     pending = [p for p in pending_review_by_document_id.get(document_id, []) if p.get('entity_key') != entity_key]
     pending_review_by_document_id[document_id] = pending
     doc['pending_review'] = pending
@@ -1185,7 +1177,7 @@ def merge_entities(document_id: str, body: EntityMergeRequest, x_internal_servic
         'decision_id': str(uuid.uuid4()), 'document_id': document_id, 'decision_type': 'MERGE_ENTITIES',
         'entity_id': target['entity_id'], 'payload': {'source_entity_ids': body.source_entity_ids}, 'created_at': now_iso(), 'updated_at': now_iso(),
     }
-    rebuild_document_from_entities(document_id, entities, doc.get('original_text', ''), doc.get('original_content'))
+    rebuild_document_from_entities(document_id, entities, doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
     return anonymization_result_response(doc)
 
 
@@ -1213,5 +1205,5 @@ def split_mention(document_id: str, entity_id: str, mention_id: str, x_internal_
         'decision_id': str(uuid.uuid4()), 'document_id': document_id, 'decision_type': 'SPLIT_MENTION',
         'entity_id': entity_id, 'mention_id': mention_id, 'target_entity_id': new_ent['entity_id'], 'payload': {}, 'created_at': now_iso(), 'updated_at': now_iso(),
     }
-    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('original_text', ''), doc.get('original_content'))
+    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
     return anonymization_result_response(doc)
