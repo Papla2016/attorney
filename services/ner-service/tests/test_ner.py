@@ -44,5 +44,11 @@ def test_extract_normalized_text_is_same_for_declensions():
     )
     assert response.status_code == 200
     person_full = [e for e in response.json()['entities'] if e['type'] == 'PERSON_FULL_NAME']
-    assert person_full
-    assert any(e.get('normalized_text') == 'Макаров Антон Сергеевич' for e in person_full)
+    surfaces = {e['text'] for e in person_full}
+    assert 'Макаров Антон Сергеевич' in surfaces
+    assert 'Макарова Антона Сергеевича' in surfaces
+    assert 'Макаровым Антоном Сергеевичем' in surfaces
+    for s in ['Макаров Антон Сергеевич', 'Макарова Антона Сергеевича', 'Макаровым Антоном Сергеевичем']:
+        variants = [e for e in person_full if e['text'] == s]
+        assert variants
+        assert all(v.get('normalized_text') == 'Макаров Антон Сергеевич' for v in variants)

@@ -674,6 +674,35 @@ def anonymize_content_by_mentions(content: dict | None, entities: list[dict]) ->
                 walk(ch)
     walk(data)
     return data
+
+
+def restore_content_from_mentions(anonymized_content: dict | None, entities: list[dict]) -> dict | None:
+    if not anonymized_content:
+        return None
+    data = copy.deepcopy(anonymized_content)
+    mention_by_id: dict[str, dict] = {}
+    for e in entities:
+        for m in e.get('mentions', []):
+            mention_by_id[m.get('mention_id')] = m
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get('type') == 'text' and isinstance(node.get('marks'), list):
+                redaction_mark = next((m for m in node['marks'] if m.get('type') == 'redactionMention'), None)
+                if redaction_mark:
+                    mention_id = (redaction_mark.get('attrs') or {}).get('mentionId')
+                    mention = mention_by_id.get(mention_id)
+                    if mention:
+                        node['text'] = mention.get('surface_value', node.get('text', ''))
+                    node['marks'] = [m for m in node['marks'] if m.get('type') != 'redactionMention']
+            if isinstance(node.get('content'), list):
+                for ch in node['content']:
+                    walk(ch)
+        elif isinstance(node, list):
+            for ch in node:
+                walk(ch)
+    walk(data)
+    return data
 def apply_manual_decisions(document_id: str, resolved: list[dict]) -> list[dict]:
     decisions = manual_decisions_by_document_id.get(document_id, {})
     for e in resolved:

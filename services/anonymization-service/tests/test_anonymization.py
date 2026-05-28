@@ -257,13 +257,25 @@ def test_ambiguous_initials_are_redacted_and_marked_for_review():
 
 
 def test_exact_restoration_text_roundtrip():
-    from app.main import build_entities_from_resolved, anonymize_text_by_mentions
+    from app.main import build_entities_from_resolved, anonymize_text_by_mentions, anonymize_content_by_mentions, restore_content_from_mentions
     text = 'Макарова Антона Сергеевича вызвали. Макаровым Антоном Сергеевичем представлены документы. Макаров А.С. пояснил.'
+    m1 = 'Макарова Антона Сергеевича'
+    m2 = 'Макаровым Антоном Сергеевичем'
+    m3 = 'Макаров А.С.'
+    s1 = text.find(m1); s2 = text.find(m2); s3 = text.find(m3)
     resolved = resolve_entities(text, [
-        {'type': 'PERSON_FULL_NAME', 'text': 'Макарова Антона Сергеевича', 'normalized_text': 'Макаров Антон Сергеевич', 'start': 0, 'end': 26},
-        {'type': 'PERSON_FULL_NAME', 'text': 'Макаровым Антоном Сергеевичем', 'normalized_text': 'Макаров Антон Сергеевич', 'start': 35, 'end': 63},
-        {'type': 'PERSON_FULL_NAME', 'text': 'Макаров А.С.', 'normalized_text': 'Макаров А.С.', 'start': 89, 'end': 100},
+        {'type': 'PERSON_FULL_NAME', 'text': m1, 'normalized_text': 'Макаров Антон Сергеевич', 'start': s1, 'end': s1 + len(m1)},
+        {'type': 'PERSON_FULL_NAME', 'text': m2, 'normalized_text': 'Макаров Антон Сергеевич', 'start': s2, 'end': s2 + len(m2)},
+        {'type': 'PERSON_FULL_NAME', 'text': m3, 'normalized_text': 'Макаров А.С.', 'start': s3, 'end': s3 + len(m3)},
     ])
     entities, _, _ = build_entities_from_resolved('doc-3', resolved)
     anonymized = anonymize_text_by_mentions(text, entities)
-    assert anonymized.count('ФИО1') == 3
+    assert anonymized == 'ФИО1 вызвали. ФИО1 представлены документы. ФИО1 пояснил.'
+    content = {
+        'type': 'doc',
+        'content': [{'type': 'paragraph', 'content': [{'type': 'text', 'text': text}]}],
+    }
+    anon_content = anonymize_content_by_mentions(content, entities)
+    restored = restore_content_from_mentions(anon_content, entities)
+    restored_text = ''.join(n.get('text', '') for n in restored['content'][0]['content'])
+    assert restored_text == text

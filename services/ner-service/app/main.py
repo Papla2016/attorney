@@ -96,8 +96,6 @@ class RussianPersonNormalizer:
     def _normalize_word(self, word: str) -> str:
         if not word:
             return word
-        if self.morph_vocab is None:
-            return word
         try:
             from natasha import Doc
             d = Doc(word)
