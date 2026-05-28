@@ -251,6 +251,7 @@ class CasePatch(BaseModel):
 class MappingIn(BaseModel):
     original_value: str
     placeholder: str | None = None
+    entity_id: str | None = None
     entity_type: str
     mode: str = 'new'
 

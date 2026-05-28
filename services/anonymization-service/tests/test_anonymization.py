@@ -2994,3 +2994,279 @@ def test_public_document_does_not_expose_split_origin():
     assert 'redactionMention' not in serialized
     assert 'entityId' not in serialized
     assert 'mentionId' not in serialized
+
+
+def _compat_client():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+    return TestClient(app), main
+
+
+def _text_node(text, marks=None):
+    node = {'type': 'text', 'text': text}
+    if marks is not None:
+        node['marks'] = marks
+    return node
+
+
+def _doc_content(nodes):
+    return {'type': 'doc', 'content': [{'type': 'paragraph', 'content': nodes}]}
+
+
+def _redaction_mark(entity_id, mention_id, placeholder):
+    return {'type': 'redactionMention', 'attrs': {'entityId': entity_id, 'mentionId': mention_id, 'placeholder': placeholder}}
+
+
+def _compat_entity(entity_id='person-1', placeholder='ФИО1', canonical='Иванов Иван Иванович', mentions=None):
+    return {
+        'entity_id': entity_id,
+        'document_id': 'legacy-doc',
+        'entity_class': 'PERSON',
+        'canonical_value': canonical,
+        'normalized_value': canonical,
+        'redaction_decision': 'REDACT',
+        'placeholder': placeholder,
+        'mentions': mentions or [
+            {'mention_id': f'{entity_id}-m1', 'entity_id': entity_id, 'surface_value': canonical, 'normalized_value': canonical, 'start': 0, 'end': len(canonical), 'replacement_value': placeholder},
+        ],
+    }
+
+
+def _install_compat_doc(main, doc_id, entities, working_text=None, working_content=None, original_text='Исходный текст'):
+    doc = {
+        'document_id': doc_id,
+        'case_id': 'case-legacy',
+        'title': 'legacy',
+        'original_text': original_text,
+        'anonymized_text': working_text or original_text,
+        'original_content': None,
+        'anonymized_content': working_content,
+        'entities': entities,
+        'kept_entities': [],
+        'recognized_but_kept': [],
+        'mappings': main.build_mappings_from_entities(entities),
+        'content_format': 'TIPTAP_JSON',
+    }
+    if working_text is not None:
+        doc['working_text'] = working_text
+    if working_content is not None:
+        doc['working_content'] = working_content
+    main.restored_docs[doc_id] = doc
+    main.manual_decisions_by_document_id[doc_id] = {}
+    return doc
+
+
+def test_patch_mapping_preserves_working_revision_and_uses_entity_metadata_decision():
+    import copy
+    client, main = _compat_client()
+    doc_id = 'legacy-patch-working'
+    content = _doc_content([_text_node('ФИО1', [_redaction_mark('person-1', 'm1', 'ФИО1')])])
+    entity = _compat_entity('person-1', 'ФИО1', mentions=[{'mention_id': 'm1', 'entity_id': 'person-1', 'surface_value': 'Иванов Иван Иванович', 'normalized_value': 'Иванов Иван Иванович', 'start': 0, 'end': 20, 'replacement_value': 'ФИО1'}])
+    doc = _install_compat_doc(main, doc_id, [entity], working_text='ФИО1', working_content=content, original_text='Иванов Иван Иванович')
+    before_content = copy.deepcopy(doc['working_content'])
+
+    response = client.patch(f'/internal/anonymization/documents/{doc_id}/mappings/person-1', headers={'X-Internal-Service-Token': main.INTERNAL}, json={'placeholder': 'ФИО1', 'original_value': 'Петров Петр Петрович', 'entity_type': 'PERSON'})
+
+    assert response.status_code == 200
+    stored = main.restored_docs[doc_id]
+    assert stored['entities'][0]['canonical_value'] == 'Петров Петр Петрович'
+    assert stored['working_text'] == 'ФИО1'
+    assert stored['working_content'] == before_content
+    assert stored['mappings'][0]['original_value'] == 'Петров Петр Петрович'
+    assert any(d['decision_type'] in {'UPDATE_ENTITY_METADATA', 'UPDATE_SPLIT_ENTITY_METADATA'} for d in main.manual_decisions_by_document_id[doc_id].values())
+    assert stored['original_text'] == 'Иванов Иван Иванович'
+
+
+def test_patch_mapping_rejects_manual_placeholder_change():
+    import copy
+    client, main = _compat_client()
+    doc_id = 'legacy-patch-placeholder'
+    entity = _compat_entity('person-1', 'ФИО1')
+    doc = _install_compat_doc(main, doc_id, [entity], working_text='ФИО1', working_content=_doc_content([_text_node('ФИО1', [_redaction_mark('person-1', 'person-1-m1', 'ФИО1')])]))
+    before = copy.deepcopy(doc)
+
+    response = client.patch(f'/internal/anonymization/documents/{doc_id}/mappings/person-1', headers={'X-Internal-Service-Token': main.INTERNAL}, json={'placeholder': 'ФИО2', 'original_value': 'Иванов Иван Иванович', 'entity_type': 'PERSON'})
+
+    assert response.status_code == 400
+    assert response.json()['error']['code'] == 'PLACEHOLDER_MANAGED_AUTOMATICALLY'
+    assert main.restored_docs[doc_id] == before
+    assert main.manual_decisions_by_document_id[doc_id] == {}
+
+
+def test_merge_mappings_compat_uses_safe_entity_merge_for_working_content():
+    client, main = _compat_client()
+    doc_id = 'legacy-merge-working'
+    e1 = _compat_entity('person-1', 'ФИО1', 'Иванов Иван Иванович', [{'mention_id': 'm1', 'entity_id': 'person-1', 'surface_value': 'Иванов Иван Иванович', 'normalized_value': 'Иванов Иван Иванович', 'start': 0, 'end': 20, 'replacement_value': 'ФИО1'}])
+    e2 = _compat_entity('person-2', 'ФИО2', 'Петров Петр Петрович', [{'mention_id': 'm2', 'entity_id': 'person-2', 'surface_value': 'Петров Петр Петрович', 'normalized_value': 'Петров Петр Петрович', 'start': 23, 'end': 43, 'replacement_value': 'ФИО2'}])
+    content = _doc_content([_text_node('ФИО1', [_redaction_mark('person-1', 'm1', 'ФИО1')]), _text_node(' и '), _text_node('ФИО2', [_redaction_mark('person-2', 'm2', 'ФИО2')])])
+    _install_compat_doc(main, doc_id, [e1, e2], working_text='ФИО1 и ФИО2', working_content=content, original_text='Иванов Иван Иванович и Петров Петр Петрович')
+
+    response = client.post(f'/internal/anonymization/documents/{doc_id}/mappings/merge', headers={'X-Internal-Service-Token': main.INTERNAL}, json={'target_mapping_id': 'person-1', 'source_mapping_ids': ['person-2']})
+
+    assert response.status_code == 200
+    stored = main.restored_docs[doc_id]
+    assert len(stored['entities']) == 1
+    assert len(stored['entities'][0]['mentions']) == 2
+    assert stored['working_text'] == 'ФИО1 и ФИО1'
+    assert all(mark['attrs']['entityId'] == 'person-1' for node in stored['working_content']['content'][0]['content'] for mark in node.get('marks', []) if mark['type'] == 'redactionMention')
+    assert stored['original_text'] == 'Иванов Иван Иванович и Петров Петр Петрович'
+
+
+def test_merge_mappings_compat_does_not_mutate_on_missing_mark():
+    import copy
+    client, main = _compat_client()
+    doc_id = 'legacy-merge-missing'
+    e1 = _compat_entity('person-1', 'ФИО1')
+    e2 = _compat_entity('person-2', 'ФИО2', 'Петров Петр Петрович', [{'mention_id': 'm2', 'entity_id': 'person-2', 'surface_value': 'Петров Петр Петрович', 'normalized_value': 'Петров Петр Петрович', 'start': 5, 'end': 25, 'replacement_value': 'ФИО2'}])
+    doc = _install_compat_doc(main, doc_id, [e1, e2], working_text='ФИО1 и ФИО2', working_content=_doc_content([_text_node('ФИО1', [_redaction_mark('person-1', 'person-1-m1', 'ФИО1')]), _text_node(' и ФИО2')]))
+    before = copy.deepcopy(doc)
+
+    response = client.post(f'/internal/anonymization/documents/{doc_id}/mappings/merge', headers={'X-Internal-Service-Token': main.INTERNAL}, json={'target_mapping_id': 'person-1', 'source_mapping_ids': ['person-2']})
+
+    assert response.status_code == 409
+    assert response.json()['error']['code'] == 'MERGE_ENTITIES_MARK_NOT_FOUND'
+    assert main.restored_docs[doc_id] == before
+    assert main.manual_decisions_by_document_id[doc_id] == {}
+
+
+def test_delete_mapping_keep_restores_surface_values_in_working_content():
+    client, main = _compat_client()
+    doc_id = 'legacy-delete-rich'
+    mentions = [
+        {'mention_id': 'm1', 'entity_id': 'person-1', 'surface_value': 'Макарова Антона Сергеевича', 'normalized_value': 'Макаров Антон Сергеевич', 'start': 0, 'end': 26, 'replacement_value': 'ФИО1'},
+        {'mention_id': 'm2', 'entity_id': 'person-1', 'surface_value': 'Макаровым Антоном Сергеевичем', 'normalized_value': 'Макаров Антон Сергеевич', 'start': 29, 'end': 57, 'replacement_value': 'ФИО1'},
+    ]
+    entity = _compat_entity('person-1', 'ФИО1', 'Макаров Антон Сергеевич', mentions)
+    bold = {'type': 'bold'}
+    content = _doc_content([_text_node('ФИО1', [bold, _redaction_mark('person-1', 'm1', 'ФИО1')]), _text_node(' и '), _text_node('ФИО1', [_redaction_mark('person-1', 'm2', 'ФИО1')])])
+    _install_compat_doc(main, doc_id, [entity], working_text='ФИО1 и ФИО1', working_content=content, original_text='ORIGINAL')
+
+    response = client.delete(f'/internal/anonymization/documents/{doc_id}/mappings/person-1', headers={'X-Internal-Service-Token': main.INTERNAL})
+
+    assert response.status_code == 200
+    stored = main.restored_docs[doc_id]
+    assert stored['working_text'] == 'Макарова Антона Сергеевича и Макаровым Антоном Сергеевичем'
+    nodes = stored['working_content']['content'][0]['content']
+    assert nodes[0]['text'] == 'Макарова Антона Сергеевича'
+    assert nodes[0]['marks'] == [bold]
+    assert nodes[2]['text'] == 'Макаровым Антоном Сергеевичем'
+    assert all(mark.get('type') != 'redactionMention' for node in nodes for mark in node.get('marks', []))
+    assert stored['entities'] == []
+    assert stored['kept_entities'][0]['entity_id'] == 'person-1'
+    assert stored['mappings'] == []
+    assert any(d['decision_type'] == 'KEEP_ENTITY' for d in main.manual_decisions_by_document_id[doc_id].values())
+    assert stored['original_text'] == 'ORIGINAL'
+
+
+def test_delete_mapping_plain_text_rejects_different_surface_values():
+    import copy
+    client, main = _compat_client()
+    doc_id = 'legacy-delete-plain-conflict'
+    entity = _compat_entity('person-1', 'ФИО1', 'Макаров Антон Сергеевич', [
+        {'mention_id': 'm1', 'entity_id': 'person-1', 'surface_value': 'Макарова Антона Сергеевича', 'start': 0, 'end': 26, 'replacement_value': 'ФИО1'},
+        {'mention_id': 'm2', 'entity_id': 'person-1', 'surface_value': 'Макаровым Антоном Сергеевичем', 'start': 29, 'end': 57, 'replacement_value': 'ФИО1'},
+    ])
+    doc = _install_compat_doc(main, doc_id, [entity], working_text='ФИО1 и ФИО1', original_text='ORIGINAL')
+    before = copy.deepcopy(doc)
+
+    response = client.delete(f'/internal/anonymization/documents/{doc_id}/mappings/person-1', headers={'X-Internal-Service-Token': main.INTERNAL})
+
+    assert response.status_code == 409
+    assert response.json()['error']['code'] == 'KEEP_REQUIRES_STRUCTURED_CONTENT'
+    assert main.restored_docs[doc_id] == before
+
+
+def test_add_mapping_working_revision_anonymizes_current_open_value():
+    client, main = _compat_client()
+    doc_id = 'legacy-add-working'
+    content = _doc_content([_text_node('Новый Иванов Иван Иванович')])
+    _install_compat_doc(main, doc_id, [], working_text='Новый Иванов Иван Иванович', working_content=content, original_text='Исходный без значения')
+
+    response = client.post(f'/internal/anonymization/documents/{doc_id}/mappings', headers={'X-Internal-Service-Token': main.INTERNAL}, json={'original_value': 'Иванов Иван Иванович', 'entity_type': 'PERSON', 'mode': 'new'})
+
+    assert response.status_code == 200
+    stored = main.restored_docs[doc_id]
+    assert len(stored['entities']) == 1
+    assert stored['entities'][0]['mentions'][0]['surface_value'] == 'Иванов Иван Иванович'
+    assert stored['working_text'] == 'Новый ФИО1'
+    assert any(mark.get('type') == 'redactionMention' for node in stored['working_content']['content'][0]['content'] for mark in node.get('marks', []))
+    assert stored['original_text'] == 'Исходный без значения'
+
+
+def test_add_mapping_working_revision_existing_mode_adds_mention_to_target_entity():
+    client, main = _compat_client()
+    doc_id = 'legacy-add-existing'
+    entity = _compat_entity('person-1', 'ФИО1', 'Иванов Иван Иванович')
+    content = _doc_content([_text_node('ФИО1 и Иванову Ивану Ивановичу', [_redaction_mark('person-1', 'person-1-m1', 'ФИО1')])])
+    _install_compat_doc(main, doc_id, [entity], working_text='ФИО1 и Иванову Ивану Ивановичу', working_content=content, original_text='ORIGINAL')
+
+    response = client.post(f'/internal/anonymization/documents/{doc_id}/mappings', headers={'X-Internal-Service-Token': main.INTERNAL}, json={'original_value': 'Иванову Ивану Ивановичу', 'entity_type': 'PERSON', 'mode': 'existing', 'entity_id': 'person-1'})
+
+    assert response.status_code == 200
+    stored = main.restored_docs[doc_id]
+    assert len(stored['entities']) == 1
+    assert len(stored['entities'][0]['mentions']) == 2
+    assert stored['working_text'] == 'ФИО1 и ФИО1'
+    assert stored['original_text'] == 'ORIGINAL'
+
+
+def test_repair_placeholders_preserves_working_rich_content():
+    client, main = _compat_client()
+    doc_id = 'legacy-repair-rich'
+    e1 = _compat_entity('person-1', 'ФИО1', 'Иванов Иван Иванович', [{'mention_id': 'm1', 'entity_id': 'person-1', 'surface_value': 'Иванов Иван Иванович', 'start': 0, 'end': 20, 'replacement_value': 'ФИО1'}])
+    e2 = _compat_entity('person-2', 'ФИО1', 'Петров Петр Петрович', [{'mention_id': 'm2', 'entity_id': 'person-2', 'surface_value': 'Петров Петр Петрович', 'start': 23, 'end': 43, 'replacement_value': 'ФИО1'}])
+    italic = {'type': 'italic'}
+    content = _doc_content([_text_node('ФИО1', [italic, _redaction_mark('person-1', 'm1', 'ФИО1')]), _text_node(' и текст '), _text_node('ФИО1', [_redaction_mark('person-2', 'm2', 'ФИО1')])])
+    _install_compat_doc(main, doc_id, [e1, e2], working_text='ФИО1 и текст ФИО1', working_content=content, original_text='ORIGINAL')
+
+    response = client.post(f'/internal/anonymization/documents/{doc_id}/mappings/repair-placeholders', headers={'X-Internal-Service-Token': main.INTERNAL})
+
+    assert response.status_code == 200
+    stored = main.restored_docs[doc_id]
+    placeholders = {e['entity_id']: e['placeholder'] for e in stored['entities']}
+    assert placeholders == {'person-1': 'ФИО1', 'person-2': 'ФИО2'}
+    nodes = stored['working_content']['content'][0]['content']
+    assert nodes[0]['text'] == 'ФИО1'
+    assert nodes[0]['marks'][0] == italic
+    assert nodes[2]['text'] == 'ФИО2'
+    assert stored['working_text'] == 'ФИО1 и текст ФИО2'
+    assert stored['original_text'] == 'ORIGINAL'
+
+
+def test_repair_placeholders_plain_text_conflict_requires_structured_content():
+    import copy
+    client, main = _compat_client()
+    doc_id = 'legacy-repair-plain-conflict'
+    e1 = _compat_entity('person-1', 'ФИО1')
+    e2 = _compat_entity('person-2', 'ФИО1', 'Петров Петр Петрович')
+    doc = _install_compat_doc(main, doc_id, [e1, e2], working_text='ФИО1 и ФИО1', original_text='ORIGINAL')
+    before = copy.deepcopy(doc)
+
+    response = client.post(f'/internal/anonymization/documents/{doc_id}/mappings/repair-placeholders', headers={'X-Internal-Service-Token': main.INTERNAL})
+
+    assert response.status_code == 409
+    assert response.json()['error']['code'] == 'REPAIR_REQUIRES_STRUCTURED_CONTENT'
+    assert main.restored_docs[doc_id] == before
+
+
+def test_legacy_mapping_public_content_remains_sanitized():
+    client, main = _compat_client()
+    doc_id = 'legacy-public-sanitized'
+    entity = _compat_entity('person-1', 'ФИО1', mentions=[{'mention_id': 'm1', 'entity_id': 'person-1', 'surface_value': 'Иванов Иван Иванович', 'start': 0, 'end': 20, 'replacement_value': 'ФИО1'}])
+    content = _doc_content([_text_node('ФИО1', [_redaction_mark('person-1', 'm1', 'ФИО1')])])
+    _install_compat_doc(main, doc_id, [entity], working_text='ФИО1', working_content=content, original_text='Иванов Иван Иванович')
+    main.public_docs[doc_id] = {'document_id': doc_id, 'title': 'legacy', 'anonymized_text': 'ФИО1', 'anonymized_content': content, 'content_format': 'TIPTAP_JSON'}
+
+    response = client.patch(f'/internal/anonymization/documents/{doc_id}/mappings/person-1', headers={'X-Internal-Service-Token': main.INTERNAL}, json={'placeholder': 'ФИО1', 'original_value': 'Иванов И.И.', 'entity_type': 'PERSON'})
+    public_response = client.get(f'/internal/anonymization/documents/{doc_id}/public', headers={'X-Internal-Service-Token': main.INTERNAL})
+
+    assert response.status_code == 200
+    assert public_response.status_code == 200
+    payload = public_response.json()
+    assert payload['anonymized_text'] == 'ФИО1'
+    serialized = str(payload)
+    assert 'redactionMention' not in serialized
+    assert 'entityId' not in serialized
+    assert 'mentionId' not in serialized
+    assert 'split_origin' not in serialized
