@@ -1439,3 +1439,320 @@ def test_pending_keep_keeps_all_surface_forms_of_same_entity_key():
 
     decision = main.manual_decisions_by_document_id[doc_id][entity_key]
     assert decision['decision_type'] == 'KEEP_ENTITY'
+
+
+def _reset_reanonymize_working_doc(main, doc_id):
+    main.restored_docs.pop(doc_id, None)
+    main.public_docs.pop(doc_id, None)
+    main.pending_review_by_document_id.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+
+
+def _simple_content(text):
+    return {
+        'type': 'doc',
+        'content': [{
+            'type': 'paragraph',
+            'content': [{'type': 'text', 'text': text}],
+        }],
+    }
+
+
+def test_reanonymize_preserves_pending_redact_working_revision():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'reanonymize-working-redact-doc'
+    original_text = 'Иванов И.И. явился в суд.'
+    working_text = 'ФИО1 явился в суд. ФИО2 представил документы.'
+    working_content = _simple_content(working_text)
+    _reset_reanonymize_working_doc(main, doc_id)
+
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': original_text,
+        'original_content': _simple_content(original_text),
+        'anonymized_text': working_text,
+        'anonymized_content': working_content,
+        'working_text': working_text,
+        'working_content': working_content,
+        'entities': [
+            {
+                'entity_id': 'person-e1',
+                'document_id': doc_id,
+                'entity_class': 'PERSON',
+                'canonical_value': 'Иванов И.И.',
+                'normalized_value': 'Иванов И.И.',
+                'placeholder': 'ФИО1',
+                'redaction_decision': 'REDACT',
+                'requires_review': False,
+                'mentions': [
+                    {'mention_id': 'm1', 'entity_id': 'person-e1', 'surface_value': 'Иванов И.И.', 'start': 0, 'end': 10, 'replacement_value': 'ФИО1'},
+                ],
+            },
+            {
+                'entity_id': 'person-e2',
+                'document_id': doc_id,
+                'entity_class': 'PERSON',
+                'canonical_value': 'Макаров А.С.',
+                'normalized_value': 'Макаров А.С.',
+                'placeholder': 'ФИО2',
+                'redaction_decision': 'REDACT',
+                'requires_review': False,
+                'mentions': [
+                    {'mention_id': 'm2', 'entity_id': 'person-e2', 'surface_value': 'Макаров А.С.', 'start': 20, 'end': 32, 'replacement_value': 'ФИО2'},
+                ],
+            },
+        ],
+        'kept_entities': [],
+        'mappings': [],
+        'pending_review': [],
+    }
+
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/reanonymize',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'mappings': [], 'publication_redaction_mode': 'STRICT'},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert 'представил документы' in payload['anonymized_text']
+    assert 'Макаров А.С.' not in payload['anonymized_text']
+    assert 'ФИО2 представил документы' in payload['anonymized_text']
+    entity = next(e for e in payload['entities'] if e['entity_id'] == 'person-e2')
+    assert entity['mentions'][0]['surface_value'] == 'Макаров А.С.'
+    assert main.restored_docs[doc_id]['original_text'] == original_text
+    assert main.restored_docs[doc_id]['original_content'] == _simple_content(original_text)
+
+
+def test_reanonymize_preserves_pending_keep_working_revision():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'reanonymize-working-keep-doc'
+    original_text = 'ФИО1 явился в суд.'
+    kept_value = 'Макаров А.С.'
+    working_text = f'ФИО1 явился в суд. {kept_value} представил документы.'
+    _reset_reanonymize_working_doc(main, doc_id)
+
+    kept_entity = {
+        'entity_id': 'person-keep',
+        'document_id': doc_id,
+        'entity_class': 'PERSON',
+        'canonical_value': kept_value,
+        'normalized_value': kept_value,
+        'redaction_decision': 'KEEP',
+        'requires_review': False,
+        'mentions': [
+            {'mention_id': 'mk1', 'entity_id': 'person-keep', 'surface_value': kept_value, 'start': working_text.index(kept_value), 'end': working_text.index(kept_value) + len(kept_value), 'replacement_value': kept_value},
+        ],
+    }
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': original_text,
+        'original_content': _simple_content(original_text),
+        'anonymized_text': working_text,
+        'working_text': working_text,
+        'working_content': _simple_content(working_text),
+        'entities': [{
+            'entity_id': 'person-e1',
+            'document_id': doc_id,
+            'entity_class': 'PERSON',
+            'canonical_value': 'Иванов И.И.',
+            'normalized_value': 'Иванов И.И.',
+            'placeholder': 'ФИО1',
+            'redaction_decision': 'REDACT',
+            'requires_review': False,
+            'mentions': [],
+        }],
+        'kept_entities': [kept_entity],
+        'recognized_but_kept': [kept_entity],
+        'mappings': [],
+        'pending_review': [],
+    }
+
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/reanonymize',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'mappings': []},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert 'представил документы' in payload['anonymized_text']
+    assert kept_value in payload['anonymized_text']
+    assert 'ФИО2' not in payload['anonymized_text']
+    assert payload['kept_entities'][0]['canonical_value'] == kept_value
+    assert main.restored_docs[doc_id]['original_text'] == original_text
+
+
+def test_reanonymize_preserves_pending_merge_with_existing_working_revision():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'reanonymize-working-merge-doc'
+    original_text = 'Иванов И.И. явился в суд.'
+    working_text = 'ФИО1 явился в суд. ФИО1 представил документы.'
+    _reset_reanonymize_working_doc(main, doc_id)
+
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': original_text,
+        'original_content': _simple_content(original_text),
+        'anonymized_text': working_text,
+        'working_text': working_text,
+        'working_content': _simple_content(working_text),
+        'entities': [{
+            'entity_id': 'person-e1',
+            'document_id': doc_id,
+            'entity_class': 'PERSON',
+            'canonical_value': 'Иванов И.И.',
+            'normalized_value': 'Иванов И.И.',
+            'placeholder': 'ФИО1',
+            'redaction_decision': 'REDACT',
+            'requires_review': False,
+            'mentions': [
+                {'mention_id': 'm1', 'entity_id': 'person-e1', 'surface_value': 'Иванов И.И.', 'start': 0, 'end': 10, 'replacement_value': 'ФИО1'},
+                {'mention_id': 'm2', 'entity_id': 'person-e1', 'surface_value': 'Макаров А.С.', 'start': 20, 'end': 32, 'replacement_value': 'ФИО1'},
+            ],
+        }],
+        'kept_entities': [],
+        'mappings': [],
+        'pending_review': [],
+    }
+
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/reanonymize',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'mappings': []},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert 'представил документы' in payload['anonymized_text']
+    assert 'Макаров А.С.' not in payload['anonymized_text']
+    assert 'ФИО1 представил документы' in payload['anonymized_text']
+    persons = [e for e in payload['entities'] if e['entity_class'] == 'PERSON']
+    assert len(persons) == 1
+    assert any(m['surface_value'] == 'Макаров А.С.' for m in persons[0]['mentions'])
+    assert main.restored_docs[doc_id]['original_text'] == original_text
+
+
+def test_reanonymize_rejects_working_revision_with_pending_review():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'reanonymize-working-pending-doc'
+    original_text = 'Иванов И.И. явился в суд.'
+    working_text = 'ФИО1 явился в суд. Макаров А.С. представил документы.'
+    pending = [{
+        'entity_key': 'PERSON::макаров а.с.',
+        'surface_value': 'Макаров А.С.',
+        'normalized_value': 'Макаров А.С.',
+        'entity_class': 'PERSON',
+        'start': working_text.index('Макаров А.С.'),
+        'end': working_text.index('Макаров А.С.') + len('Макаров А.С.'),
+        'reason': 'В изменённом тексте найдено новое значение, требующее проверки',
+    }]
+    _reset_reanonymize_working_doc(main, doc_id)
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': original_text,
+        'original_content': _simple_content(original_text),
+        'anonymized_text': working_text,
+        'working_text': working_text,
+        'working_content': _simple_content(working_text),
+        'entities': [],
+        'kept_entities': [],
+        'mappings': [],
+        'pending_review': pending,
+    }
+    main.pending_review_by_document_id[doc_id] = pending
+    before = main.restored_docs[doc_id].copy()
+
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/reanonymize',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'mappings': []},
+    )
+
+    assert response.status_code == 409
+    error = response.json()['error']
+    assert error['code'] == 'PENDING_REVIEW_REQUIRED'
+    assert error['message'] == 'Перед повторным обезличиванием обработайте найденные в изменённом тексте фрагменты'
+    assert error['details']['pending_count'] == 1
+    assert error['details']['review_count'] == 1
+    assert error['details']['pending_review'] == pending
+    assert main.restored_docs[doc_id]['working_text'] == before['working_text']
+    assert main.restored_docs[doc_id]['working_content'] == before['working_content']
+    assert main.restored_docs[doc_id]['entities'] == before['entities']
+    assert main.restored_docs[doc_id]['kept_entities'] == before['kept_entities']
+    assert main.restored_docs[doc_id]['pending_review'] == pending
+    assert main.restored_docs[doc_id]['original_text'] == original_text
+
+
+def test_reanonymize_without_working_revision_uses_original_pipeline(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'reanonymize-original-pipeline-doc'
+    original_text = 'Петров П.П. подписал документ.'
+    _reset_reanonymize_working_doc(main, doc_id)
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': original_text,
+        'original_content': _simple_content(original_text),
+        'anonymized_text': 'stale anonymized text',
+        'entities': [],
+        'kept_entities': [],
+        'mappings': [],
+        'pending_review': [],
+    }
+
+    async def fake_extract_entities(text):
+        assert text == original_text
+        return [{
+            'type': 'PERSON_FULL_NAME',
+            'text': 'Петров П.П.',
+            'normalized_text': 'Петров П.П.',
+            'start': 0,
+            'end': len('Петров П.П.'),
+            'source': 'natasha',
+        }]
+
+    monkeypatch.setattr(main, 'extract_entities', fake_extract_entities)
+
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/reanonymize',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'mappings': []},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['anonymized_text'] == 'ФИО1 подписал документ.'
+    assert payload['entities'][0]['mentions'][0]['surface_value'] == 'Петров П.П.'
+    assert main.restored_docs[doc_id].get('working_text') is None
+    assert main.restored_docs[doc_id].get('working_content') is None
+    assert main.restored_docs[doc_id]['original_text'] == original_text
