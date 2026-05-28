@@ -515,30 +515,41 @@ def build_entities_from_resolved(document_id: str, resolved: list[dict], mode: s
         for m in ent.get('mentions', []):
             m['replacement_value'] = ent['placeholder']
 
-    kept=[]
+    kept_by_key = {}
     for e in resolved:
         if e.get('redaction_decision') != 'KEEP':
             continue
-        kept.append({
-            'entity_id': str(uuid.uuid4()),
-            'document_id': document_id,
-            'entity_class': e.get('entity_class', 'OTHER'),
-            'canonical_value': e.get('normalized_value') or e.get('surface_value'),
-            'normalized_value': e.get('normalized_value') or e.get('surface_value'),
-            'person_role': e.get('person_role'),
-            'redaction_decision': 'KEEP',
-            'requires_review': False,
-            'source': e.get('source', 'natasha'),
-            'mentions_count': 1,
-            'mentions': [{
-                'mention_id': str(uuid.uuid4()),
-                'surface_value': e.get('surface_value'),
-                'normalized_value': e.get('normalized_value'),
-                'start': e.get('start'),
-                'end': e.get('end'),
-                'replacement_value': e.get('surface_value'),
-            }]
+        cls = e.get('entity_class', 'OTHER')
+        normalized = e.get('normalized_value') or e.get('surface_value')
+        role = e.get('person_role')
+        key = f'{cls}::{normalized}::{role or ""}'
+        ent = kept_by_key.get(key)
+        if not ent:
+            ent = {
+                'entity_id': str(uuid.uuid4()),
+                'document_id': document_id,
+                'entity_class': cls,
+                'canonical_value': normalized,
+                'normalized_value': normalized,
+                'person_role': role,
+                'redaction_decision': 'KEEP',
+                'requires_review': False,
+                'source': e.get('source', 'natasha'),
+                'mentions': [],
+            }
+            kept_by_key[key] = ent
+        ent['mentions'].append({
+            'mention_id': str(uuid.uuid4()),
+            'entity_id': ent['entity_id'],
+            'surface_value': e.get('surface_value'),
+            'normalized_value': e.get('normalized_value'),
+            'start': e.get('start'),
+            'end': e.get('end'),
+            'replacement_value': e.get('surface_value'),
         })
+    kept = list(kept_by_key.values())
+    for ent in kept:
+        ent['mentions_count'] = len(ent.get('mentions', []))
     review=[]
     for ent in entities:
         if ent['requires_review']:
@@ -703,6 +714,22 @@ def restore_content_from_mentions(anonymized_content: dict | None, entities: lis
                 walk(ch)
     walk(data)
     return data
+
+def content_plain_text(content: dict | None) -> str:
+    parts: list[str] = []
+    def walk(node):
+        if isinstance(node, dict):
+            if isinstance(node.get('text'), str):
+                parts.append(node['text'])
+            if isinstance(node.get('content'), list):
+                for ch in node['content']:
+                    walk(ch)
+        elif isinstance(node, list):
+            for ch in node:
+                walk(ch)
+    walk(content)
+    return ''.join(parts)
+
 def apply_manual_decisions(document_id: str, resolved: list[dict]) -> list[dict]:
     decisions = manual_decisions_by_document_id.get(document_id, {})
     for e in resolved:
@@ -886,7 +913,12 @@ def restored(document_id: str, x_internal_service_token: str | None = Header(Non
     require_internal(x_internal_service_token)
     if document_id not in restored_docs:
         _error(404, 'NOT_FOUND', 'Документ не найден')
-    return restored_docs[document_id]
+    doc = copy.deepcopy(restored_docs[document_id])
+    restored_content = restore_content_from_mentions(doc.get('anonymized_content'), doc.get('entities', []))
+    if restored_content is not None:
+        doc['restored_content'] = restored_content
+        doc['restored_text'] = content_plain_text(restored_content)
+    return doc
 
 
 @app.get('/internal/anonymization/documents/{document_id}')
@@ -912,17 +944,27 @@ def add_mapping(document_id: str, body: MappingRequest, x_internal_service_token
     positions = [m.start() for m in re.finditer(re.escape(body.original_value), doc.get('original_text', ''))]
     if not positions:
         return anonymization_result_response(doc)
+    entity_class = 'PERSON' if body.entity_type in {'PERSON_FULL_NAME', 'PERSON'} else body.entity_type
     if body.mode == 'existing':
         target = next((e for e in doc.get('entities', []) if e.get('placeholder') == body.placeholder or e.get('entity_id') == body.placeholder), None)
         if not target:
             _error(400, 'BAD_REQUEST', 'Целевая сущность не найдена')
-        for pos in positions:
-            target.setdefault('mentions', []).append({'mention_id': str(uuid.uuid4()), 'entity_id': target['entity_id'], 'surface_value': body.original_value, 'start': pos, 'end': pos + len(body.original_value), 'replacement_value': target.get('placeholder')})
     else:
-        ent = {'entity_id': str(uuid.uuid4()), 'document_id': document_id, 'entity_class': body.entity_type, 'canonical_value': body.original_value, 'normalized_value': body.original_value, 'redaction_decision': 'REDACT', 'mentions': []}
-        for pos in positions:
-            ent['mentions'].append({'mention_id': str(uuid.uuid4()), 'entity_id': ent['entity_id'], 'surface_value': body.original_value, 'start': pos, 'end': pos + len(body.original_value), 'replacement_value': ''})
-        doc.setdefault('entities', []).append(ent)
+        target = next((e for e in doc.get('entities', []) if e.get('entity_class') == entity_class and (e.get('canonical_value') == body.original_value or e.get('normalized_value') == body.original_value)), None)
+        if not target:
+            target = {'entity_id': str(uuid.uuid4()), 'document_id': document_id, 'entity_class': entity_class, 'canonical_value': body.original_value, 'normalized_value': body.original_value, 'redaction_decision': 'REDACT', 'mentions': []}
+            doc.setdefault('entities', []).append(target)
+    existing_ranges = {(m.get('start'), m.get('end')) for m in target.get('mentions', [])}
+    for pos in positions:
+        rng = (pos, pos + len(body.original_value))
+        if rng in existing_ranges:
+            continue
+        target.setdefault('mentions', []).append({'mention_id': str(uuid.uuid4()), 'entity_id': target['entity_id'], 'surface_value': body.original_value, 'start': pos, 'end': pos + len(body.original_value), 'replacement_value': target.get('placeholder') or ''})
+    target['mentions_count'] = len(target.get('mentions', []))
+    manual_decisions_by_document_id.setdefault(document_id, {})[f'REDACT_ENTITY::{entity_class}::{body.original_value}'] = {
+        'decision_id': str(uuid.uuid4()), 'document_id': document_id, 'decision_type': 'REDACT_ENTITY',
+        'entity_id': target['entity_id'], 'canonical_value': target.get('canonical_value'), 'payload': {'mode': body.mode}, 'created_at': now_iso(), 'updated_at': now_iso(),
+    }
     rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
     return anonymization_result_response(doc)
 
@@ -959,13 +1001,17 @@ def delete_mapping(document_id: str, mapping_id: str, x_internal_service_token: 
         _error(404, 'NOT_FOUND', 'Элемент таблицы соответствия не найден')
     entity_key = mapping.get('cluster_id') or f"{mapping.get('entity_class', mapping.get('entity_type','OTHER'))}::{mapping.get('normalized_value', mapping.get('original_value',''))}"
     manual_decisions_by_document_id.setdefault(document_id, {})[entity_key] = {'entity_key': entity_key, 'decision': 'FORCE_KEEP', 'target_cluster_id': None, 'reason': 'Оставлено пользователем', 'created_at': now_iso(), 'updated_at': now_iso()}
-    doc['mappings'] = [m for m in mappings if m.get('id') != mapping_id]
+    kept = doc.setdefault('kept_entities', [])
+    redacted = []
     for e in doc.get('entities', []):
         if e.get('entity_id') == mapping_id:
             e['redaction_decision'] = 'KEEP'
-    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
-    manual_mappings_by_document_id[document_id] = [m for m in doc['mappings'] if m.get('source') == 'manual']
-    return {'document_id': document_id, 'anonymized_text': doc.get('anonymized_text', ''), 'mappings': doc['mappings']}
+            kept.append(e)
+        else:
+            redacted.append(e)
+    rebuild_document_from_entities(document_id, redacted, kept, doc.get('original_text', ''), doc.get('original_content'))
+    manual_mappings_by_document_id[document_id] = [m for m in doc.get('mappings', []) if m.get('source') == 'manual']
+    return anonymization_result_response(doc)
 
 
 @app.post('/internal/anonymization/documents/{document_id}/mappings/merge')
@@ -997,18 +1043,6 @@ def repair_placeholders(document_id: str, x_internal_service_token: str | None =
     if document_id not in restored_docs:
         _error(404, 'NOT_FOUND', 'Документ не найден')
     doc = restored_docs[document_id]
-    mappings = ensure_document_mappings(document_id)
-    counters = defaultdict(int)
-    by_cluster = {}
-    for m in mappings:
-        cluster = m.get('cluster_id') or f"{m.get('entity_class','OTHER')}::{m.get('normalized_value', m.get('original_value',''))}"
-        et = m.get('entity_class') or m.get('entity_type') or 'OTHER'
-        prefix = 'ФИО' if et == 'PERSON' else make_placeholder(et, 0)[:-1]
-        if cluster not in by_cluster:
-            counters[prefix]+=1
-            by_cluster[cluster]=f"{prefix}{counters[prefix]}"
-        m['placeholder']=by_cluster[cluster]
-    doc['mappings']=mappings
     rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
     audit_log.append({'id': str(uuid.uuid4()), 'document_id': document_id, 'action': 'REPAIR_PLACEHOLDERS', 'created_at': now_iso(), 'details': {}})
     return anonymization_result_response(doc)
@@ -1150,7 +1184,7 @@ def patch_entity(document_id: str, entity_id: str, body: EntityPatchRequest, x_i
         'decision_id': str(uuid.uuid4()), 'document_id': document_id, 'decision_type': 'UPDATE_ENTITY_ROLE',
         'entity_id': entity_id, 'payload': body.model_dump(exclude_unset=True), 'created_at': now_iso(), 'updated_at': now_iso(),
     }
-    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('original_text', ''), doc.get('original_content'))
+    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
     return anonymization_result_response(doc)
 
 

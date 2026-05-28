@@ -1162,7 +1162,17 @@ async def restored(case_id: str, authorization: str | None = Header(None)):
     ds = [d for d in docs if d['case_id'] == case_id]
     out = []
     for d in ds:
-        if d.get('original_text') is not None:
+        restored_payload = None
+        try:
+            async with httpx.AsyncClient() as cl:
+                rr = await cl.get(f'{ANON}/internal/anonymization/documents/{d["id"]}/restored', headers={'X-Internal-Service-Token': INTERNAL})
+            if rr.status_code < 400:
+                restored_payload = rr.json()
+        except Exception:
+            restored_payload = None
+        if restored_payload:
+            out.append({'document_id': d['id'], 'title': d['title'], **restored_payload})
+        else:
             out.append({
                 'document_id': d['id'],
                 'title': d['title'],
@@ -1173,9 +1183,5 @@ async def restored(case_id: str, authorization: str | None = Header(None)):
                 'content_format': d.get('content_format', 'PLAIN_TEXT'),
                 'mappings': d.get('mappings', []),
             })
-        else:
-            async with httpx.AsyncClient() as cl:
-                rr = await cl.get(f'{ANON}/internal/anonymization/documents/{d["id"]}/restored', headers={'X-Internal-Service-Token': INTERNAL})
-            out.append({'document_id': d['id'], 'title': d['title'], **rr.json()})
     audit(c.get('sub'), 'VIEW_RESTORED_CASE', 'CASE', case_id)
     return {'case': cs, 'documents': out}
