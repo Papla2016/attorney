@@ -2718,3 +2718,44 @@ def test_merge_entities_validates_sources_before_mutation():
     assert response.status_code == 400
     assert main.restored_docs[doc_id] == before_doc
     assert main.manual_decisions_by_document_id.get(doc_id, {}) == before_decisions
+
+def test_merge_entities_plain_text_does_not_corrupt_longer_placeholder():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'merge-plain-placeholder-prefix-doc'
+
+    doc = _merge_entities_doc(
+        main,
+        doc_id,
+        working_text='ФИО2 явился. ФИО1 сказал. ФИО10 подписал документ.',
+        working_content_marker=None,
+    )
+
+    target = next(e for e in doc['entities'] if e['entity_id'] == 'merge-person-1')
+    source = next(e for e in doc['entities'] if e['entity_id'] == 'merge-person-2')
+
+    target['placeholder'] = 'ФИО2'
+    target['mentions'][0]['replacement_value'] = 'ФИО2'
+
+    source['placeholder'] = 'ФИО1'
+    source['mentions'][0]['replacement_value'] = 'ФИО1'
+
+    doc['anonymized_text'] = doc['working_text']
+    doc['mappings'] = main.build_mappings_from_entities(doc['entities'])
+
+    response = _merge_post(
+        client,
+        main,
+        doc_id,
+        target='merge-person-1',
+        sources=['merge-person-2'],
+    )
+
+    assert response.status_code == 200
+    assert response.json()['anonymized_text'] == (
+        'ФИО2 явился. ФИО2 сказал. ФИО10 подписал документ.'
+    )
+    assert 'ФИО20' not in response.json()['anonymized_text']

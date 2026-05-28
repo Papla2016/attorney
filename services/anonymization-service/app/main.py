@@ -1970,10 +1970,17 @@ def merge_entities(document_id: str, body: EntityMergeRequest, x_internal_servic
         doc['review_entities'] = [e for e in doc.get('entities', []) if e.get('requires_review')]
     elif has_working_revision:
         updated_text = doc.get('working_text') or ''
+        target_placeholder = target.get('placeholder') or ''
+
         for source in sources:
             source_placeholder = source.get('placeholder') or ''
             if source_placeholder:
-                updated_text = updated_text.replace(source_placeholder, target.get('placeholder') or '')
+                updated_text = re.sub(
+                    rf'(?<!\w){re.escape(source_placeholder)}(?!\w)',
+                    target_placeholder,
+                    updated_text,
+                )
+
         doc['entities'] = merged_entities
         doc['working_text'] = updated_text
         doc['anonymized_text'] = updated_text
