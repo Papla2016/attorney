@@ -957,3 +957,485 @@ def test_merge_with_existing_pending_group_merges_multiple_forms(monkeypatch):
     content_placeholders = _redaction_placeholders(payload['anonymized_content'])
     assert content_placeholders.count('ФИО1') == 2
     assert payload['pending_review'] == []
+
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'draft-merge-candidates-entity-id-doc'
+    existing = 'Макаров Антон Сергеевич'
+    pending = 'Макаров А.С.'
+    working_text = f'ФИО1 явился. {pending} представил документы.'
+    start = working_text.index(pending)
+
+    main.restored_docs.pop(doc_id, None)
+    main.pending_review_by_document_id.pop(doc_id, None)
+
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': f'{existing} явился.',
+        'anonymized_text': 'ФИО1 явился.',
+        'entities': [{
+            'entity_id': 'person-e1',
+            'document_id': doc_id,
+            'entity_class': 'PERSON',
+            'canonical_value': existing,
+            'normalized_value': existing,
+            'placeholder': 'ФИО1',
+            'redaction_decision': 'REDACT',
+            'mentions': [],
+        }],
+        'kept_entities': [],
+        'mappings': [],
+    }
+
+    async def fake_extract_entities(_text):
+        return [{
+            'type': 'PERSON_FULL_NAME',
+            'text': pending,
+            'normalized_text': pending,
+            'start': start,
+            'end': start + len(pending),
+        }]
+
+    monkeypatch.setattr(main, 'extract_entities', fake_extract_entities)
+
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/draft-scan',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={
+            'text': working_text,
+            'content': None,
+            'content_format': 'PLAIN_TEXT',
+            'document_revision': 1,
+        },
+    )
+
+    assert response.status_code == 200
+
+    candidate = response.json()['pending_review'][0]['merge_candidates'][0]
+
+    assert candidate['entity_id'] == 'person-e1'
+    assert candidate['placeholder'] == 'ФИО1'
+    assert 'cluster_id' not in candidate
+
+
+def test_merge_with_existing_pending_adds_mention_to_entity(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'draft-merge-pending-mention-doc'
+    existing = 'Макаров Антон Сергеевич'
+    pending = 'Макаров А.С.'
+    working_text = f'ФИО1 явился. {pending} представил документы.'
+    start = working_text.index(pending)
+
+    main.restored_docs.pop(doc_id, None)
+    main.pending_review_by_document_id.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': f'{existing} явился.',
+        'anonymized_text': 'ФИО1 явился.',
+        'entities': [{
+            'entity_id': 'person-e1',
+            'document_id': doc_id,
+            'entity_class': 'PERSON',
+            'canonical_value': existing,
+            'normalized_value': existing,
+            'placeholder': 'ФИО1',
+            'redaction_decision': 'REDACT',
+            'mentions': [{
+                'mention_id': 'm-existing',
+                'entity_id': 'person-e1',
+                'surface_value': existing,
+                'normalized_value': existing,
+                'start': 0,
+                'end': len(existing),
+                'replacement_value': 'ФИО1',
+            }],
+        }],
+        'kept_entities': [],
+        'mappings': [],
+    }
+
+    async def fake_extract_entities(_text):
+        return [{
+            'type': 'PERSON_FULL_NAME',
+            'text': pending,
+            'normalized_text': pending,
+            'start': start,
+            'end': start + len(pending),
+        }]
+
+    monkeypatch.setattr(main, 'extract_entities', fake_extract_entities)
+
+    scan = client.post(
+        f'/internal/anonymization/documents/{doc_id}/draft-scan',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={
+            'text': working_text,
+            'content': None,
+            'content_format': 'PLAIN_TEXT',
+            'document_revision': 1,
+        },
+    )
+
+    assert scan.status_code == 200
+
+    entity_key = scan.json()['pending_review'][0]['entity_key']
+
+    decision = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={
+            'selected_text': pending,
+            'entity_class': 'PERSON',
+            'entity_key': entity_key,
+            'decision': 'MERGE_WITH_EXISTING',
+            'target_entity_id': 'person-e1',
+        },
+    )
+
+    assert decision.status_code == 200
+
+    payload = decision.json()
+
+    assert len(payload['entities']) == 1
+
+    entity = payload['entities'][0]
+
+    assert any(
+        mention['surface_value'] == pending
+        for mention in entity['mentions']
+    )
+
+    assert pending not in payload['anonymized_text']
+    assert 'ФИО1 представил документы' in payload['anonymized_text']
+    assert len(payload['mappings']) == 1
+    assert pending not in [mapping['original_value'] for mapping in payload['mappings']]
+    assert payload['pending_review'] == []
+
+
+def test_merge_with_existing_pending_group_merges_multiple_forms(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'draft-merge-pending-group-doc'
+    existing = 'Макаров Антон Сергеевич'
+    first = 'Макаров А.С.'
+    second = 'Макаровым Антоном Сергеевичем'
+    pending_normalized = 'Макаров А.С.'
+
+    working_text = (
+        f'ФИО1 явился. '
+        f'{first} пояснил. '
+        f'{second} представлены документы.'
+    )
+
+    content = {
+        'type': 'doc',
+        'content': [{
+            'type': 'paragraph',
+            'content': [{
+                'type': 'text',
+                'text': working_text,
+            }],
+        }],
+    }
+
+    start_first = working_text.index(first)
+    start_second = working_text.index(second)
+
+    main.restored_docs.pop(doc_id, None)
+    main.pending_review_by_document_id.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': f'{existing} явился.',
+        'anonymized_text': 'ФИО1 явился.',
+        'entities': [{
+            'entity_id': 'person-e1',
+            'document_id': doc_id,
+            'entity_class': 'PERSON',
+            'canonical_value': existing,
+            'normalized_value': existing,
+            'placeholder': 'ФИО1',
+            'redaction_decision': 'REDACT',
+            'mentions': [],
+        }],
+        'kept_entities': [],
+        'mappings': [],
+    }
+
+    async def fake_extract_entities(_text):
+        return [
+            {
+                'type': 'PERSON_FULL_NAME',
+                'text': first,
+                'normalized_text': pending_normalized,
+                'start': start_first,
+                'end': start_first + len(first),
+            },
+            {
+                'type': 'PERSON_FULL_NAME',
+                'text': second,
+                'normalized_text': pending_normalized,
+                'start': start_second,
+                'end': start_second + len(second),
+            },
+        ]
+
+    monkeypatch.setattr(main, 'extract_entities', fake_extract_entities)
+
+    scan = client.post(
+        f'/internal/anonymization/documents/{doc_id}/draft-scan',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={
+            'text': working_text,
+            'content': content,
+            'content_format': 'TIPTAP_JSON',
+            'document_revision': 1,
+        },
+    )
+
+    assert scan.status_code == 200
+
+    entity_key = scan.json()['pending_review'][0]['entity_key']
+
+    decision = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={
+            'selected_text': first,
+            'entity_class': 'PERSON',
+            'entity_key': entity_key,
+            'decision': 'MERGE_WITH_EXISTING',
+            'target_entity_id': 'person-e1',
+        },
+    )
+
+    assert decision.status_code == 200
+
+    payload = decision.json()
+
+    assert len(payload['entities']) == 1
+
+    surfaces = {
+        mention['surface_value']
+        for mention in payload['entities'][0]['mentions']
+    }
+
+    assert {first, second}.issubset(surfaces)
+    assert first not in payload['anonymized_text']
+    assert second not in payload['anonymized_text']
+    assert payload['anonymized_text'].count('ФИО1') >= 3
+
+    content_placeholders = _redaction_placeholders(payload['anonymized_content'])
+
+    assert content_placeholders.count('ФИО1') == 2
+    assert payload['pending_review'] == []
+    
+def test_pending_redact_groups_all_surface_forms_of_same_entity_key():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'pending-same-person-redact-doc'
+
+    first = 'Макарова Антона Сергеевича'
+    second = 'Макаровым Антоном Сергеевичем'
+    third = 'Макаров А.С.'
+    normalized = 'Макаров Антон Сергеевич'
+    entity_key = 'PERSON::макаров антон сергеевич'
+
+    working_text = (
+        f'{first} вызвали в суд. '
+        f'{second} представлены документы. '
+        f'{third} пояснил.'
+    )
+
+    content = {
+        'type': 'doc',
+        'content': [
+            {
+                'type': 'paragraph',
+                'content': [
+                    {'type': 'text', 'text': working_text}
+                ],
+            }
+        ],
+    }
+
+    main.restored_docs.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    main.pending_review_by_document_id.pop(doc_id, None)
+
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': 'Исходный защищённый документ.',
+        'anonymized_text': working_text,
+        'working_text': working_text,
+        'working_content': content,
+        'mappings': [],
+        'entities': [],
+        'kept_entities': [],
+    }
+
+    pending = []
+    for surface in (first, second, third):
+        start = working_text.index(surface)
+        pending.append({
+            'entity_key': entity_key,
+            'surface_value': surface,
+            'normalized_value': normalized,
+            'entity_class': 'PERSON',
+            'person_role': 'UNKNOWN',
+            'start': start,
+            'end': start + len(surface),
+            'reason': 'В изменённом тексте найдено новое значение, требующее проверки',
+        })
+
+    main.pending_review_by_document_id[doc_id] = pending
+    main.restored_docs[doc_id]['pending_review'] = pending
+
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={
+            'selected_text': first,
+            'entity_class': 'PERSON',
+            'entity_key': entity_key,
+            'decision': 'REDACT',
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert first not in payload['anonymized_text']
+    assert second not in payload['anonymized_text']
+    assert third not in payload['anonymized_text']
+
+    entity = next(
+        e for e in payload['entities']
+        if e.get('entity_key') == entity_key
+    )
+
+    assert entity['mentions_count'] == 3
+    assert {
+        mention['surface_value']
+        for mention in entity['mentions']
+    } == {first, second, third}
+
+    placeholder = entity['placeholder']
+    assert payload['anonymized_text'].count(placeholder) == 3
+    assert payload['pending_review'] == []
+
+    restored_content = main.restore_content_from_mentions(
+        payload['anonymized_content'],
+        payload['entities'],
+    )
+
+    assert _content_text(restored_content) == working_text
+
+
+def test_pending_keep_keeps_all_surface_forms_of_same_entity_key():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'pending-same-person-keep-doc'
+
+    first = 'Макарова Антона Сергеевича'
+    second = 'Макаровым Антоном Сергеевичем'
+    normalized = 'Макаров Антон Сергеевич'
+    entity_key = 'PERSON::макаров антон сергеевич'
+
+    working_text = f'{first} вызвали. {second} представлены документы.'
+
+    content = {
+        'type': 'doc',
+        'content': [
+            {
+                'type': 'paragraph',
+                'content': [
+                    {'type': 'text', 'text': working_text}
+                ],
+            }
+        ],
+    }
+
+    main.restored_docs.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    main.pending_review_by_document_id.pop(doc_id, None)
+
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': 'Исходный защищённый документ.',
+        'anonymized_text': working_text,
+        'working_text': working_text,
+        'working_content': content,
+        'anonymized_content': content,
+        'mappings': [],
+        'entities': [],
+        'kept_entities': [],
+    }
+
+    pending = []
+    for surface in (first, second):
+        start = working_text.index(surface)
+        pending.append({
+            'entity_key': entity_key,
+            'surface_value': surface,
+            'normalized_value': normalized,
+            'entity_class': 'PERSON',
+            'person_role': 'UNKNOWN',
+            'start': start,
+            'end': start + len(surface),
+            'reason': 'В изменённом тексте найдено новое значение, требующее проверки',
+        })
+
+    main.pending_review_by_document_id[doc_id] = pending
+    main.restored_docs[doc_id]['pending_review'] = pending
+
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={
+            'selected_text': first,
+            'entity_class': 'PERSON',
+            'entity_key': entity_key,
+            'decision': 'KEEP',
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert payload['anonymized_text'] == working_text
+    assert first in payload['anonymized_text']
+    assert second in payload['anonymized_text']
+    assert payload['pending_review'] == []
+
+    decision = main.manual_decisions_by_document_id[doc_id][entity_key]
+    assert decision['decision_type'] == 'KEEP_ENTITY'
