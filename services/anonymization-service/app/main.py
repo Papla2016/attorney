@@ -232,6 +232,33 @@ def store_keep_redact_decision(document_id: str, decision_type: str, entity: dic
     return decision
 
 
+def build_split_operation_key(source_entity_key: str, mention_locator: dict) -> str:
+    return (
+        'SPLIT_MENTION::'
+        + str(source_entity_key)
+        + '::'
+        + str(mention_locator.get('start'))
+        + '::'
+        + str(mention_locator.get('end'))
+        + '::'
+        + str(mention_locator.get('surface_value'))
+    )
+
+
+def build_split_origin(source_entity_key: str, mention_locator: dict) -> dict:
+    locator = {
+        'surface_value': mention_locator.get('surface_value'),
+        'normalized_value': mention_locator.get('normalized_value') or mention_locator.get('surface_value'),
+        'start': mention_locator.get('start'),
+        'end': mention_locator.get('end'),
+    }
+    return {
+        'split_key': build_split_operation_key(source_entity_key, locator),
+        'source_entity_key': source_entity_key,
+        'mention_locator': locator,
+    }
+
+
 def store_entity_metadata_decision(document_id: str, source_entity_key: str, entity: dict) -> dict:
     now = now_iso()
     decisions = manual_decisions_by_document_id.setdefault(document_id, {})
@@ -247,6 +274,45 @@ def store_entity_metadata_decision(document_id: str, source_entity_key: str, ent
             'person_role': entity.get('person_role'),
             'context_label': entity.get('context_label'),
         },
+        'created_at': existing.get('created_at') or now,
+        'updated_at': now,
+    }
+    decisions[decision_key] = decision
+    return decision
+
+
+def store_split_entity_metadata_decision(document_id: str, entity: dict) -> dict:
+    split_origin = entity.get('split_origin') or {}
+    split_key = split_origin.get('split_key')
+    source_entity_key = split_origin.get('source_entity_key')
+    locator = split_origin.get('mention_locator') or {}
+    if not split_key or not source_entity_key or not locator:
+        source_entity_key = source_entity_key or entity_semantic_key(entity)
+        first_mention = next(iter(entity.get('mentions', []) or []), {})
+        locator = locator or mention_locator_from_mention(first_mention)
+        split_key = build_split_operation_key(source_entity_key, locator)
+    now = now_iso()
+    decisions = manual_decisions_by_document_id.setdefault(document_id, {})
+    decision_key = f'UPDATE_SPLIT_ENTITY_METADATA::{split_key}'
+    existing = decisions.get(decision_key, {})
+    decision = {
+        'decision_id': existing.get('decision_id') or str(uuid.uuid4()),
+        'document_id': document_id,
+        'decision_type': 'UPDATE_SPLIT_ENTITY_METADATA',
+        'split_key': split_key,
+        'split_source_entity_key': source_entity_key,
+        'mention_locator': {
+            'surface_value': locator.get('surface_value'),
+            'normalized_value': locator.get('normalized_value') or locator.get('surface_value'),
+            'start': locator.get('start'),
+            'end': locator.get('end'),
+        },
+        'payload': {
+            'canonical_value': entity.get('canonical_value'),
+            'person_role': entity.get('person_role'),
+            'context_label': entity.get('context_label'),
+        },
+        'entity_id': entity.get('entity_id'),
         'created_at': existing.get('created_at') or now,
         'updated_at': now,
     }
@@ -880,7 +946,7 @@ def mention_locator_from_mention(mention: dict) -> dict:
 def store_split_mention_decision(document_id: str, source_entity_key: str, source_entity_id: str, mention: dict, target_entity_id: str) -> dict:
     now = now_iso()
     locator = mention_locator_from_mention(mention)
-    decision_key = f"SPLIT_MENTION::{source_entity_key}::{locator.get('start')}::{locator.get('end')}::{locator.get('surface_value')}"
+    decision_key = build_split_operation_key(source_entity_key, locator)
     decisions = manual_decisions_by_document_id.setdefault(document_id, {})
     existing = decisions.get(decision_key, {})
     decision = {
@@ -899,7 +965,7 @@ def store_split_mention_decision(document_id: str, source_entity_key: str, sourc
     return decision
 
 
-def split_entity_mention_in_state(document_id: str, entities: list[dict], source_entity: dict, mention: dict) -> tuple[list[dict], dict]:
+def split_entity_mention_in_state(document_id: str, entities: list[dict], source_entity: dict, mention: dict, source_entity_key: str | None = None) -> tuple[list[dict], dict]:
     original_placeholder = source_entity.get('placeholder')
     remaining_mentions = [m for m in source_entity.get('mentions', []) if m.get('mention_id') != mention.get('mention_id')]
     split_singleton = not remaining_mentions
@@ -919,6 +985,8 @@ def split_entity_mention_in_state(document_id: str, entities: list[dict], source
     new_entity['mentions_count'] = 1
     new_entity['created_at'] = now_iso()
     new_entity['updated_at'] = now_iso()
+    split_source_key = source_entity_key or entity_semantic_key(source_entity)
+    new_entity['split_origin'] = build_split_origin(split_source_key, mention_locator_from_mention(mention))
 
     if split_singleton:
         updated_entities = [e for e in entities if e is not source_entity and e.get('entity_id') != source_entity.get('entity_id')]
@@ -1016,7 +1084,7 @@ def apply_split_mention_decisions(document_id: str, redacted_entities: list[dict
         mention = next((m for m in source_entity.get('mentions', []) if split_mention_locator_matches(m, locator)), None)
         if not mention:
             continue
-        entities, _new_entity = split_entity_mention_in_state(document_id, entities, source_entity, mention)
+        entities, _new_entity = split_entity_mention_in_state(document_id, entities, source_entity, mention, source_entity_key)
     return entities
 
 
@@ -1097,6 +1165,28 @@ def apply_manual_decisions(document_id: str, resolved: list[dict]) -> list[dict]
 
 def _find_entity_by_semantic_key(entities: list[dict], entity_key: str) -> dict | None:
     return next((e for e in entities if e.get('entity_key') == entity_key or entity_semantic_key(e) == entity_key), None)
+
+
+def apply_split_entity_metadata_decisions(document_id: str, redacted_entities: list[dict]) -> list[dict]:
+    decisions = [d for d in manual_decisions_by_document_id.get(document_id, {}).values() if d.get('decision_type') == 'UPDATE_SPLIT_ENTITY_METADATA']
+    by_split_key = {
+        (entity.get('split_origin') or {}).get('split_key'): entity
+        for entity in redacted_entities
+        if (entity.get('split_origin') or {}).get('split_key')
+    }
+    for decision in decisions:
+        split_key = decision.get('split_key')
+        if not split_key:
+            continue
+        ent = by_split_key.get(split_key)
+        if not ent:
+            continue
+        payload = decision.get('payload') or {}
+        for field in ('canonical_value', 'person_role', 'context_label'):
+            if field in payload:
+                ent[field] = payload.get(field)
+        ent['updated_at'] = now_iso()
+    return redacted_entities
 
 
 def apply_entity_metadata_decisions(document_id: str, redacted_entities: list[dict], kept_entities: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -1534,6 +1624,7 @@ async def reanonymize(document_id: str, body: ReanonymizeRequest, x_internal_ser
     entities_view, recognized_but_kept = apply_keep_redact_entity_decisions(document_id, entities_view, recognized_but_kept, original_text)
     entities_view, recognized_but_kept = apply_entity_metadata_decisions(document_id, entities_view, recognized_but_kept)
     entities_view = apply_split_mention_decisions(document_id, entities_view)
+    entities_view = apply_split_entity_metadata_decisions(document_id, entities_view)
     entities_view = apply_merge_entity_decisions(document_id, entities_view)
     review_entities = [e for e in entities_view if e.get('requires_review')]
     rebuilt = rebuild_document_from_entities(document_id, entities_view, recognized_but_kept, original_text, doc.get('original_content'))
@@ -1858,11 +1949,15 @@ def patch_entity(document_id: str, entity_id: str, body: EntityPatchRequest, x_i
     if not ent:
         _error(404, 'NOT_FOUND', 'Сущность не найдена')
 
+    split_origin = ent.get('split_origin')
     source_entity_key = entity_semantic_key(ent)
     for k, v in body.model_dump(exclude_unset=True).items():
         ent[k] = v
     ent['updated_at'] = now_iso()
-    store_entity_metadata_decision(document_id, source_entity_key, ent)
+    if split_origin:
+        store_split_entity_metadata_decision(document_id, ent)
+    else:
+        store_entity_metadata_decision(document_id, source_entity_key, ent)
 
     has_working_revision = (
         doc.get('working_text') is not None
@@ -2043,7 +2138,7 @@ def split_mention(document_id: str, entity_id: str, mention_id: str, x_internal_
                 },
             )
             
-    updated_entities, new_ent = split_entity_mention_in_state(document_id, doc.get('entities', []), src, mention)
+    updated_entities, new_ent = split_entity_mention_in_state(document_id, doc.get('entities', []), src, mention, source_entity_key)
     store_split_mention_decision(document_id, source_entity_key, entity_id, mention, new_ent['entity_id'])
 
     if has_working_revision and doc.get('working_content') is not None:

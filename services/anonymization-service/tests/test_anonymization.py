@@ -2759,3 +2759,238 @@ def test_merge_entities_plain_text_does_not_corrupt_longer_placeholder():
         'ФИО2 явился. ФИО2 сказал. ФИО10 подписал документ.'
     )
     assert 'ФИО20' not in response.json()['anonymized_text']
+
+def _patch_split_created_entity(client, main, doc_id, entity_id):
+    return client.patch(
+        f'/internal/anonymization/documents/{doc_id}/entities/{entity_id}',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={
+            'canonical_value': 'Алексеев Александр Сергеевич',
+            'person_role': 'WITNESS',
+            'context_label': 'Свидетель',
+        },
+    )
+
+
+def _split_created_entity(payload):
+    return next(e for e in payload['entities'] if e['entity_id'] != 'person-1')
+
+
+def test_patch_split_created_entity_stores_split_metadata_decision():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'split-metadata-decision-doc'
+    _split_doc(main, doc_id)
+
+    split_response = _split_post(client, main, doc_id)
+    assert split_response.status_code == 200
+    new_entity = _split_created_entity(split_response.json())
+
+    patch_response = _patch_split_created_entity(client, main, doc_id, new_entity['entity_id'])
+
+    assert patch_response.status_code == 200
+    decisions = list(main.manual_decisions_by_document_id[doc_id].values())
+    split_metadata = [d for d in decisions if d['decision_type'] == 'UPDATE_SPLIT_ENTITY_METADATA']
+    assert len(split_metadata) == 1
+    decision = split_metadata[0]
+    assert decision['split_key'] == new_entity['split_origin']['split_key']
+    assert decision['mention_locator'] == new_entity['split_origin']['mention_locator']
+    assert decision['payload'] == {
+        'canonical_value': 'Алексеев Александр Сергеевич',
+        'person_role': 'WITNESS',
+        'context_label': 'Свидетель',
+    }
+    assert decision['entity_id'] == new_entity['entity_id']
+    assert not any(d['decision_type'] == 'UPDATE_ENTITY_METADATA' for d in decisions)
+
+
+def test_split_created_entity_metadata_survives_original_based_reanonymize(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'split-metadata-original-reanon-doc'
+    original_text, _ = _split_original_content()
+    _split_doc(main, doc_id)
+
+    split_response = _split_post(client, main, doc_id)
+    assert split_response.status_code == 200
+    old_new_entity = _split_created_entity(split_response.json())
+    patch_response = _patch_split_created_entity(client, main, doc_id, old_new_entity['entity_id'])
+    assert patch_response.status_code == 200
+
+    async def fake_extract_entities(text):
+        assert text == original_text
+        return [
+            {
+                'type': 'PERSON_FULL_NAME',
+                'text': 'Макаров Антон Сергеевич',
+                'normalized_text': 'Макаров Антон Сергеевич',
+                'start': original_text.index('Макаров Антон Сергеевич'),
+                'end': original_text.index('Макаров Антон Сергеевич') + len('Макаров Антон Сергеевич'),
+                'source': 'natasha',
+            },
+            {
+                'type': 'PERSON_FULL_NAME',
+                'text': 'Макаров А.С.',
+                'normalized_text': 'Макаров А.С.',
+                'start': original_text.index('Макаров А.С.'),
+                'end': original_text.index('Макаров А.С.') + len('Макаров А.С.'),
+                'source': 'natasha',
+            },
+        ]
+
+    monkeypatch.setattr(main, 'extract_entities', fake_extract_entities)
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/reanonymize',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'mappings': []},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload['entities']) == 2
+    source_entity = next(e for e in payload['entities'] if e['mentions'][0]['surface_value'] == 'Макаров Антон Сергеевич')
+    split_entity = next(e for e in payload['entities'] if e['mentions'][0]['surface_value'] == 'Макаров А.С.')
+    assert source_entity['canonical_value'] != 'Алексеев Александр Сергеевич'
+    assert source_entity.get('person_role') != 'WITNESS'
+    assert source_entity.get('context_label') != 'Свидетель'
+    assert split_entity['canonical_value'] == 'Алексеев Александр Сергеевич'
+    assert split_entity['person_role'] == 'WITNESS'
+    assert split_entity['context_label'] == 'Свидетель'
+    assert source_entity['placeholder'] != split_entity['placeholder']
+    assert source_entity['placeholder'] in payload['anonymized_text']
+    assert split_entity['placeholder'] in payload['anonymized_text']
+    assert split_entity['entity_id'] != old_new_entity['entity_id']
+
+
+def test_split_created_entity_metadata_survives_working_reanonymize():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'split-metadata-working-reanon-doc'
+    original_text, original_content = _split_original_content()
+    working_text = 'ФИО1 явился. ФИО1 представил документы.'
+    working_content = _split_rich_content()
+    _split_doc(main, doc_id, working_text=working_text, working_content=working_content)
+
+    split_response = _split_post(client, main, doc_id)
+    assert split_response.status_code == 200
+    split_payload = split_response.json()
+    new_entity = _split_created_entity(split_payload)
+    after_split_working_text = main.restored_docs[doc_id]['working_text']
+    after_split_working_content = main.restored_docs[doc_id]['working_content']
+
+    patch_response = _patch_split_created_entity(client, main, doc_id, new_entity['entity_id'])
+    assert patch_response.status_code == 200
+    assert main.restored_docs[doc_id]['working_text'] == after_split_working_text
+    assert main.restored_docs[doc_id]['working_content'] == after_split_working_content
+
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/reanonymize',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'mappings': []},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    source_entity = next(e for e in payload['entities'] if e['entity_id'] == 'person-1')
+    split_entity = next(e for e in payload['entities'] if e['entity_id'] == new_entity['entity_id'])
+    assert payload['anonymized_text'] == 'ФИО1 явился. ФИО2 представил документы.'
+    assert payload['anonymized_content']['content'][0]['content'][2]['text'] == 'ФИО2'
+    assert split_entity['canonical_value'] == 'Алексеев Александр Сергеевич'
+    assert split_entity['person_role'] == 'WITNESS'
+    assert split_entity['context_label'] == 'Свидетель'
+    assert source_entity['canonical_value'] != 'Алексеев Александр Сергеевич'
+    assert source_entity.get('person_role') != 'WITNESS'
+    assert source_entity.get('context_label') != 'Свидетель'
+    assert split_entity['split_origin'] == new_entity['split_origin']
+    assert main.restored_docs[doc_id]['original_text'] == original_text
+    assert main.restored_docs[doc_id]['original_content'] == original_content
+
+
+def test_apply_split_entity_metadata_does_not_modify_source_entity():
+    from app import main
+    from app.main import apply_split_entity_metadata_decisions, build_split_origin, entity_semantic_key, mention_locator_from_mention
+    import copy
+
+    doc_id = 'split-metadata-helper-doc'
+    original_text, _ = _split_original_content()
+    source = _split_person_entity(doc_id, original_text)
+    split = copy.deepcopy(source)
+    split['entity_id'] = 'split-entity'
+    split['mentions'] = [copy.deepcopy(source['mentions'][1])]
+    split['mentions'][0]['entity_id'] = split['entity_id']
+    split['mentions_count'] = 1
+    source['mentions'] = [source['mentions'][0]]
+    source['mentions_count'] = 1
+    split['split_origin'] = build_split_origin(entity_semantic_key(source), mention_locator_from_mention(split['mentions'][0]))
+    main.manual_decisions_by_document_id[doc_id] = {
+        'decision': {
+            'decision_id': 'decision',
+            'document_id': doc_id,
+            'decision_type': 'UPDATE_SPLIT_ENTITY_METADATA',
+            'split_key': split['split_origin']['split_key'],
+            'split_source_entity_key': split['split_origin']['source_entity_key'],
+            'mention_locator': split['split_origin']['mention_locator'],
+            'payload': {
+                'canonical_value': 'Алексеев Александр Сергеевич',
+                'person_role': 'WITNESS',
+                'context_label': 'Свидетель',
+            },
+            'entity_id': split['entity_id'],
+        }
+    }
+
+    result = apply_split_entity_metadata_decisions(doc_id, [source, split])
+
+    result_source = next(e for e in result if e['entity_id'] == 'person-1')
+    result_split = next(e for e in result if e['entity_id'] == 'split-entity')
+    assert result_split['canonical_value'] == 'Алексеев Александр Сергеевич'
+    assert result_split['person_role'] == 'WITNESS'
+    assert result_split['context_label'] == 'Свидетель'
+    assert result_source['canonical_value'] == 'Макаров Антон Сергеевич'
+    assert result_source['person_role'] == 'UNKNOWN'
+    assert result_source['context_label'] is None
+
+
+def test_public_document_does_not_expose_split_origin():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+    import json
+
+    client = TestClient(app)
+    doc_id = 'split-public-sanitized-doc'
+    _split_doc(main, doc_id, working_text='ФИО1 явился. ФИО1 представил документы.', working_content=_split_rich_content())
+    main.public_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'anonymized_text': main.restored_docs[doc_id]['anonymized_text'],
+        'anonymized_content': main.restored_docs[doc_id]['anonymized_content'],
+        'content_format': 'TIPTAP_JSON',
+        'metadata': {},
+    }
+    split_response = _split_post(client, main, doc_id)
+    assert split_response.status_code == 200
+
+    response = client.get(
+        f'/internal/anonymization/documents/{doc_id}/public',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert 'split_origin' not in serialized
+    assert 'entities' not in payload
+    assert 'redactionMention' not in serialized
+    assert 'entityId' not in serialized
+    assert 'mentionId' not in serialized
