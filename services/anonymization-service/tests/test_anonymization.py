@@ -1756,3 +1756,246 @@ def test_reanonymize_without_working_revision_uses_original_pipeline(monkeypatch
     assert main.restored_docs[doc_id].get('working_text') is None
     assert main.restored_docs[doc_id].get('working_content') is None
     assert main.restored_docs[doc_id]['original_text'] == original_text
+
+
+def _reset_patch_entity_metadata_doc(main, doc_id):
+    main.restored_docs.pop(doc_id, None)
+    main.public_docs.pop(doc_id, None)
+    main.pending_review_by_document_id.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+
+
+def _patch_metadata_person_entity(doc_id, original_text, working_text=None, working_content=None):
+    mentions = [
+        {
+            'mention_id': 'mention-1',
+            'entity_id': 'person-1',
+            'surface_value': 'Макаров А.С.',
+            'normalized_value': 'Макаров А.С.',
+            'start': 0,
+            'end': len('Макаров А.С.'),
+            'replacement_value': 'ФИО1',
+        }
+    ]
+    if working_text and 'представил документы' in working_text:
+        second_start = working_text.index('ФИО1 представил документы')
+        mentions.append({
+            'mention_id': 'mention-2',
+            'entity_id': 'person-1',
+            'surface_value': 'Макаров А.С.',
+            'normalized_value': 'Макаров А.С.',
+            'start': second_start,
+            'end': second_start + len('ФИО1'),
+            'replacement_value': 'ФИО1',
+            'source': 'manual',
+        })
+    return {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': original_text,
+        'original_content': _simple_content(original_text),
+        'anonymized_text': working_text if working_text is not None else 'ФИО1 явился.',
+        'anonymized_content': working_content if working_content is not None else _simple_content('ФИО1 явился.'),
+        'working_text': working_text,
+        'working_content': working_content,
+        'entities': [{
+            'entity_id': 'person-1',
+            'document_id': doc_id,
+            'entity_class': 'PERSON',
+            'canonical_value': 'Макаров А.С.',
+            'normalized_value': 'Макаров А.С.',
+            'person_role': 'UNKNOWN',
+            'context_label': None,
+            'placeholder': 'ФИО1',
+            'redaction_decision': 'REDACT',
+            'requires_review': False,
+            'mentions': mentions,
+        }],
+        'kept_entities': [],
+        'mappings': [],
+        'pending_review': [],
+    }
+
+
+def test_patch_entity_role_preserves_working_revision():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'patch-role-working-doc'
+    original_text = 'Макаров А.С. явился.'
+    working_text = 'ФИО1 явился. ФИО1 представил документы.'
+    working_content = _simple_content(working_text)
+    _reset_patch_entity_metadata_doc(main, doc_id)
+    main.restored_docs[doc_id] = _patch_metadata_person_entity(doc_id, original_text, working_text, working_content)
+
+    response = client.patch(
+        f'/internal/anonymization/documents/{doc_id}/entities/person-1',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'person_role': 'REPRESENTATIVE', 'context_label': 'Представитель ответчика'},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    entity = payload['entities'][0]
+    assert entity['person_role'] == 'REPRESENTATIVE'
+    assert entity['context_label'] == 'Представитель ответчика'
+    assert payload['anonymized_text'] == working_text
+    assert main.restored_docs[doc_id]['working_text'] == working_text
+    assert main.restored_docs[doc_id]['working_content'] == working_content
+    assert len(entity['mentions']) == 2
+    assert {m['mention_id'] for m in entity['mentions']} == {'mention-1', 'mention-2'}
+    assert payload['mappings'][0]['id'] == 'person-1'
+    assert payload['mappings'][0]['placeholder'] == 'ФИО1'
+
+
+def test_patch_entity_canonical_value_preserves_working_content():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'patch-canonical-working-doc'
+    original_text = 'Макаров А.С. явился.'
+    working_text = 'ФИО1 явился.'
+    working_content = _simple_content(working_text)
+    _reset_patch_entity_metadata_doc(main, doc_id)
+    main.restored_docs[doc_id] = _patch_metadata_person_entity(doc_id, original_text, working_text, working_content)
+
+    response = client.patch(
+        f'/internal/anonymization/documents/{doc_id}/entities/person-1',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'canonical_value': 'Макаров Антон Сергеевич'},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['entities'][0]['canonical_value'] == 'Макаров Антон Сергеевич'
+    assert payload['mappings'][0]['original_value'] == 'Макаров Антон Сергеевич'
+    assert main.restored_docs[doc_id]['working_text'] == working_text
+    assert main.restored_docs[doc_id]['working_content'] == working_content
+    assert payload['anonymized_text'] == working_text
+    assert payload['anonymized_content'] == working_content
+    assert 'ФИО1' in main.restored_docs[doc_id]['working_text']
+    assert main.restored_docs[doc_id]['original_text'] == original_text
+
+
+def test_patch_entity_metadata_survives_working_reanonymize():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'patch-metadata-working-reanon-doc'
+    original_text = 'Макаров А.С. явился.'
+    working_text = 'ФИО1 явился. ФИО1 представил документы.'
+    working_content = _simple_content(working_text)
+    _reset_patch_entity_metadata_doc(main, doc_id)
+    main.restored_docs[doc_id] = _patch_metadata_person_entity(doc_id, original_text, working_text, working_content)
+
+    patch_response = client.patch(
+        f'/internal/anonymization/documents/{doc_id}/entities/person-1',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'person_role': 'WITNESS', 'context_label': 'Свидетель'},
+    )
+    assert patch_response.status_code == 200
+
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/reanonymize',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'mappings': []},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    entity = payload['entities'][0]
+    assert payload['anonymized_text'] == working_text
+    assert main.restored_docs[doc_id]['working_text'] == working_text
+    assert entity['person_role'] == 'WITNESS'
+    assert entity['context_label'] == 'Свидетель'
+    assert {m['mention_id'] for m in entity['mentions']} == {'mention-1', 'mention-2'}
+    assert main.restored_docs[doc_id]['original_text'] == original_text
+
+
+def test_patch_entity_metadata_survives_original_based_reanonymize(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'patch-metadata-original-reanon-doc'
+    original_text = 'Макаров А.С. явился.'
+    _reset_patch_entity_metadata_doc(main, doc_id)
+    doc = _patch_metadata_person_entity(doc_id, original_text)
+    doc.pop('working_text', None)
+    doc.pop('working_content', None)
+    main.restored_docs[doc_id] = doc
+
+    patch_response = client.patch(
+        f'/internal/anonymization/documents/{doc_id}/entities/person-1',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={
+            'canonical_value': 'Макаров Антон Сергеевич',
+            'person_role': 'REPRESENTATIVE',
+            'context_label': 'Представитель',
+        },
+    )
+    assert patch_response.status_code == 200
+
+    async def fake_extract_entities(text):
+        assert text == original_text
+        return [{
+            'type': 'PERSON_FULL_NAME',
+            'text': 'Макаров А.С.',
+            'normalized_text': 'Макаров А.С.',
+            'start': 0,
+            'end': len('Макаров А.С.'),
+            'source': 'natasha',
+        }]
+
+    monkeypatch.setattr(main, 'extract_entities', fake_extract_entities)
+
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/reanonymize',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'mappings': []},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    entity = payload['entities'][0]
+    assert entity['entity_id'] != 'person-1'
+    assert entity['canonical_value'] == 'Макаров Антон Сергеевич'
+    assert entity['person_role'] == 'REPRESENTATIVE'
+    assert entity['context_label'] == 'Представитель'
+
+
+def test_update_entity_metadata_decision_uses_source_semantic_key():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app, entity_semantic_key
+
+    client = TestClient(app)
+    doc_id = 'patch-metadata-source-key-doc'
+    original_text = 'Макаров А.С. явился.'
+    _reset_patch_entity_metadata_doc(main, doc_id)
+    doc = _patch_metadata_person_entity(doc_id, original_text)
+    doc.pop('working_text', None)
+    doc.pop('working_content', None)
+    expected_source_key = entity_semantic_key(doc['entities'][0])
+    main.restored_docs[doc_id] = doc
+
+    response = client.patch(
+        f'/internal/anonymization/documents/{doc_id}/entities/person-1',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'canonical_value': 'Макаров Антон Сергеевич'},
+    )
+
+    assert response.status_code == 200
+    decisions = list(main.manual_decisions_by_document_id[doc_id].values())
+    decision = next(d for d in decisions if d['decision_type'] == 'UPDATE_ENTITY_METADATA')
+    assert decision['source_entity_key'] == expected_source_key
+    assert decision['payload']['canonical_value'] == 'Макаров Антон Сергеевич'
+    assert decision.get('entity_id') is None
