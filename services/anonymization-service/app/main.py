@@ -1153,6 +1153,54 @@ async def reanonymize(document_id: str, body: ReanonymizeRequest, x_internal_ser
     if document_id not in restored_docs:
         _error(404, 'NOT_FOUND', 'Документ не найден')
     doc = restored_docs[document_id]
+
+    has_working_revision = (
+        doc.get('working_text') is not None
+        or doc.get('working_content') is not None
+    )
+
+    if has_working_revision:
+        pending_review = pending_review_by_document_id.get(document_id, []) or doc.get('pending_review', [])
+        if pending_review:
+            _error(
+                409,
+                'PENDING_REVIEW_REQUIRED',
+                'Перед повторным обезличиванием обработайте найденные в изменённом тексте фрагменты',
+                {
+                    'pending_count': len(pending_review),
+                    'review_count': len(pending_review),
+                    'pending_review': pending_review,
+                },
+            )
+
+        entities = doc.get('entities', [])
+        kept_entities = doc.get('kept_entities', doc.get('recognized_but_kept', []))
+        mappings = build_mappings_from_entities(entities)
+        review_entities = [e for e in entities if e.get('requires_review')]
+
+        if doc.get('working_text') is not None:
+            doc['anonymized_text'] = doc.get('working_text', '')
+        if doc.get('working_content') is not None:
+            doc['anonymized_content'] = doc.get('working_content')
+        doc['entities'] = entities
+        doc['kept_entities'] = kept_entities
+        doc['recognized_but_kept'] = kept_entities
+        doc['mappings'] = mappings
+        doc['review_entities'] = review_entities
+        doc['pending_review'] = []
+        doc['pending_entities'] = []
+        doc['pending_markers'] = []
+        doc['publication_redaction_mode'] = body.publication_redaction_mode
+        doc['manual_decisions'] = list(manual_decisions_by_document_id.get(document_id, {}).values())
+        pending_review_by_document_id[document_id] = []
+
+        if document_id in public_docs:
+            public_docs[document_id]['anonymized_text'] = doc.get('anonymized_text', '')
+            public_docs[document_id]['anonymized_content'] = doc.get('anonymized_content')
+            public_docs[document_id]['content_format'] = doc.get('content_format', 'PLAIN_TEXT')
+
+        return anonymization_result_response(doc)
+
     original_text = doc.get('original_text', '')
     entities = await extract_entities(original_text)
     resolved = resolve_entities(original_text, entities, body.publication_redaction_mode)
