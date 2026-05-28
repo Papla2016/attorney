@@ -635,3 +635,158 @@ def test_draft_pending_keep_preserves_working_text(monkeypatch):
     assert payload['pending_review'] == []
     decisions = main.manual_decisions_by_document_id[doc_id]
     assert decisions[entity_key]['decision_type'] == 'KEEP_ENTITY'
+
+
+def _content_text(content):
+    parts = []
+    def walk(node):
+        if isinstance(node, dict):
+            if isinstance(node.get('text'), str):
+                parts.append(node['text'])
+            for child in node.get('content', []) or []:
+                walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+    walk(content)
+    return ''.join(parts)
+
+
+def _redaction_placeholders(content):
+    placeholders = []
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get('type') == 'text':
+                marks = node.get('marks') or []
+                if any(m.get('type') == 'redactionMention' for m in marks):
+                    placeholders.append(node.get('text'))
+            for child in node.get('content', []) or []:
+                walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+    walk(content)
+    return placeholders
+
+
+def test_pending_rich_content_two_redacts_accumulate(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'pending-rich-two-redacts-doc'
+    first = 'Петрова Мария Ивановна'
+    second = 'Сидоров Андрей Олегович'
+    working_text = f'Представитель {first} и {second} присутствовали.'
+    content = {'type': 'doc', 'content': [{'type': 'paragraph', 'content': [{'type': 'text', 'text': working_text}]}]}
+    main.restored_docs.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    main.pending_review_by_document_id.pop(doc_id, None)
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': 'ФИО1 обратился.',
+        'anonymized_text': 'ФИО1 обратился.',
+        'entities': [],
+        'kept_entities': [],
+        'mappings': [],
+    }
+
+    async def fake_extract_entities(_text):
+        return [
+            {'type': 'PERSON_FULL_NAME', 'text': first, 'normalized_text': first, 'start': working_text.index(first), 'end': working_text.index(first) + len(first)},
+            {'type': 'PERSON_FULL_NAME', 'text': second, 'normalized_text': second, 'start': working_text.index(second), 'end': working_text.index(second) + len(second)},
+        ]
+
+    monkeypatch.setattr(main, 'extract_entities', fake_extract_entities)
+    scan = client.post(
+        f'/internal/anonymization/documents/{doc_id}/draft-scan',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'text': working_text, 'content': content, 'content_format': 'TIPTAP_JSON', 'document_revision': 1},
+    )
+    assert scan.status_code == 200
+    pending_by_surface = {p['surface_value']: p for p in scan.json()['pending_review']}
+
+    first_redact = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'selected_text': first, 'entity_class': 'PERSON', 'entity_key': pending_by_surface[first]['entity_key'], 'decision': 'REDACT'},
+    )
+    assert first_redact.status_code == 200
+    second_redact = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'selected_text': second, 'entity_class': 'PERSON', 'entity_key': pending_by_surface[second]['entity_key'], 'decision': 'REDACT'},
+    )
+    assert second_redact.status_code == 200
+    payload = second_redact.json()
+    content_text = _content_text(payload['anonymized_content'])
+    assert first not in payload['anonymized_text']
+    assert second not in payload['anonymized_text']
+    assert first not in content_text
+    assert second not in content_text
+    assert {'ФИО1', 'ФИО2'}.issubset(set(_redaction_placeholders(payload['anonymized_content'])))
+    assert main.restored_docs[doc_id]['working_content'] == payload['anonymized_content']
+
+
+def test_pending_rich_content_redact_then_keep_preserves_redaction(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'pending-rich-redact-keep-doc'
+    first = 'Петрова Мария Ивановна'
+    second = 'Сидоров Андрей Олегович'
+    working_text = f'Представитель {first} и {second} присутствовали.'
+    content = {'type': 'doc', 'content': [{'type': 'paragraph', 'content': [{'type': 'text', 'text': working_text}]}]}
+    main.restored_docs.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    main.pending_review_by_document_id.pop(doc_id, None)
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': 'ФИО1 обратился.',
+        'anonymized_text': 'ФИО1 обратился.',
+        'entities': [],
+        'kept_entities': [],
+        'mappings': [],
+    }
+
+    async def fake_extract_entities(_text):
+        return [
+            {'type': 'PERSON_FULL_NAME', 'text': first, 'normalized_text': first, 'start': working_text.index(first), 'end': working_text.index(first) + len(first)},
+            {'type': 'PERSON_FULL_NAME', 'text': second, 'normalized_text': second, 'start': working_text.index(second), 'end': working_text.index(second) + len(second)},
+        ]
+
+    monkeypatch.setattr(main, 'extract_entities', fake_extract_entities)
+    scan = client.post(
+        f'/internal/anonymization/documents/{doc_id}/draft-scan',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'text': working_text, 'content': content, 'content_format': 'TIPTAP_JSON', 'document_revision': 1},
+    )
+    assert scan.status_code == 200
+    pending_by_surface = {p['surface_value']: p for p in scan.json()['pending_review']}
+
+    redact = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'selected_text': first, 'entity_class': 'PERSON', 'entity_key': pending_by_surface[first]['entity_key'], 'decision': 'REDACT'},
+    )
+    assert redact.status_code == 200
+    keep = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'selected_text': second, 'entity_class': 'PERSON', 'entity_key': pending_by_surface[second]['entity_key'], 'decision': 'KEEP'},
+    )
+    assert keep.status_code == 200
+    payload = keep.json()
+    content_text = _content_text(payload['anonymized_content'])
+    assert first not in content_text
+    assert second in content_text
+    assert 'ФИО1' in _redaction_placeholders(payload['anonymized_content'])
+    assert main.restored_docs[doc_id]['working_content'] == payload['anonymized_content']
+    assert payload['pending_review'] == []

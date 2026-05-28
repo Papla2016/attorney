@@ -1257,7 +1257,9 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
             doc['anonymized_text'] = updated_text
             working_content = doc.get('working_content')
             if working_content:
-                doc['anonymized_content'] = anonymize_content_by_mentions(working_content, [{**target, 'mentions': new_mentions}])
+                updated_content = anonymize_content_by_mentions(working_content, [{**target, 'mentions': new_mentions}])
+                doc['working_content'] = updated_content
+                doc['anonymized_content'] = updated_content
             doc['entities'] = redacted_entities
             doc['kept_entities'] = kept_entities
             doc['recognized_but_kept'] = kept_entities
