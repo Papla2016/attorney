@@ -790,3 +790,193 @@ def test_pending_rich_content_redact_then_keep_preserves_redaction(monkeypatch):
     assert 'ФИО1' in _redaction_placeholders(payload['anonymized_content'])
     assert main.restored_docs[doc_id]['working_content'] == payload['anonymized_content']
     assert payload['pending_review'] == []
+
+def test_pending_redact_groups_all_surface_forms_of_same_entity_key():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'pending-same-person-redact-doc'
+
+    first = 'Макарова Антона Сергеевича'
+    second = 'Макаровым Антоном Сергеевичем'
+    third = 'Макаров А.С.'
+    normalized = 'Макаров Антон Сергеевич'
+    entity_key = 'PERSON::макаров антон сергеевич'
+
+    working_text = (
+        f'{first} вызвали в суд. '
+        f'{second} представлены документы. '
+        f'{third} пояснил.'
+    )
+
+    content = {
+        'type': 'doc',
+        'content': [
+            {
+                'type': 'paragraph',
+                'content': [
+                    {'type': 'text', 'text': working_text}
+                ],
+            }
+        ],
+    }
+
+    main.restored_docs.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    main.pending_review_by_document_id.pop(doc_id, None)
+
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': 'Исходный защищённый документ.',
+        'anonymized_text': working_text,
+        'working_text': working_text,
+        'working_content': content,
+        'mappings': [],
+        'entities': [],
+        'kept_entities': [],
+    }
+
+    pending = []
+    for surface in (first, second, third):
+        start = working_text.index(surface)
+        pending.append({
+            'entity_key': entity_key,
+            'surface_value': surface,
+            'normalized_value': normalized,
+            'entity_class': 'PERSON',
+            'person_role': 'UNKNOWN',
+            'start': start,
+            'end': start + len(surface),
+            'reason': 'В изменённом тексте найдено новое значение, требующее проверки',
+        })
+
+    main.pending_review_by_document_id[doc_id] = pending
+    main.restored_docs[doc_id]['pending_review'] = pending
+
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={
+            'selected_text': first,
+            'entity_class': 'PERSON',
+            'entity_key': entity_key,
+            'decision': 'REDACT',
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert first not in payload['anonymized_text']
+    assert second not in payload['anonymized_text']
+    assert third not in payload['anonymized_text']
+
+    entity = next(
+        e for e in payload['entities']
+        if e.get('entity_key') == entity_key
+    )
+
+    assert entity['mentions_count'] == 3
+    assert {
+        mention['surface_value']
+        for mention in entity['mentions']
+    } == {first, second, third}
+
+    placeholder = entity['placeholder']
+    assert payload['anonymized_text'].count(placeholder) == 3
+    assert payload['pending_review'] == []
+
+    restored_content = main.restore_content_from_mentions(
+        payload['anonymized_content'],
+        payload['entities'],
+    )
+
+    assert _content_text(restored_content) == working_text
+    
+def test_pending_keep_keeps_all_surface_forms_of_same_entity_key():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'pending-same-person-keep-doc'
+
+    first = 'Макарова Антона Сергеевича'
+    second = 'Макаровым Антоном Сергеевичем'
+    normalized = 'Макаров Антон Сергеевич'
+    entity_key = 'PERSON::макаров антон сергеевич'
+
+    working_text = f'{first} вызвали. {second} представлены документы.'
+
+    content = {
+        'type': 'doc',
+        'content': [
+            {
+                'type': 'paragraph',
+                'content': [
+                    {'type': 'text', 'text': working_text}
+                ],
+            }
+        ],
+    }
+
+    main.restored_docs.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    main.pending_review_by_document_id.pop(doc_id, None)
+
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': 'Исходный защищённый документ.',
+        'anonymized_text': working_text,
+        'working_text': working_text,
+        'working_content': content,
+        'anonymized_content': content,
+        'mappings': [],
+        'entities': [],
+        'kept_entities': [],
+    }
+
+    pending = []
+    for surface in (first, second):
+        start = working_text.index(surface)
+        pending.append({
+            'entity_key': entity_key,
+            'surface_value': surface,
+            'normalized_value': normalized,
+            'entity_class': 'PERSON',
+            'person_role': 'UNKNOWN',
+            'start': start,
+            'end': start + len(surface),
+            'reason': 'В изменённом тексте найдено новое значение, требующее проверки',
+        })
+
+    main.pending_review_by_document_id[doc_id] = pending
+    main.restored_docs[doc_id]['pending_review'] = pending
+
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={
+            'selected_text': first,
+            'entity_class': 'PERSON',
+            'entity_key': entity_key,
+            'decision': 'KEEP',
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert payload['anonymized_text'] == working_text
+    assert first in payload['anonymized_text']
+    assert second in payload['anonymized_text']
+    assert payload['pending_review'] == []
+
+    decision = main.manual_decisions_by_document_id[doc_id][entity_key]
+    assert decision['decision_type'] == 'KEEP_ENTITY'

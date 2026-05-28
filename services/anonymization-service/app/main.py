@@ -1201,6 +1201,11 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
     redacted_entities = list(doc.get('entities', []))
     kept_entities = list(doc.get('kept_entities', []))
     is_pending_decision = pending_item is not None
+    pending_group = (
+        [p for p in pending_items if p.get('entity_key') == entity_key]
+        if is_pending_decision
+        else []
+    )
 
     if body.decision == 'REDACT':
         store_keep_redact_decision(document_id, 'REDACT_ENTITY', decision_entity, reason=body.reason, explicit_entity_key=entity_key)
@@ -1227,24 +1232,74 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
             }
             redacted_entities.append(target)
         target['entity_key'] = entity_key
-        search_text = doc.get('working_text') if is_pending_decision and doc.get('working_text') is not None else doc.get('original_text', '')
-        existing_ranges = {(m.get('start'), m.get('end')) for m in target.get('mentions', [])}
+        search_text = (
+            doc.get('working_text')
+            if is_pending_decision and doc.get('working_text') is not None
+            else doc.get('original_text', '')
+        )
+
+        existing_ranges = {
+            (m.get('start'), m.get('end'))
+            for m in target.get('mentions', [])
+        }
+        accepted_ranges = set(existing_ranges)
         new_mentions = []
-        for match in re.finditer(re.escape(body.selected_text), search_text or ''):
-            rng = (match.start(), match.end())
-            if rng in existing_ranges:
-                continue
-            mention = {
-                'mention_id': str(uuid.uuid4()),
-                'entity_id': target['entity_id'],
-                'surface_value': body.selected_text,
-                'normalized_value': canonical_value,
-                'start': match.start(),
-                'end': match.end(),
-                'replacement_value': target.get('placeholder') or '',
+
+        if is_pending_decision:
+            # Решение REDACT относится ко всей сущности, а не только
+            # к одной выбранной пользователем форме написания.
+            surface_to_normalized = {}
+            for pending in pending_group:
+                surface = pending.get('surface_value')
+                if not surface:
+                    continue
+                surface_to_normalized[surface] = (
+                    pending.get('normalized_value') or canonical_value
+                )
+
+            # Более длинные варианты обрабатываем первыми,
+            # чтобы короткая форма не перекрыла длинную.
+            surfaces_to_redact = sorted(
+                surface_to_normalized.keys(),
+                key=len,
+                reverse=True,
+            )
+        else:
+            surface_to_normalized = {
+                body.selected_text: canonical_value
             }
-            target.setdefault('mentions', []).append(mention)
-            new_mentions.append(mention)
+            surfaces_to_redact = [body.selected_text]
+
+        def overlaps_existing(start: int, end: int) -> bool:
+            return any(
+                start < existing_end and existing_start < end
+                for existing_start, existing_end in accepted_ranges
+            )
+
+        for surface in surfaces_to_redact:
+            normalized_value = surface_to_normalized[surface]
+
+            for match in re.finditer(re.escape(surface), search_text or ''):
+                start = match.start()
+                end = match.end()
+
+                if overlaps_existing(start, end):
+                    continue
+
+                mention = {
+                    'mention_id': str(uuid.uuid4()),
+                    'entity_id': target['entity_id'],
+                    'surface_value': surface,
+                    'normalized_value': normalized_value,
+                    'start': start,
+                    'end': end,
+                    'replacement_value': target.get('placeholder') or '',
+                }
+
+                target.setdefault('mentions', []).append(mention)
+                new_mentions.append(mention)
+                accepted_ranges.add((start, end))
+
         target['mentions_count'] = len(target.get('mentions', []))
         if is_pending_decision:
             target['placeholder'] = target.get('placeholder') or next_placeholder(entity_class, doc.get('mappings', []))
