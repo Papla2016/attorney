@@ -1192,34 +1192,75 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
         _error(400, 'BAD_REQUEST', 'Недопустимое решение', {'allowed': ['REDACT', 'KEEP', 'MERGE_WITH_EXISTING']})
     audit_log.append({'id': str(uuid.uuid4()), 'document_id': document_id, 'action': 'REDACTION_DECISION', 'details': body.model_dump(), 'created_at': now_iso()})
     doc = restored_docs[document_id]
-    decision_entity = {'entity_class': body.entity_class, 'canonical_value': body.selected_text, 'normalized_value': body.selected_text}
+    entity_class = 'PERSON' if body.entity_class in {'PERSON_FULL_NAME', 'PERSON'} else body.entity_class
+    decision_entity = {'entity_class': entity_class, 'canonical_value': body.selected_text, 'normalized_value': body.selected_text}
     entity_key = body.entity_key or entity_semantic_key(decision_entity)
-    decisions = manual_decisions_by_document_id.setdefault(document_id, {})
+    redacted_entities = list(doc.get('entities', []))
+    kept_entities = list(doc.get('kept_entities', []))
+
     if body.decision == 'REDACT':
         store_keep_redact_decision(document_id, 'REDACT_ENTITY', decision_entity, reason=body.reason)
-        mapping = ensure_mapping_metadata({'original_value': body.selected_text, 'entity_type': body.entity_class, 'entity_class': body.entity_class, 'placeholder': next_placeholder(body.entity_class, doc.get('mappings', [])), 'source': 'manual'})
-        doc.setdefault('mappings', []).append(mapping)
+        target = _find_entity_by_semantic_key(redacted_entities, entity_key)
+        if not target:
+            target = _find_entity_by_semantic_key(kept_entities, entity_key)
+            if target:
+                kept_entities.remove(target)
+                target['redaction_decision'] = 'REDACT'
+                target['requires_review'] = False
+                redacted_entities.append(target)
+        if not target:
+            target = {
+                'entity_id': str(uuid.uuid4()),
+                'document_id': document_id,
+                'entity_class': entity_class,
+                'canonical_value': body.selected_text,
+                'normalized_value': body.selected_text,
+                'redaction_decision': 'REDACT',
+                'requires_review': False,
+                'mentions': [],
+            }
+            redacted_entities.append(target)
+        existing_ranges = {(m.get('start'), m.get('end')) for m in target.get('mentions', [])}
+        for match in re.finditer(re.escape(body.selected_text), doc.get('original_text', '')):
+            rng = (match.start(), match.end())
+            if rng in existing_ranges:
+                continue
+            target.setdefault('mentions', []).append({
+                'mention_id': str(uuid.uuid4()),
+                'entity_id': target['entity_id'],
+                'surface_value': body.selected_text,
+                'normalized_value': body.selected_text,
+                'start': match.start(),
+                'end': match.end(),
+                'replacement_value': target.get('placeholder') or '',
+            })
+        target['mentions_count'] = len(target.get('mentions', []))
     elif body.decision == 'KEEP':
         store_keep_redact_decision(document_id, 'KEEP_ENTITY', decision_entity, reason=body.reason)
-        doc['mappings'] = [m for m in doc.get('mappings', []) if m.get('original_value') != body.selected_text]
+        target = _find_entity_by_semantic_key(redacted_entities, entity_key)
+        if target:
+            redacted_entities.remove(target)
+            target['redaction_decision'] = 'KEEP'
+            target['requires_review'] = False
+            kept_entities = [e for e in kept_entities if entity_semantic_key(e) != entity_key]
+            kept_entities.append(target)
     elif body.decision == 'MERGE_WITH_EXISTING':
         target = next((m for m in doc.get('mappings', []) if m.get('cluster_id') == body.target_cluster_id), None)
         if not target:
             _error(400, 'BAD_REQUEST', 'Целевой cluster не найден')
+        decisions = manual_decisions_by_document_id.setdefault(document_id, {})
         decisions[entity_key] = {'entity_key': entity_key, 'decision': 'MERGE_WITH_CLUSTER', 'target_cluster_id': body.target_cluster_id, 'reason': body.reason, 'created_at': now_iso(), 'updated_at': now_iso()}
         doc.setdefault('mappings', []).append(ensure_mapping_metadata({'original_value': body.selected_text, 'entity_type': body.entity_class, 'entity_class': body.entity_class, 'cluster_id': body.target_cluster_id, 'placeholder': target.get('placeholder'), 'source': 'manual'}))
-    for e in doc.get('entities', []):
-        if e.get('canonical_value') == body.selected_text or e.get('normalized_value') == body.selected_text:
-            if body.decision == 'KEEP':
-                e['redaction_decision'] = 'KEEP'
-            elif body.decision in {'REDACT', 'MERGE_WITH_EXISTING'}:
+        for e in redacted_entities:
+            if e.get('canonical_value') == body.selected_text or e.get('normalized_value') == body.selected_text:
                 e['redaction_decision'] = 'REDACT'
-    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
+
+    rebuild_document_from_entities(document_id, redacted_entities, kept_entities, doc.get('original_text', ''), doc.get('original_content'))
     pending = [p for p in pending_review_by_document_id.get(document_id, []) if p.get('entity_key') != entity_key]
     pending_review_by_document_id[document_id] = pending
     doc['pending_review'] = pending
     doc['pending_markers'] = [{'entity_key': p['entity_key'], 'surface_value': p['surface_value'], 'start': p['start'], 'end': p['end'], 'reason': p['reason']} for p in pending]
-    doc['manual_decisions'] = list(decisions.values())
+    doc['manual_decisions'] = list(manual_decisions_by_document_id.get(document_id, {}).values())
     return anonymization_result_response(doc)
 
 

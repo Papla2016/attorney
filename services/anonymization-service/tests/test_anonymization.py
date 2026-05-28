@@ -395,3 +395,89 @@ def test_keep_redact_manual_decisions_use_single_format():
     assert {d['decision_type'] for d in decisions.values()} == {'KEEP_ENTITY', 'REDACT_ENTITY'}
     assert all(d.get('entity_key') for d in decisions.values())
     assert all('decision' not in d for d in decisions.values())
+
+
+def test_redaction_decision_redact_creates_entity_and_placeholder():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'redaction-decision-redact-doc'
+    text = 'Договор от 20.05.2024 подписан.'
+    value = '20.05.2024'
+    main.restored_docs.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': text,
+        'entities': [],
+        'kept_entities': [],
+        'mappings': [],
+    }
+
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'selected_text': value, 'entity_class': 'DATE', 'decision': 'REDACT'},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload['entities']) == 1
+    entity = payload['entities'][0]
+    assert entity['canonical_value'] == value
+    assert entity['mentions'][0]['surface_value'] == value
+    assert 'ДАТА1' in payload['anonymized_text']
+    assert payload['mappings'][0]['id'] == entity['entity_id']
+    decision = main.manual_decisions_by_document_id[doc_id][main.build_entity_semantic_key('DATE', value)]
+    assert decision['decision_type'] == 'REDACT_ENTITY'
+    assert decision['entity_key'] == 'DATE::20.05.2024'
+    assert 'decision' not in decision
+
+
+def test_redaction_decision_keep_survives_reanonymize(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'redaction-decision-keep-doc'
+    text = 'Иванов Иван Иванович явился.'
+    name = 'Иванов Иван Иванович'
+    main.restored_docs.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    main.restored_docs[doc_id] = {'document_id': doc_id, 'case_id': 'case-1', 'title': 'doc', 'original_text': text, 'mappings': []}
+    entity = {
+        'entity_id': 'rd-keep-e1', 'document_id': doc_id, 'entity_class': 'PERSON',
+        'canonical_value': name, 'normalized_value': name, 'redaction_decision': 'REDACT',
+        'mentions': [{'mention_id': 'rd-keep-m1', 'entity_id': 'rd-keep-e1', 'surface_value': name, 'normalized_value': name, 'start': 0, 'end': len(name), 'replacement_value': 'ФИО1'}],
+    }
+    main.rebuild_document_from_entities(doc_id, [entity], [], text, None)
+
+    keep = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'selected_text': name, 'entity_class': 'PERSON', 'decision': 'KEEP'},
+    )
+    assert keep.status_code == 200
+    kept_payload = keep.json()
+    assert kept_payload['entities'] == []
+    assert kept_payload['kept_entities'][0]['canonical_value'] == name
+    assert kept_payload['anonymized_text'] == text
+
+    async def fake_extract_entities(_text):
+        return [{'type': 'PERSON_FULL_NAME', 'text': name, 'normalized_text': name, 'start': 0, 'end': len(name)}]
+
+    monkeypatch.setattr(main, 'extract_entities', fake_extract_entities)
+    reanon = client.post(f'/internal/anonymization/documents/{doc_id}/reanonymize', headers={'X-Internal-Service-Token': main.INTERNAL}, json={})
+    assert reanon.status_code == 200
+    payload = reanon.json()
+    assert payload['entities'] == []
+    assert payload['kept_entities'][0]['canonical_value'] == name
+    assert payload['anonymized_text'] == text
+    decision = main.manual_decisions_by_document_id[doc_id][main.build_entity_semantic_key('PERSON', name)]
+    assert decision['decision_type'] == 'KEEP_ENTITY'
+    assert 'decision' not in decision
