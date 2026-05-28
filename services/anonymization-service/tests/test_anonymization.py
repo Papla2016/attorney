@@ -2766,6 +2766,7 @@ def _patch_split_created_entity(client, main, doc_id, entity_id):
         headers={'X-Internal-Service-Token': main.INTERNAL},
         json={
             'canonical_value': 'Алексеев Александр Сергеевич',
+            'entity_class': 'ORGANIZATION',
             'person_role': 'WITNESS',
             'context_label': 'Свидетель',
         },
@@ -2800,6 +2801,7 @@ def test_patch_split_created_entity_stores_split_metadata_decision():
     assert decision['mention_locator'] == new_entity['split_origin']['mention_locator']
     assert decision['payload'] == {
         'canonical_value': 'Алексеев Александр Сергеевич',
+        'entity_class': 'ORGANIZATION',
         'person_role': 'WITNESS',
         'context_label': 'Свидетель',
     }
@@ -2857,9 +2859,12 @@ def test_split_created_entity_metadata_survives_original_based_reanonymize(monke
     source_entity = next(e for e in payload['entities'] if e['mentions'][0]['surface_value'] == 'Макаров Антон Сергеевич')
     split_entity = next(e for e in payload['entities'] if e['mentions'][0]['surface_value'] == 'Макаров А.С.')
     assert source_entity['canonical_value'] != 'Алексеев Александр Сергеевич'
+    assert source_entity['entity_class'] == 'PERSON'
     assert source_entity.get('person_role') != 'WITNESS'
     assert source_entity.get('context_label') != 'Свидетель'
+
     assert split_entity['canonical_value'] == 'Алексеев Александр Сергеевич'
+    assert split_entity['entity_class'] == 'ORGANIZATION'
     assert split_entity['person_role'] == 'WITNESS'
     assert split_entity['context_label'] == 'Свидетель'
     assert source_entity['placeholder'] != split_entity['placeholder']
@@ -2905,9 +2910,12 @@ def test_split_created_entity_metadata_survives_working_reanonymize():
     assert payload['anonymized_text'] == 'ФИО1 явился. ФИО2 представил документы.'
     assert payload['anonymized_content']['content'][0]['content'][2]['text'] == 'ФИО2'
     assert split_entity['canonical_value'] == 'Алексеев Александр Сергеевич'
+    assert split_entity['entity_class'] == 'ORGANIZATION'
     assert split_entity['person_role'] == 'WITNESS'
     assert split_entity['context_label'] == 'Свидетель'
+
     assert source_entity['canonical_value'] != 'Алексеев Александр Сергеевич'
+    assert source_entity['entity_class'] == 'PERSON'
     assert source_entity.get('person_role') != 'WITNESS'
     assert source_entity.get('context_label') != 'Свидетель'
     assert split_entity['split_origin'] == new_entity['split_origin']

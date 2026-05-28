@@ -312,6 +312,7 @@ def store_split_entity_metadata_decision(document_id: str, entity: dict) -> dict
         },
         'payload': {
             'canonical_value': entity.get('canonical_value'),
+            'entity_class': entity.get('entity_class'),
             'person_role': entity.get('person_role'),
             'context_label': entity.get('context_label'),
         },
@@ -1320,7 +1321,7 @@ def apply_split_entity_metadata_decisions(document_id: str, redacted_entities: l
         if not ent:
             continue
         payload = decision.get('payload') or {}
-        for field in ('canonical_value', 'person_role', 'context_label'):
+        for field in ('canonical_value', 'entity_class', 'person_role', 'context_label'):
             if field in payload:
                 ent[field] = payload.get(field)
         ent['updated_at'] = now_iso()
