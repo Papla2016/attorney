@@ -134,6 +134,82 @@ def entity_semantic_key(entity: dict) -> str:
     )
 
 
+
+def store_merge_entities_decision(document_id: str, target: dict, sources: list[dict]) -> dict:
+    now = now_iso()
+    target_key = entity_semantic_key(target)
+    source_keys = [entity_semantic_key(source) for source in sources]
+    decision_key = f"MERGE_ENTITIES::{target_key}::{','.join(source_keys)}"
+    decisions = manual_decisions_by_document_id.setdefault(document_id, {})
+    existing = decisions.get(decision_key, {})
+    decision = {
+        'decision_id': existing.get('decision_id') or str(uuid.uuid4()),
+        'document_id': document_id,
+        'decision_type': 'MERGE_ENTITIES',
+        'target_entity_key': target_key,
+        'source_entity_keys': source_keys,
+        'target_entity_id': target.get('entity_id'),
+        'source_entity_ids': [source.get('entity_id') for source in sources],
+        'created_at': existing.get('created_at') or now,
+        'updated_at': now,
+    }
+    decisions[decision_key] = decision
+    return decision
+
+
+def merge_entities_in_state(entities: list[dict], target: dict, sources: list[dict]) -> list[dict]:
+    existing_mention_ids = {
+        mention.get('mention_id')
+        for mention in target.get('mentions', [])
+        if mention.get('mention_id')
+    }
+    target_mentions = target.setdefault('mentions', [])
+    for source in sources:
+        for mention in source.get('mentions', []):
+            mention_id = mention.get('mention_id')
+            if mention_id and mention_id in existing_mention_ids:
+                continue
+            moved = copy.deepcopy(mention)
+            moved['entity_id'] = target.get('entity_id')
+            moved['replacement_value'] = target.get('placeholder')
+            target_mentions.append(moved)
+            if mention_id:
+                existing_mention_ids.add(mention_id)
+    target['mentions_count'] = len(target_mentions)
+    target['updated_at'] = now_iso()
+    source_ids = {source.get('entity_id') for source in sources}
+    return [entity for entity in entities if entity.get('entity_id') not in source_ids]
+
+
+def update_working_content_for_merge(content: dict, mention_ids: set[str], target: dict) -> tuple[dict, set[str]]:
+    data = copy.deepcopy(content)
+    updated_mention_ids: set[str] = set()
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get('type') == 'text' and isinstance(node.get('marks'), list):
+                for mark in node['marks']:
+                    if mark.get('type') != 'redactionMention':
+                        continue
+                    attrs = mark.setdefault('attrs', {})
+                    mention_id = attrs.get('mentionId')
+                    if mention_id in mention_ids:
+                        node['text'] = target.get('placeholder', node.get('text', ''))
+                        attrs['entityId'] = target.get('entity_id')
+                        attrs['placeholder'] = target.get('placeholder')
+                        attrs['mentionId'] = mention_id
+                        updated_mention_ids.add(mention_id)
+                        break
+            if isinstance(node.get('content'), list):
+                for child in node['content']:
+                    walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    walk(data)
+    return data, updated_mention_ids
+
 def store_keep_redact_decision(document_id: str, decision_type: str, entity: dict, *, reason: str | None = None, explicit_entity_key: str | None = None) -> dict:
     if decision_type not in {'KEEP_ENTITY', 'REDACT_ENTITY'}:
         raise ValueError('Unsupported keep/redact manual decision')
@@ -943,6 +1019,62 @@ def apply_split_mention_decisions(document_id: str, redacted_entities: list[dict
         entities, _new_entity = split_entity_mention_in_state(document_id, entities, source_entity, mention)
     return entities
 
+
+
+def _entities_by_semantic_key(entities: list[dict], entity_key: str) -> list[dict]:
+    return [entity for entity in entities if entity.get('entity_key') == entity_key or entity_semantic_key(entity) == entity_key]
+
+
+def apply_merge_entity_decisions(document_id: str, redacted_entities: list[dict]) -> list[dict]:
+    decisions = [
+        decision
+        for decision in manual_decisions_by_document_id.get(document_id, {}).values()
+        if decision.get('decision_type') == 'MERGE_ENTITIES'
+    ]
+    entities = redacted_entities
+    for decision in decisions:
+        target_key = decision.get('target_entity_key')
+        source_keys = decision.get('source_entity_keys') or []
+        if not target_key or not source_keys:
+            continue
+        target_matches = _entities_by_semantic_key(entities, target_key)
+        if len(target_matches) != 1:
+            continue
+        sources = []
+        ambiguous = False
+        for source_key in source_keys:
+            source_matches = [
+                entity
+                for entity in _entities_by_semantic_key(entities, source_key)
+                if entity.get('entity_id') != target_matches[0].get('entity_id')
+            ]
+            if len(source_matches) != 1:
+                ambiguous = True
+                break
+            sources.append(source_matches[0])
+        if ambiguous:
+            continue
+        entities = merge_entities_in_state(entities, target_matches[0], sources)
+    return entities
+
+
+def _validate_merge_semantic_keys_are_replayable(entities: list[dict], target: dict, sources: list[dict]):
+    target_key = entity_semantic_key(target)
+    source_keys = [entity_semantic_key(source) for source in sources]
+    if target_key in source_keys or len(source_keys) != len(set(source_keys)):
+        _error(
+            409,
+            'MERGE_REQUIRES_DISTINCT_ENTITY_KEYS',
+            'Невозможно устойчиво сохранить объединение сущностей с одинаковыми идентификаторами',
+        )
+    for key in [target_key, *source_keys]:
+        if len(_entities_by_semantic_key(entities, key)) != 1:
+            _error(
+                409,
+                'MERGE_REQUIRES_DISTINCT_ENTITY_KEYS',
+                'Невозможно устойчиво сохранить объединение сущностей с одинаковыми идентификаторами',
+            )
+
 def apply_manual_decisions(document_id: str, resolved: list[dict]) -> list[dict]:
     decisions = manual_decisions_by_document_id.get(document_id, {})
     for e in resolved:
@@ -1402,6 +1534,7 @@ async def reanonymize(document_id: str, body: ReanonymizeRequest, x_internal_ser
     entities_view, recognized_but_kept = apply_keep_redact_entity_decisions(document_id, entities_view, recognized_but_kept, original_text)
     entities_view, recognized_but_kept = apply_entity_metadata_decisions(document_id, entities_view, recognized_but_kept)
     entities_view = apply_split_mention_decisions(document_id, entities_view)
+    entities_view = apply_merge_entity_decisions(document_id, entities_view)
     review_entities = [e for e in entities_view if e.get('requires_review')]
     rebuilt = rebuild_document_from_entities(document_id, entities_view, recognized_but_kept, original_text, doc.get('original_content'))
     mappings = rebuilt.get('mappings', [])
@@ -1760,24 +1893,100 @@ def merge_entities(document_id: str, body: EntityMergeRequest, x_internal_servic
     doc = restored_docs.get(document_id)
     if not doc:
         _error(404, 'NOT_FOUND', 'Документ не найден')
+    if not body.source_entity_ids:
+        _error(400, 'BAD_REQUEST', 'Не указаны исходные сущности для объединения')
+    if body.target_entity_id in body.source_entity_ids:
+        _error(400, 'BAD_REQUEST', 'Целевая сущность не может быть исходной сущностью')
+
     entities = doc.get('entities', [])
     target = next((e for e in entities if e.get('entity_id') == body.target_entity_id), None)
     if not target:
         _error(404, 'NOT_FOUND', 'Целевая сущность не найдена')
-    for sid in body.source_entity_ids:
-        src = next((e for e in entities if e.get('entity_id') == sid), None)
-        if not src:
-            continue
-        for m in src.get('mentions', []):
-            m['entity_id'] = target['entity_id']
-            m['replacement_value'] = target['placeholder']
-            target.setdefault('mentions', []).append(m)
-        entities.remove(src)
-    manual_decisions_by_document_id.setdefault(document_id, {})[f'MERGE_ENTITIES::{target["entity_id"]}'] = {
-        'decision_id': str(uuid.uuid4()), 'document_id': document_id, 'decision_type': 'MERGE_ENTITIES',
-        'entity_id': target['entity_id'], 'payload': {'source_entity_ids': body.source_entity_ids}, 'created_at': now_iso(), 'updated_at': now_iso(),
+
+    sources = []
+    for source_id in body.source_entity_ids:
+        source = next((e for e in entities if e.get('entity_id') == source_id), None)
+        if not source:
+            _error(404, 'NOT_FOUND', 'Исходная сущность не найдена', {'source_entity_id': source_id})
+        sources.append(source)
+
+    target_class = target.get('entity_class') or target.get('entity_type')
+    for source in sources:
+        source_class = source.get('entity_class') or source.get('entity_type')
+        if source_class != target_class:
+            _error(400, 'BAD_REQUEST', 'Нельзя объединить сущности разных классов')
+    if target.get('redaction_decision') != 'REDACT' or any(source.get('redaction_decision') != 'REDACT' for source in sources):
+        _error(400, 'BAD_REQUEST', 'Можно объединять только обезличиваемые сущности')
+
+    has_working_revision = (
+        doc.get('working_text') is not None
+        or doc.get('working_content') is not None
+    )
+    if not has_working_revision:
+        _validate_merge_semantic_keys_are_replayable(entities, target, sources)
+
+    source_mention_ids = {
+        mention.get('mention_id')
+        for source in sources
+        for mention in source.get('mentions', [])
+        if mention.get('mention_id')
     }
-    rebuild_document_from_entities(document_id, entities, doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
+
+    updated_content = None
+    if has_working_revision and doc.get('working_content') is not None:
+        missing_mention_ids = sorted(
+            mention_id
+            for mention_id in source_mention_ids
+            if not has_redaction_mention_mark(doc.get('working_content'), mention_id)
+        )
+        if missing_mention_ids:
+            _error(
+                409,
+                'MERGE_ENTITIES_MARK_NOT_FOUND',
+                'Разметка одного или нескольких объединяемых упоминаний не найдена',
+                {'missing_mention_ids': missing_mention_ids},
+            )
+        updated_content, updated_mention_ids = update_working_content_for_merge(doc.get('working_content'), source_mention_ids, target)
+        missing_after_update = sorted(source_mention_ids - updated_mention_ids)
+        if missing_after_update:
+            _error(
+                409,
+                'MERGE_ENTITIES_MARK_NOT_FOUND',
+                'Разметка одного или нескольких объединяемых упоминаний не найдена',
+                {'missing_mention_ids': missing_after_update},
+            )
+
+    store_merge_entities_decision(document_id, target, sources)
+    merged_entities = merge_entities_in_state(entities, target, sources)
+
+    if has_working_revision and doc.get('working_content') is not None:
+        updated_text = content_plain_text(updated_content)
+        doc['entities'] = merged_entities
+        doc['working_content'] = updated_content
+        doc['anonymized_content'] = updated_content
+        doc['working_text'] = updated_text
+        doc['anonymized_text'] = updated_text
+        doc['mappings'] = build_mappings_from_entities(doc['entities'])
+        doc['review_entities'] = [e for e in doc.get('entities', []) if e.get('requires_review')]
+    elif has_working_revision:
+        updated_text = doc.get('working_text') or ''
+        for source in sources:
+            source_placeholder = source.get('placeholder') or ''
+            if source_placeholder:
+                updated_text = updated_text.replace(source_placeholder, target.get('placeholder') or '')
+        doc['entities'] = merged_entities
+        doc['working_text'] = updated_text
+        doc['anonymized_text'] = updated_text
+        doc['mappings'] = build_mappings_from_entities(doc['entities'])
+        doc['review_entities'] = [e for e in doc.get('entities', []) if e.get('requires_review')]
+    else:
+        rebuild_document_from_entities(document_id, merged_entities, doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
+
+    doc['manual_decisions'] = list(manual_decisions_by_document_id.get(document_id, {}).values())
+    if document_id in public_docs:
+        public_docs[document_id]['anonymized_text'] = doc.get('anonymized_text', '')
+        public_docs[document_id]['anonymized_content'] = doc.get('anonymized_content')
+        public_docs[document_id]['content_format'] = doc.get('content_format', 'PLAIN_TEXT')
     return anonymization_result_response(doc)
 
 
