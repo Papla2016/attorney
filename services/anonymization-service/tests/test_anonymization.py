@@ -279,3 +279,119 @@ def test_exact_restoration_text_roundtrip():
     restored = restore_content_from_mentions(anon_content, entities)
     restored_text = ''.join(n.get('text', '') for n in restored['content'][0]['content'])
     assert restored_text == text
+
+
+def test_keep_entity_manual_decision_survives_reanonymize(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'keep-survives-reanon-doc'
+    text = 'Иванов Иван Иванович явился.'
+    name = 'Иванов Иван Иванович'
+    main.restored_docs.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    main.restored_docs[doc_id] = {'document_id': doc_id, 'case_id': 'case-1', 'title': 'doc', 'original_text': text, 'mappings': []}
+    entity = {
+        'entity_id': 'keep-e1', 'document_id': doc_id, 'entity_class': 'PERSON',
+        'canonical_value': name, 'normalized_value': name, 'redaction_decision': 'REDACT',
+        'mentions': [{'mention_id': 'keep-m1', 'entity_id': 'keep-e1', 'surface_value': name, 'normalized_value': name, 'start': 0, 'end': len(name), 'replacement_value': 'ФИО1'}],
+    }
+    main.rebuild_document_from_entities(doc_id, [entity], [], text, None)
+    assert main.restored_docs[doc_id]['anonymized_text'] == 'ФИО1 явился.'
+
+    deleted = client.delete(f'/internal/anonymization/documents/{doc_id}/mappings/keep-e1', headers={'X-Internal-Service-Token': main.INTERNAL})
+    assert deleted.status_code == 200
+    deleted_payload = deleted.json()
+    assert deleted_payload['entities'] == []
+    assert deleted_payload['kept_entities'][0]['canonical_value'] == name
+    assert deleted_payload['anonymized_text'] == text
+
+    async def fake_extract_entities(_text):
+        return [{'type': 'PERSON_FULL_NAME', 'text': name, 'normalized_text': name, 'start': 0, 'end': len(name)}]
+
+    monkeypatch.setattr(main, 'extract_entities', fake_extract_entities)
+    reanon = client.post(f'/internal/anonymization/documents/{doc_id}/reanonymize', headers={'X-Internal-Service-Token': main.INTERNAL}, json={})
+    assert reanon.status_code == 200
+    payload = reanon.json()
+    assert payload['entities'] == []
+    assert payload['kept_entities'][0]['canonical_value'] == name
+    assert payload['anonymized_text'] == text
+    decision = main.manual_decisions_by_document_id[doc_id][main.build_entity_semantic_key('PERSON', name)]
+    assert decision['decision_type'] == 'KEEP_ENTITY'
+    assert decision['entity_key'] == 'PERSON::иванов иван иванович'
+    assert 'decision' not in decision
+
+
+def test_redact_entity_manual_decision_survives_reanonymize(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'redact-survives-reanon-doc'
+    text = 'Решение от 30.10.2023 принято.'
+    value = '30.10.2023'
+    start = text.index(value)
+    main.restored_docs.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    main.restored_docs[doc_id] = {'document_id': doc_id, 'case_id': 'case-1', 'title': 'doc', 'original_text': text, 'mappings': [], 'entities': [], 'kept_entities': []}
+
+    added = client.post(
+        f'/internal/anonymization/documents/{doc_id}/mappings',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'original_value': value, 'entity_type': 'DATE', 'mode': 'new'},
+    )
+    assert added.status_code == 200
+    added_payload = added.json()
+    assert added_payload['entities'][0]['canonical_value'] == value
+    assert 'ДАТА1' in added_payload['anonymized_text']
+
+    async def fake_extract_entities(_text):
+        return [{'type': 'DATE', 'text': value, 'start': start, 'end': start + len(value)}]
+
+    monkeypatch.setattr(main, 'extract_entities', fake_extract_entities)
+    reanon = client.post(f'/internal/anonymization/documents/{doc_id}/reanonymize', headers={'X-Internal-Service-Token': main.INTERNAL}, json={})
+    assert reanon.status_code == 200
+    payload = reanon.json()
+    assert payload['entities'][0]['canonical_value'] == value
+    assert payload['kept_entities'] == []
+    assert 'ДАТА1' in payload['anonymized_text']
+    decision = main.manual_decisions_by_document_id[doc_id][main.build_entity_semantic_key('DATE', value)]
+    assert decision['decision_type'] == 'REDACT_ENTITY'
+    assert decision['entity_key'] == 'DATE::30.10.2023'
+    assert 'decision' not in decision
+
+
+def test_keep_redact_manual_decisions_use_single_format():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'manual-decision-format-doc'
+    text = 'Иванов Иван Иванович и 30.10.2023.'
+    name = 'Иванов Иван Иванович'
+    date = '30.10.2023'
+    main.restored_docs.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    main.restored_docs[doc_id] = {'document_id': doc_id, 'case_id': 'case-1', 'title': 'doc', 'original_text': text, 'mappings': []}
+    entity = {
+        'entity_id': 'format-e1', 'document_id': doc_id, 'entity_class': 'PERSON',
+        'canonical_value': name, 'normalized_value': name, 'redaction_decision': 'REDACT',
+        'mentions': [{'mention_id': 'format-m1', 'entity_id': 'format-e1', 'surface_value': name, 'normalized_value': name, 'start': 0, 'end': len(name), 'replacement_value': 'ФИО1'}],
+    }
+    main.rebuild_document_from_entities(doc_id, [entity], [], text, None)
+    keep = client.delete(f'/internal/anonymization/documents/{doc_id}/mappings/format-e1', headers={'X-Internal-Service-Token': main.INTERNAL})
+    redact = client.post(
+        f'/internal/anonymization/documents/{doc_id}/mappings',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'original_value': date, 'entity_type': 'DATE', 'mode': 'new'},
+    )
+    assert keep.status_code == 200
+    assert redact.status_code == 200
+    decisions = main.manual_decisions_by_document_id[doc_id]
+    assert {d['decision_type'] for d in decisions.values()} == {'KEEP_ENTITY', 'REDACT_ENTITY'}
+    assert all(d.get('entity_key') for d in decisions.values())
+    assert all('decision' not in d for d in decisions.values())

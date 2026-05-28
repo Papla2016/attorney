@@ -117,6 +117,43 @@ def normalize_source(source: str | None) -> str:
     return source or 'manual'
 
 
+
+
+def build_entity_semantic_key(entity_class: str, normalized_value: str | None, person_role: str | None = None) -> str:
+    cls = ' '.join(str(entity_class or 'OTHER').split()).upper()
+    value = ' '.join(str(normalized_value or '').split()).lower()
+    return f'{cls}::{value}'
+
+
+def entity_semantic_key(entity: dict) -> str:
+    return build_entity_semantic_key(
+        entity.get('entity_class') or entity.get('entity_type') or 'OTHER',
+        entity.get('normalized_value') or entity.get('canonical_value') or entity.get('original_value') or entity.get('surface_value') or '',
+        entity.get('person_role'),
+    )
+
+
+def store_keep_redact_decision(document_id: str, decision_type: str, entity: dict, *, reason: str | None = None) -> dict:
+    if decision_type not in {'KEEP_ENTITY', 'REDACT_ENTITY'}:
+        raise ValueError('Unsupported keep/redact manual decision')
+    key = entity_semantic_key(entity)
+    now = now_iso()
+    decisions = manual_decisions_by_document_id.setdefault(document_id, {})
+    existing = decisions.get(key, {})
+    decision = {
+        'decision_id': existing.get('decision_id') or str(uuid.uuid4()),
+        'document_id': document_id,
+        'decision_type': decision_type,
+        'entity_key': key,
+        'entity_class': entity.get('entity_class') or entity.get('entity_type') or 'OTHER',
+        'canonical_value': entity.get('canonical_value') or entity.get('normalized_value') or entity.get('original_value') or entity.get('surface_value'),
+        'reason': reason,
+        'created_at': existing.get('created_at') or now,
+        'updated_at': now,
+    }
+    decisions[key] = decision
+    return decision
+
 def ensure_mapping_metadata(mapping: dict, *, touch_updated: bool = False) -> dict:
     now = now_iso()
     if not mapping.get('id'):
@@ -733,20 +770,81 @@ def content_plain_text(content: dict | None) -> str:
 def apply_manual_decisions(document_id: str, resolved: list[dict]) -> list[dict]:
     decisions = manual_decisions_by_document_id.get(document_id, {})
     for e in resolved:
-        key = e.get('cluster_id') or f"{e['entity_class']}::{e.get('normalized_value', e['surface_value'])}"
+        key = build_entity_semantic_key(e.get('entity_class', 'OTHER'), e.get('normalized_value') or e.get('surface_value'), e.get('person_role'))
         d = decisions.get(key)
         if not d:
             continue
-        if d['decision'] == 'FORCE_KEEP':
+        if d.get('decision_type') == 'KEEP_ENTITY':
             e['redaction_decision'] = 'KEEP'
             e['requires_review'] = False
             e['redaction_reason'] = 'Оставлено пользователем'
-        elif d['decision'] == 'FORCE_REDACT':
+        elif d.get('decision_type') == 'REDACT_ENTITY':
             e['redaction_decision'] = 'REDACT'
             e['redaction_reason'] = 'Обезличено пользователем'
             e['requires_review'] = False
     return resolved
 
+
+
+
+def _find_entity_by_semantic_key(entities: list[dict], entity_key: str) -> dict | None:
+    return next((e for e in entities if entity_semantic_key(e) == entity_key), None)
+
+
+def apply_keep_redact_entity_decisions(document_id: str, redacted_entities: list[dict], kept_entities: list[dict], original_text: str) -> tuple[list[dict], list[dict]]:
+    decisions = [d for d in manual_decisions_by_document_id.get(document_id, {}).values() if d.get('decision_type') in {'KEEP_ENTITY', 'REDACT_ENTITY'}]
+    redacted = list(redacted_entities)
+    kept = list(kept_entities)
+
+    for d in decisions:
+        entity_key = d.get('entity_key')
+        if not entity_key:
+            continue
+        if d.get('decision_type') == 'KEEP_ENTITY':
+            ent = _find_entity_by_semantic_key(redacted, entity_key)
+            if ent:
+                redacted.remove(ent)
+                ent['redaction_decision'] = 'KEEP'
+                ent['requires_review'] = False
+                kept = [e for e in kept if e.get('entity_id') != ent.get('entity_id') and entity_semantic_key(e) != entity_key]
+                kept.append(ent)
+        elif d.get('decision_type') == 'REDACT_ENTITY':
+            ent = _find_entity_by_semantic_key(kept, entity_key)
+            if ent:
+                kept.remove(ent)
+                ent['redaction_decision'] = 'REDACT'
+                ent['requires_review'] = False
+                redacted = [e for e in redacted if e.get('entity_id') != ent.get('entity_id') and entity_semantic_key(e) != entity_key]
+                redacted.append(ent)
+            elif not _find_entity_by_semantic_key(redacted, entity_key):
+                value = d.get('canonical_value') or ''
+                if value:
+                    positions = [m.start() for m in re.finditer(re.escape(value), original_text)]
+                    if positions:
+                        entity_class = d.get('entity_class') or 'OTHER'
+                        ent = {
+                            'entity_id': str(uuid.uuid4()),
+                            'document_id': document_id,
+                            'entity_class': entity_class,
+                            'canonical_value': value,
+                            'normalized_value': value,
+                            'redaction_decision': 'REDACT',
+                            'requires_review': False,
+                            'mentions': [],
+                        }
+                        for pos in positions:
+                            ent['mentions'].append({
+                                'mention_id': str(uuid.uuid4()),
+                                'entity_id': ent['entity_id'],
+                                'surface_value': value,
+                                'normalized_value': value,
+                                'start': pos,
+                                'end': pos + len(value),
+                                'replacement_value': '',
+                            })
+                        ent['mentions_count'] = len(ent['mentions'])
+                        redacted.append(ent)
+    return redacted, kept
 
 def rebuild_document(document_id: str, mode: str):
     doc = restored_docs[document_id]
@@ -818,6 +916,7 @@ def anonymization_result_response(document: dict) -> dict:
         'content_format': document.get('content_format', 'PLAIN_TEXT'),
         'entities': document.get('entities', []),
         'mappings': document.get('mappings', []),
+        'kept_entities': document.get('kept_entities', document.get('recognized_but_kept', [])),
         'recognized_but_kept': document.get('recognized_but_kept', []),
         'review_entities': document.get('review_entities', []),
         'review_markers': document.get('review_markers', []),
@@ -961,10 +1060,7 @@ def add_mapping(document_id: str, body: MappingRequest, x_internal_service_token
             continue
         target.setdefault('mentions', []).append({'mention_id': str(uuid.uuid4()), 'entity_id': target['entity_id'], 'surface_value': body.original_value, 'start': pos, 'end': pos + len(body.original_value), 'replacement_value': target.get('placeholder') or ''})
     target['mentions_count'] = len(target.get('mentions', []))
-    manual_decisions_by_document_id.setdefault(document_id, {})[f'REDACT_ENTITY::{entity_class}::{body.original_value}'] = {
-        'decision_id': str(uuid.uuid4()), 'document_id': document_id, 'decision_type': 'REDACT_ENTITY',
-        'entity_id': target['entity_id'], 'canonical_value': target.get('canonical_value'), 'payload': {'mode': body.mode}, 'created_at': now_iso(), 'updated_at': now_iso(),
-    }
+    store_keep_redact_decision(document_id, 'REDACT_ENTITY', target, reason='Обезличено пользователем')
     rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
     return anonymization_result_response(doc)
 
@@ -999,13 +1095,16 @@ def delete_mapping(document_id: str, mapping_id: str, x_internal_service_token: 
     mapping = next((m for m in mappings if m.get('id') == mapping_id), None)
     if not mapping:
         _error(404, 'NOT_FOUND', 'Элемент таблицы соответствия не найден')
-    entity_key = mapping.get('cluster_id') or f"{mapping.get('entity_class', mapping.get('entity_type','OTHER'))}::{mapping.get('normalized_value', mapping.get('original_value',''))}"
-    manual_decisions_by_document_id.setdefault(document_id, {})[entity_key] = {'entity_key': entity_key, 'decision': 'FORCE_KEEP', 'target_cluster_id': None, 'reason': 'Оставлено пользователем', 'created_at': now_iso(), 'updated_at': now_iso()}
-    kept = doc.setdefault('kept_entities', [])
+    target_entity = next((e for e in doc.get('entities', []) if e.get('entity_id') == mapping_id), None)
+    if not target_entity:
+        _error(404, 'NOT_FOUND', 'Сущность для элемента таблицы соответствия не найдена')
+    store_keep_redact_decision(document_id, 'KEEP_ENTITY', target_entity, reason='Оставлено пользователем')
+    kept = [e for e in doc.get('kept_entities', []) if e.get('entity_id') != mapping_id]
     redacted = []
     for e in doc.get('entities', []):
         if e.get('entity_id') == mapping_id:
             e['redaction_decision'] = 'KEEP'
+            e['requires_review'] = False
             kept.append(e)
         else:
             redacted.append(e)
@@ -1056,13 +1155,10 @@ async def reanonymize(document_id: str, body: ReanonymizeRequest, x_internal_ser
     original_text = doc.get('original_text', '')
     entities = await extract_entities(original_text)
     resolved = resolve_entities(original_text, entities, body.publication_redaction_mode)
+    resolved = apply_manual_decisions(document_id, resolved)
     entities_view, recognized_but_kept, review_entities = build_entities_from_resolved(document_id, resolved, body.publication_redaction_mode)
-    for d in manual_decisions_by_document_id.get(document_id, {}).values():
-        ent = next((e for e in entities_view if e['entity_id'] == d.get('entity_id') or e.get('canonical_value') == d.get('canonical_value')), None)
-        if ent and d.get('decision') == 'FORCE_KEEP':
-            ent['redaction_decision'] = 'KEEP'
-        if ent and d.get('decision') == 'FORCE_REDACT':
-            ent['redaction_decision'] = 'REDACT'
+    entities_view, recognized_but_kept = apply_keep_redact_entity_decisions(document_id, entities_view, recognized_but_kept, original_text)
+    review_entities = [e for e in entities_view if e.get('requires_review')]
     rebuilt = rebuild_document_from_entities(document_id, entities_view, recognized_but_kept, original_text, doc.get('original_content'))
     mappings = rebuilt.get('mappings', [])
     anonymized = rebuilt.get('anonymized_text', '')
@@ -1096,14 +1192,15 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
         _error(400, 'BAD_REQUEST', 'Недопустимое решение', {'allowed': ['REDACT', 'KEEP', 'MERGE_WITH_EXISTING']})
     audit_log.append({'id': str(uuid.uuid4()), 'document_id': document_id, 'action': 'REDACTION_DECISION', 'details': body.model_dump(), 'created_at': now_iso()})
     doc = restored_docs[document_id]
-    entity_key = body.entity_key or f"{body.entity_class}::{normalize_spaces(body.selected_text)}"
+    decision_entity = {'entity_class': body.entity_class, 'canonical_value': body.selected_text, 'normalized_value': body.selected_text}
+    entity_key = body.entity_key or entity_semantic_key(decision_entity)
     decisions = manual_decisions_by_document_id.setdefault(document_id, {})
     if body.decision == 'REDACT':
-        decisions[entity_key] = {'entity_key': entity_key, 'decision': 'FORCE_REDACT', 'target_cluster_id': body.target_cluster_id, 'reason': body.reason, 'created_at': now_iso(), 'updated_at': now_iso()}
+        store_keep_redact_decision(document_id, 'REDACT_ENTITY', decision_entity, reason=body.reason)
         mapping = ensure_mapping_metadata({'original_value': body.selected_text, 'entity_type': body.entity_class, 'entity_class': body.entity_class, 'placeholder': next_placeholder(body.entity_class, doc.get('mappings', [])), 'source': 'manual'})
         doc.setdefault('mappings', []).append(mapping)
     elif body.decision == 'KEEP':
-        decisions[entity_key] = {'entity_key': entity_key, 'decision': 'FORCE_KEEP', 'target_cluster_id': body.target_cluster_id, 'reason': body.reason, 'created_at': now_iso(), 'updated_at': now_iso()}
+        store_keep_redact_decision(document_id, 'KEEP_ENTITY', decision_entity, reason=body.reason)
         doc['mappings'] = [m for m in doc.get('mappings', []) if m.get('original_value') != body.selected_text]
     elif body.decision == 'MERGE_WITH_EXISTING':
         target = next((m for m in doc.get('mappings', []) if m.get('cluster_id') == body.target_cluster_id), None)
@@ -1140,8 +1237,8 @@ async def draft_scan(document_id: str, body: DraftScanRequest, x_internal_servic
         surface = e.get('surface_value', '')
         if any(re.fullmatch(pat, surface) for pat in placeholder_patterns):
             continue
-        key = f"{e.get('entity_class','OTHER')}::{normalize_spaces(surface)}"
-        if decisions.get(key, {}).get('decision') == 'FORCE_KEEP':
+        key = build_entity_semantic_key(e.get('entity_class','OTHER'), e.get('normalized_value') or surface, e.get('person_role'))
+        if decisions.get(key, {}).get('decision_type') == 'KEEP_ENTITY':
             continue
         merge_candidates = [{'cluster_id': m.get('cluster_id'), 'placeholder': m.get('placeholder'), 'normalized_value': m.get('normalized_value')} for m in mappings if m.get('entity_class') == e.get('entity_class') and m.get('cluster_id')]
         pending.append({'entity_key': key, 'surface_value': surface, 'normalized_value': e.get('normalized_value', surface), 'entity_class': e.get('entity_class', 'OTHER'), 'person_role': e.get('person_role', 'UNKNOWN'), 'start': e.get('start', 0), 'end': e.get('end', 0), 'reason': 'В изменённом тексте найдено новое значение, требующее проверки', 'suggested_action': 'REDACT', 'merge_candidates': merge_candidates})
