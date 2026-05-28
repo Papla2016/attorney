@@ -2346,3 +2346,416 @@ def test_split_mention_missing_rich_content_mark_does_not_mutate_state():
         decision.get('decision_type') == 'SPLIT_MENTION'
         for decision in decisions.values()
     )
+
+def _merge_entities_doc(main, doc_id, *, working_text=None, working_content_marker=True, same_keys=False):
+    original_text = 'Макаров Антон Сергеевич явился. Макаров А.С. представил документы.'
+    original_content = _simple_content(original_text)
+    target_value = 'Макаров Антон Сергеевич'
+    source_value = target_value if same_keys else 'Макаров А.С.'
+    source_surface = 'Макаров А.С.'
+    target_start = original_text.index(target_value)
+    source_start = original_text.index(source_surface)
+    anonymized_text = working_text if working_text is not None else 'ФИО1 явился. ФИО2 представил документы.'
+    if working_content_marker is True:
+        anonymized_content = {
+            'type': 'doc',
+            'content': [{
+                'type': 'paragraph',
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': 'ФИО1',
+                        'marks': [{'type': 'redactionMention', 'attrs': {'entityId': 'merge-person-1', 'mentionId': 'merge-mention-1', 'placeholder': 'ФИО1'}}],
+                    },
+                    {'type': 'text', 'text': ' явился. '},
+                    {
+                        'type': 'text',
+                        'text': 'ФИО2',
+                        'marks': [{'type': 'redactionMention', 'attrs': {'entityId': 'merge-person-2', 'mentionId': 'merge-mention-2', 'placeholder': 'ФИО2'}}],
+                    },
+                    {'type': 'text', 'text': ' представил документы. Дополнительный текст.'},
+                ],
+            }],
+        }
+    elif working_content_marker is None:
+        anonymized_content = None
+    else:
+        anonymized_content = working_content_marker
+
+    main.restored_docs.pop(doc_id, None)
+    main.public_docs.pop(doc_id, None)
+    main.pending_review_by_document_id.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    doc = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': original_text,
+        'original_content': original_content,
+        'anonymized_text': anonymized_text,
+        'anonymized_content': anonymized_content,
+        'entities': [
+            {
+                'entity_id': 'merge-person-1',
+                'document_id': doc_id,
+                'entity_class': 'PERSON',
+                'canonical_value': target_value,
+                'normalized_value': target_value,
+                'person_role': 'UNKNOWN',
+                'context_label': None,
+                'placeholder': 'ФИО1',
+                'redaction_decision': 'REDACT',
+                'requires_review': False,
+                'mentions_count': 1,
+                'mentions': [{
+                    'mention_id': 'merge-mention-1',
+                    'entity_id': 'merge-person-1',
+                    'surface_value': target_value,
+                    'normalized_value': target_value,
+                    'start': target_start,
+                    'end': target_start + len(target_value),
+                    'replacement_value': 'ФИО1',
+                }],
+            },
+            {
+                'entity_id': 'merge-person-2',
+                'document_id': doc_id,
+                'entity_class': 'PERSON',
+                'canonical_value': source_value,
+                'normalized_value': source_value,
+                'person_role': 'UNKNOWN',
+                'context_label': None,
+                'placeholder': 'ФИО2',
+                'redaction_decision': 'REDACT',
+                'requires_review': False,
+                'mentions_count': 1,
+                'mentions': [{
+                    'mention_id': 'merge-mention-2',
+                    'entity_id': 'merge-person-2',
+                    'surface_value': source_surface,
+                    'normalized_value': source_value,
+                    'start': source_start,
+                    'end': source_start + len(source_surface),
+                    'replacement_value': 'ФИО2',
+                }],
+            },
+        ],
+        'kept_entities': [],
+        'recognized_but_kept': [],
+        'mappings': [],
+        'pending_review': [],
+    }
+    if working_text is not None:
+        doc['working_text'] = working_text
+    if working_content_marker is not None:
+        doc['working_content'] = anonymized_content
+    doc['mappings'] = main.build_mappings_from_entities(doc['entities'])
+    main.restored_docs[doc_id] = doc
+    return doc
+
+
+def _merge_post(client, main, doc_id, *, target='merge-person-1', sources=None):
+    return client.post(
+        f'/internal/anonymization/documents/{doc_id}/entities/merge',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'target_entity_id': target, 'source_entity_ids': sources if sources is not None else ['merge-person-2']},
+    )
+
+
+def _find_redaction_node(content, mention_id):
+    if isinstance(content, dict):
+        if content.get('type') == 'text':
+            for mark in content.get('marks', []):
+                if mark.get('type') == 'redactionMention' and (mark.get('attrs') or {}).get('mentionId') == mention_id:
+                    return content
+        for child in content.get('content', []) or []:
+            found = _find_redaction_node(child, mention_id)
+            if found:
+                return found
+    elif isinstance(content, list):
+        for child in content:
+            found = _find_redaction_node(child, mention_id)
+            if found:
+                return found
+    return None
+
+
+def test_merge_entities_preserves_working_rich_content_revision():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'merge-rich-working-doc'
+    working_text = 'ФИО1 явился. ФИО2 представил документы. Дополнительный текст.'
+    doc = _merge_entities_doc(main, doc_id, working_text=working_text, working_content_marker=True)
+    original_text = doc['original_text']
+    original_content = doc['original_content']
+
+    response = _merge_post(client, main, doc_id)
+
+    assert response.status_code == 200
+    payload = response.json()
+    expected = 'ФИО1 явился. ФИО1 представил документы. Дополнительный текст.'
+    assert payload['anonymized_text'] == expected
+    assert main.restored_docs[doc_id]['working_text'] == expected
+    assert main.restored_docs[doc_id]['working_content'] == main.restored_docs[doc_id]['anonymized_content']
+    person_entities = [entity for entity in payload['entities'] if entity['entity_class'] == 'PERSON']
+    assert len(person_entities) == 1
+    assert {mention['mention_id'] for mention in person_entities[0]['mentions']} == {'merge-mention-1', 'merge-mention-2'}
+    updated_node = _find_redaction_node(payload['anonymized_content'], 'merge-mention-2')
+    assert updated_node['text'] == 'ФИО1'
+    updated_mark = next(mark for mark in updated_node['marks'] if mark['type'] == 'redactionMention')
+    assert updated_mark['attrs']['entityId'] == 'merge-person-1'
+    assert updated_mark['attrs']['mentionId'] == 'merge-mention-2'
+    assert updated_mark['attrs']['placeholder'] == 'ФИО1'
+    assert main.restored_docs[doc_id]['original_text'] == original_text
+    assert main.restored_docs[doc_id]['original_content'] == original_content
+
+
+def test_merge_entities_survives_working_reanonymize():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'merge-rich-working-reanon-doc'
+    _merge_entities_doc(
+        main,
+        doc_id,
+        working_text='ФИО1 явился. ФИО2 представил документы. Дополнительный текст.',
+        working_content_marker=True,
+    )
+    original_text = main.restored_docs[doc_id]['original_text']
+    assert _merge_post(client, main, doc_id).status_code == 200
+
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/reanonymize',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'mappings': []},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['anonymized_text'] == 'ФИО1 явился. ФИО1 представил документы. Дополнительный текст.'
+    assert main.restored_docs[doc_id]['working_text'] == payload['anonymized_text']
+    assert len(payload['entities']) == 1
+    assert len(payload['entities'][0]['mentions']) == 2
+    assert main.restored_docs[doc_id]['original_text'] == original_text
+
+
+def test_merge_entities_plain_text_working_revision_replaces_all_source_placeholders():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'merge-plain-working-doc'
+    original_text = 'Исходный текст не должен использоваться.'
+    doc = _merge_entities_doc(
+        main,
+        doc_id,
+        working_text='ФИО1 явился. ФИО2 сказал. ФИО2 подписал документ.',
+        working_content_marker=None,
+    )
+    doc['original_text'] = original_text
+
+    response = _merge_post(client, main, doc_id)
+
+    assert response.status_code == 200
+    expected = 'ФИО1 явился. ФИО1 сказал. ФИО1 подписал документ.'
+    assert response.json()['anonymized_text'] == expected
+    assert main.restored_docs[doc_id]['working_text'] == expected
+    assert main.restored_docs[doc_id]['original_text'] == original_text
+    assert [entity['entity_id'] for entity in main.restored_docs[doc_id]['entities']] == ['merge-person-1']
+
+
+def test_merge_entities_missing_rich_content_mark_does_not_mutate_state():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+    import copy
+
+    client = TestClient(app)
+    doc_id = 'merge-rich-missing-mark-doc'
+    _merge_entities_doc(
+        main,
+        doc_id,
+        working_text='ФИО1 явился. ФИО2 представил документы. Дополнительный текст.',
+        working_content_marker=True,
+    )
+    content = main.restored_docs[doc_id]['working_content']
+    node = _find_redaction_node(content, 'merge-mention-2')
+    node['marks'][0]['attrs']['mentionId'] = 'missing-source-mention'
+    before_doc = copy.deepcopy(main.restored_docs[doc_id])
+    before_decisions = copy.deepcopy(main.manual_decisions_by_document_id.get(doc_id, {}))
+
+    response = _merge_post(client, main, doc_id)
+
+    assert response.status_code == 409
+    error = response.json()['error']
+    assert error['code'] == 'MERGE_ENTITIES_MARK_NOT_FOUND'
+    assert error['details']['missing_mention_ids'] == ['merge-mention-2']
+    assert main.restored_docs[doc_id]['entities'] == before_doc['entities']
+    assert main.restored_docs[doc_id]['mappings'] == before_doc['mappings']
+    assert main.restored_docs[doc_id]['working_text'] == before_doc['working_text']
+    assert main.restored_docs[doc_id]['working_content'] == before_doc['working_content']
+    assert main.restored_docs[doc_id]['anonymized_text'] == before_doc['anonymized_text']
+    assert main.restored_docs[doc_id]['anonymized_content'] == before_doc['anonymized_content']
+    assert main.manual_decisions_by_document_id.get(doc_id, {}) == before_decisions
+    assert not any(decision.get('decision_type') == 'MERGE_ENTITIES' for decision in before_decisions.values())
+
+
+def test_merge_entities_original_document_survives_original_based_reanonymize(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'merge-original-reanon-doc'
+    doc = _merge_entities_doc(main, doc_id, working_text=None, working_content_marker=None)
+    original_text = doc['original_text']
+
+    response = _merge_post(client, main, doc_id)
+    assert response.status_code == 200
+    decision = next(d for d in main.manual_decisions_by_document_id[doc_id].values() if d['decision_type'] == 'MERGE_ENTITIES')
+    assert decision['target_entity_key'] == 'PERSON::макаров антон сергеевич'
+    assert decision['source_entity_keys'] == ['PERSON::макаров а.с.']
+    assert decision['target_entity_id'] == 'merge-person-1'
+    assert decision['source_entity_ids'] == ['merge-person-2']
+
+    async def fake_extract_entities(text):
+        assert text == original_text
+        first = 'Макаров Антон Сергеевич'
+        second = 'Макаров А.С.'
+        return [
+            {
+                'type': 'PERSON_FULL_NAME',
+                'text': first,
+                'normalized_text': first,
+                'start': text.index(first),
+                'end': text.index(first) + len(first),
+                'source': 'natasha',
+            },
+            {
+                'type': 'PERSON_FULL_NAME',
+                'text': second,
+                'normalized_text': second,
+                'start': text.index(second),
+                'end': text.index(second) + len(second),
+                'source': 'natasha',
+            },
+        ]
+
+    monkeypatch.setattr(main, 'extract_entities', fake_extract_entities)
+    reanon = client.post(
+        f'/internal/anonymization/documents/{doc_id}/reanonymize',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'mappings': []},
+    )
+
+    assert reanon.status_code == 200
+    payload = reanon.json()
+    assert len(payload['entities']) == 1
+    assert {mention['surface_value'] for mention in payload['entities'][0]['mentions']} == {'Макаров Антон Сергеевич', 'Макаров А.С.'}
+    assert payload['anonymized_text'] == 'ФИО1 явился. ФИО1 представил документы.'
+    assert payload['entities'][0]['entity_id'] != 'merge-person-1'
+    assert all(mention['entity_id'] == payload['entities'][0]['entity_id'] for mention in payload['entities'][0]['mentions'])
+
+
+def test_merge_entities_original_document_rejects_same_semantic_keys():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+    import copy
+
+    client = TestClient(app)
+    doc_id = 'merge-original-same-key-doc'
+    _merge_entities_doc(main, doc_id, working_text=None, working_content_marker=None, same_keys=True)
+    before_doc = copy.deepcopy(main.restored_docs[doc_id])
+    before_decisions = copy.deepcopy(main.manual_decisions_by_document_id.get(doc_id, {}))
+
+    response = _merge_post(client, main, doc_id)
+
+    assert response.status_code == 409
+    error = response.json()['error']
+    assert error['code'] == 'MERGE_REQUIRES_DISTINCT_ENTITY_KEYS'
+    assert main.restored_docs[doc_id] == before_doc
+    assert main.manual_decisions_by_document_id.get(doc_id, {}) == before_decisions
+
+
+def test_merge_entities_validates_sources_before_mutation():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+    import copy
+
+    client = TestClient(app)
+    cases = [
+        ('merge-validate-empty-doc', {'target_entity_id': 'merge-person-1', 'source_entity_ids': []}, 400),
+        ('merge-validate-self-doc', {'target_entity_id': 'merge-person-1', 'source_entity_ids': ['merge-person-1']}, 400),
+        ('merge-validate-missing-doc', {'target_entity_id': 'merge-person-1', 'source_entity_ids': ['missing-source']}, 404),
+    ]
+    for doc_id, payload, status_code in cases:
+        _merge_entities_doc(main, doc_id, working_text='ФИО1 и ФИО2', working_content_marker=None)
+        before_doc = copy.deepcopy(main.restored_docs[doc_id])
+        before_decisions = copy.deepcopy(main.manual_decisions_by_document_id.get(doc_id, {}))
+        response = client.post(
+            f'/internal/anonymization/documents/{doc_id}/entities/merge',
+            headers={'X-Internal-Service-Token': main.INTERNAL},
+            json=payload,
+        )
+        assert response.status_code == status_code
+        assert main.restored_docs[doc_id] == before_doc
+        assert main.manual_decisions_by_document_id.get(doc_id, {}) == before_decisions
+
+    doc_id = 'merge-validate-class-doc'
+    _merge_entities_doc(main, doc_id, working_text='ФИО1 и ФИО2', working_content_marker=None)
+    main.restored_docs[doc_id]['entities'][1]['entity_class'] = 'ORGANIZATION'
+    before_doc = copy.deepcopy(main.restored_docs[doc_id])
+    before_decisions = copy.deepcopy(main.manual_decisions_by_document_id.get(doc_id, {}))
+    response = _merge_post(client, main, doc_id)
+    assert response.status_code == 400
+    assert main.restored_docs[doc_id] == before_doc
+    assert main.manual_decisions_by_document_id.get(doc_id, {}) == before_decisions
+
+def test_merge_entities_plain_text_does_not_corrupt_longer_placeholder():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'merge-plain-placeholder-prefix-doc'
+
+    doc = _merge_entities_doc(
+        main,
+        doc_id,
+        working_text='ФИО2 явился. ФИО1 сказал. ФИО10 подписал документ.',
+        working_content_marker=None,
+    )
+
+    target = next(e for e in doc['entities'] if e['entity_id'] == 'merge-person-1')
+    source = next(e for e in doc['entities'] if e['entity_id'] == 'merge-person-2')
+
+    target['placeholder'] = 'ФИО2'
+    target['mentions'][0]['replacement_value'] = 'ФИО2'
+
+    source['placeholder'] = 'ФИО1'
+    source['mentions'][0]['replacement_value'] = 'ФИО1'
+
+    doc['anonymized_text'] = doc['working_text']
+    doc['mappings'] = main.build_mappings_from_entities(doc['entities'])
+
+    response = _merge_post(
+        client,
+        main,
+        doc_id,
+        target='merge-person-1',
+        sources=['merge-person-2'],
+    )
+
+    assert response.status_code == 200
+    assert response.json()['anonymized_text'] == (
+        'ФИО2 явился. ФИО2 сказал. ФИО10 подписал документ.'
+    )
+    assert 'ФИО20' not in response.json()['anonymized_text']
