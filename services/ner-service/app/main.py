@@ -46,6 +46,13 @@ def map_natasha_type(span_type: str) -> str:
 class RussianPersonNormalizer:
     def __init__(self, morph_vocab=None):
         self.morph_vocab = morph_vocab
+        self.names_extractor = None
+        if morph_vocab is not None:
+            try:
+                from natasha import NamesExtractor
+                self.names_extractor = NamesExtractor(morph_vocab)
+            except Exception:
+                self.names_extractor = None
         self.initials_patterns = [
             re.compile(r'^([А-ЯЁ][а-яё]+)\s+([А-ЯЁ])\.\s*([А-ЯЁ])\.$'),
             re.compile(r'^([А-ЯЁ])\.\s*([А-ЯЁ])\.\s*([А-ЯЁ][а-яё]+)$'),
@@ -67,17 +74,27 @@ class RussianPersonNormalizer:
         parts = value.split()
         if len(parts) >= 3:
             s, n, p = parts[:3]
-            sn = self._normalize_word(s)
-            nn = self._normalize_word(n)
-            pn = self._normalize_word(p)
+            sn, nn, pn = self._normalize_full_name_parts(value, s, n, p)
             meta.update({'surname_normalized': sn, 'initials': f'{nn[0]}{pn[0]}', 'word_order': 'SURNAME_NAME_PATRONYMIC'})
             return f'{sn} {nn} {pn}', meta
         return None, meta
 
+    def _normalize_full_name_parts(self, text: str, s: str, n: str, p: str) -> tuple[str, str, str]:
+        if self.names_extractor is not None:
+            try:
+                matches = list(self.names_extractor(text))
+                if matches:
+                    fact = matches[0].fact
+                    sn = (fact.last or s)
+                    nn = (fact.first or n)
+                    pn = (fact.middle or p)
+                    return self._normalize_word(sn), self._normalize_word(nn), self._normalize_word(pn)
+            except Exception:
+                pass
+        return self._normalize_word(s), self._normalize_word(n), self._normalize_word(p)
+
     def _normalize_word(self, word: str) -> str:
         if not word:
-            return word
-        if self.morph_vocab is None:
             return word
         try:
             from natasha import Doc
@@ -86,12 +103,26 @@ class RussianPersonNormalizer:
         except Exception:
             pass
         try:
-            from pymorphy2 import MorphAnalyzer
+            from pymorphy3 import MorphAnalyzer
             m = MorphAnalyzer()
             p = m.parse(word)[0]
             return p.normal_form.capitalize()
         except Exception:
-            return word
+            lw = word.lower()
+            # lightweight russian name fallback for common declensions
+            for src, dst in [
+                ('ым', ''), ('им', ''), ('ом', ''), ('ем', ''),
+                ('ого', 'ий'), ('его', 'ий'),
+                ('ову', 'ов'), ('еву', 'ев'), ('ину', 'ин'),
+                ('ова', 'ов'), ('ева', 'ев'), ('ина', 'ин'),
+                ('ича', 'ич'), ('овича', 'ович'), ('евича', 'евич'),
+                ('ьевича', 'ьевич'), ('овне', 'овна'), ('евне', 'евна'),
+                ('ича', 'ич'), ('ия', 'ий'), ('ея', 'ей'),
+                ('у', ''), ('ю', ''), ('а', ''), ('я', ''),
+            ]:
+                if lw.endswith(src) and len(lw) > len(src) + 2:
+                    return (lw[:-len(src)] + dst).capitalize()
+            return word.capitalize()
 
 
 class NatashaNerProvider(BaseNerProvider):
@@ -154,7 +185,11 @@ class RegexRuleNerProvider(BaseNerProvider):
         fio_full = r'[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+'
         fio_initials = r'[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\.'
         fio = rf'(?:{fio_full}|{fio_initials})'
-        self.person_normalizer = RussianPersonNormalizer()
+        try:
+            from natasha import MorphVocab
+            self.person_normalizer = RussianPersonNormalizer(MorphVocab())
+        except Exception:
+            self.person_normalizer = RussianPersonNormalizer()
         self.patterns = [
             ('EMAIL', re.compile(r'(?<![\w.-])[\w.+-]+@[\w.-]+\.[A-Za-zА-Яа-яЁё]{2,}\b'), 0.95, 'regex'),
             ('PHONE', re.compile(r'(?<!\d)(?:\+7|8)[\s\-()]?\d{3}[\s\-()]?\d{3}[\s\-()]?\d{2}[\s\-()]?\d{2}(?!\d)'), 0.93, 'regex'),

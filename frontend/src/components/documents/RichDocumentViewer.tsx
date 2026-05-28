@@ -6,6 +6,19 @@ import Table from '@tiptap/extension-table';
 import TableRow from '@tiptap/extension-table-row';
 import TableHeader from '@tiptap/extension-table-header';
 import TableCell from '@tiptap/extension-table-cell';
+import { Mark } from '@tiptap/core';
+
+const RedactionMentionMark = Mark.create({
+  name: 'redactionMention',
+  inclusive: false,
+  addAttributes() {
+    return { entityId: { default: null }, mentionId: { default: null }, placeholder: { default: null } };
+  },
+  parseHTML() { return [{ tag: 'span[data-redaction-mention]' }]; },
+  renderHTML({ HTMLAttributes }) {
+    return ['span', { ...HTMLAttributes, 'data-redaction-mention': '1' }, 0];
+  },
+});
 
 export default function RichDocumentViewer({ value }: { value?: unknown }) {
   const editor = useEditor({
@@ -18,6 +31,7 @@ export default function RichDocumentViewer({ value }: { value?: unknown }) {
       TableRow,
       TableHeader,
       TableCell,
+      RedactionMentionMark,
     ],
     content: value || '<p></p>',
   });
