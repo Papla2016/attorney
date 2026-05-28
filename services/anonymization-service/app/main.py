@@ -78,6 +78,7 @@ class DraftScanRequest(BaseModel):
 
 class EntityPatchRequest(BaseModel):
     canonical_value: str | None = None
+    entity_class: str | None = None
     person_role: str | None = None
     context_label: str | None = None
 
@@ -272,6 +273,7 @@ def store_entity_metadata_decision(document_id: str, source_entity_key: str, ent
         'source_entity_key': source_entity_key,
         'payload': {
             'canonical_value': entity.get('canonical_value'),
+            'entity_class': entity.get('entity_class'),
             'person_role': entity.get('person_role'),
             'context_label': entity.get('context_label'),
         },
@@ -735,6 +737,7 @@ def build_entities_from_resolved(document_id: str, resolved: list[dict], mode: s
                 'canonical_value': normalized,
                 'normalized_value': normalized,
                 'person_role': role,
+                'entity_key': build_entity_semantic_key(cls, normalized, role),
                 'redaction_decision': 'KEEP',
                 'requires_review': False,
                 'source': e.get('source', 'natasha'),
@@ -1062,6 +1065,13 @@ def find_open_value_positions(text: str, value: str) -> list[int]:
     return [m.start() for m in re.finditer(re.escape(value), text or '')]
 
 
+def entity_response_items(entities: list[dict]) -> list[dict]:
+    return [
+        {**entity, 'entity_key': entity.get('entity_key') or entity_semantic_key(entity)}
+        for entity in entities
+    ]
+
+
 def mention_locator_from_mention(mention: dict) -> dict:
     return {
         'surface_value': mention.get('surface_value'),
@@ -1328,7 +1338,7 @@ def apply_entity_metadata_decisions(document_id: str, redacted_entities: list[di
         if not ent:
             continue
         payload = d.get('payload') or {}
-        for field in ('canonical_value', 'person_role', 'context_label'):
+        for field in ('canonical_value', 'entity_class', 'person_role', 'context_label'):
             if field in payload:
                 ent[field] = payload.get(field)
         ent['updated_at'] = now_iso()
@@ -1460,8 +1470,8 @@ def anonymization_result_response(document: dict) -> dict:
         'content_format': document.get('content_format', 'PLAIN_TEXT'),
         'entities': document.get('entities', []),
         'mappings': document.get('mappings', []),
-        'kept_entities': document.get('kept_entities', document.get('recognized_but_kept', [])),
-        'recognized_but_kept': document.get('recognized_but_kept', []),
+        'kept_entities': entity_response_items(document.get('kept_entities', document.get('recognized_but_kept', []))),
+        'recognized_but_kept': entity_response_items(document.get('recognized_but_kept', [])),
         'review_entities': document.get('review_entities', []),
         'review_markers': document.get('review_markers', []),
         'pending_review': document.get('pending_review', []),
@@ -1718,6 +1728,7 @@ def delete_mapping(document_id: str, mapping_id: str, x_internal_service_token: 
         if entity.get('entity_id') == mapping_id:
             entity['redaction_decision'] = 'KEEP'
             entity['requires_review'] = False
+            entity['entity_key'] = entity.get('entity_key') or entity_semantic_key(entity)
             kept.append(entity)
         else:
             redacted.append(entity)
@@ -1948,16 +1959,18 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
             }
             redacted_entities.append(target)
         target['entity_key'] = entity_key
-        search_text = (
-            doc.get('working_text')
-            if is_pending_decision and doc.get('working_text') is not None
-            else doc.get('original_text', '')
-        )
+        working = has_working_revision(doc)
+        search_text = (doc.get('working_text') if doc.get('working_text') is not None else content_plain_text(doc.get('working_content'))) if working else doc.get('original_text', '')
 
-        existing_ranges = {
-            (m.get('start'), m.get('end'))
-            for m in target.get('mentions', [])
-        }
+        previous_mentions = list(target.get('mentions', []))
+        if working and not is_pending_decision:
+            target['mentions'] = []
+            existing_ranges = set()
+        else:
+            existing_ranges = {
+                (m.get('start'), m.get('end'))
+                for m in target.get('mentions', [])
+            }
         accepted_ranges = set(existing_ranges)
         new_mentions = []
 
@@ -1981,10 +1994,13 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
                 reverse=True,
             )
         else:
-            surface_to_normalized = {
-                body.selected_text: canonical_value
-            }
-            surfaces_to_redact = [body.selected_text]
+            surface_to_normalized = {body.selected_text: canonical_value}
+            if working:
+                for previous in previous_mentions:
+                    surface = previous.get('surface_value')
+                    if surface:
+                        surface_to_normalized[surface] = previous.get('normalized_value') or canonical_value
+            surfaces_to_redact = sorted(surface_to_normalized.keys(), key=len, reverse=True)
 
         def overlaps_existing(start: int, end: int) -> bool:
             return any(
@@ -2017,7 +2033,7 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
                 accepted_ranges.add((start, end))
 
         target['mentions_count'] = len(target.get('mentions', []))
-        if is_pending_decision:
+        if is_pending_decision or working:
             target['placeholder'] = target.get('placeholder') or next_placeholder(entity_class, doc.get('mappings', []))
             for mention in new_mentions:
                 mention['replacement_value'] = target['placeholder']
@@ -2029,8 +2045,11 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
             working_content = doc.get('working_content')
             if working_content:
                 updated_content = anonymize_content_by_mentions(working_content, [{**target, 'mentions': new_mentions}])
+                updated_text = content_plain_text(updated_content)
                 doc['working_content'] = updated_content
                 doc['anonymized_content'] = updated_content
+                doc['working_text'] = updated_text
+                doc['anonymized_text'] = updated_text
             doc['entities'] = redacted_entities
             doc['kept_entities'] = kept_entities
             doc['recognized_but_kept'] = kept_entities

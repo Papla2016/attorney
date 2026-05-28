@@ -3270,3 +3270,71 @@ def test_legacy_mapping_public_content_remains_sanitized():
     assert 'entityId' not in serialized
     assert 'mentionId' not in serialized
     assert 'split_origin' not in serialized
+
+
+def test_keep_table_redact_action_restores_redaction_for_working_document():
+    client, main = _compat_client()
+    doc_id = 'keep-table-redact-working'
+    mentions = [
+        {'mention_id': 'm1', 'entity_id': 'person-1', 'surface_value': 'Макарова Антона Сергеевича', 'normalized_value': 'Макаров Антон Сергеевич', 'start': 0, 'end': 26, 'replacement_value': 'Макарова Антона Сергеевича'},
+        {'mention_id': 'm2', 'entity_id': 'person-1', 'surface_value': 'Макаровым Антоном Сергеевичем', 'normalized_value': 'Макаров Антон Сергеевич', 'start': 29, 'end': 57, 'replacement_value': 'Макаровым Антоном Сергеевичем'},
+    ]
+    kept = _compat_entity('person-1', None, 'Макаров Антон Сергеевич', mentions)
+    kept['redaction_decision'] = 'KEEP'
+    kept.pop('placeholder', None)
+    content = _doc_content([_text_node('Макарова Антона Сергеевича'), _text_node(' и '), _text_node('Макаровым Антоном Сергеевичем')])
+    doc = _install_compat_doc(main, doc_id, [], working_text='Макарова Антона Сергеевича и Макаровым Антоном Сергеевичем', working_content=content, original_text='ORIGINAL')
+    doc['kept_entities'] = [kept]
+    doc['recognized_but_kept'] = [kept]
+    entity_key = main.entity_semantic_key(kept)
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={
+            'entity_key': entity_key,
+            'selected_text': 'Макаров Антон Сергеевич',
+            'entity_class': 'PERSON',
+            'decision': 'REDACT',
+            'reason': 'Обезличено пользователем из списка оставленных значений',
+        },
+    )
+
+    assert response.status_code == 200
+    stored = main.restored_docs[doc_id]
+    assert stored['kept_entities'] == []
+    assert stored['entities'][0]['entity_id'] == 'person-1'
+    assert stored['entities'][0]['redaction_decision'] == 'REDACT'
+    assert stored['entities'][0]['placeholder'] == 'ФИО1'
+    assert stored['working_text'] == 'ФИО1 и ФИО1'
+    assert stored['anonymized_text'] == 'ФИО1 и ФИО1'
+    marks = [mark for node in stored['working_content']['content'][0]['content'] for mark in node.get('marks', []) if mark.get('type') == 'redactionMention']
+    assert len(marks) == 2
+    assert all(mark['attrs']['entityId'] == 'person-1' for mark in marks)
+    assert stored['mappings'][0]['id'] == 'person-1'
+    assert any(d['decision_type'] == 'REDACT_ENTITY' for d in main.manual_decisions_by_document_id[doc_id].values())
+    assert stored['original_text'] == 'ORIGINAL'
+
+
+def test_patch_entity_allows_entity_class_update_without_losing_working_revision():
+    import copy
+    client, main = _compat_client()
+    doc_id = 'patch-entity-class-working'
+    content = _doc_content([_text_node('ФИО1', [_redaction_mark('person-1', 'm1', 'ФИО1')])])
+    entity = _compat_entity('person-1', 'ФИО1', mentions=[{'mention_id': 'm1', 'entity_id': 'person-1', 'surface_value': 'Иванов Иван Иванович', 'normalized_value': 'Иванов Иван Иванович', 'start': 0, 'end': 20, 'replacement_value': 'ФИО1'}])
+    doc = _install_compat_doc(main, doc_id, [entity], working_text='ФИО1', working_content=content, original_text='Иванов Иван Иванович')
+    before_content = copy.deepcopy(doc['working_content'])
+
+    response = client.patch(
+        f'/internal/anonymization/documents/{doc_id}/entities/person-1',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'canonical_value': 'Иванов Иван Иванович', 'entity_class': 'DATE'},
+    )
+
+    assert response.status_code == 200
+    stored = main.restored_docs[doc_id]
+    assert stored['entities'][0]['entity_class'] == 'DATE'
+    assert stored['mappings'][0]['entity_class'] == 'DATE'
+    assert stored['mappings'][0]['entity_type'] == 'DATE'
+    assert stored['working_text'] == 'ФИО1'
+    assert stored['working_content'] == before_content
+    assert stored['original_text'] == 'Иванов Иван Иванович'

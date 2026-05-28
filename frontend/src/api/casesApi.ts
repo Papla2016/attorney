@@ -52,4 +52,4 @@ export const scanEditedDraft = (
   payload: { text: string; content: unknown; content_format: 'TIPTAP_JSON'; document_revision: number }
 ) => client.post<AnonymizationResult>(`/cases/documents/${documentId}/draft-scan`, payload);
 
-export const updateDocumentEntity = (documentId: string, entityId: string, payload: { canonical_value: string; person_role?: string; context_label?: string }) => client.patch(`/cases/documents/${documentId}/entities/${entityId}`, payload);
+export const updateDocumentEntity = (documentId: string, entityId: string, payload: { canonical_value: string; entity_class?: string; person_role?: string; context_label?: string }) => client.patch(`/cases/documents/${documentId}/entities/${entityId}`, payload);
