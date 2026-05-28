@@ -854,6 +854,39 @@ def split_entity_mention_in_state(document_id: str, entities: list[dict], source
     updated_entities.append(new_entity)
     return updated_entities, new_entity
 
+def has_redaction_mention_mark(content: dict | None, mention_id: str) -> bool:
+    if not content:
+        return False
+
+    found = False
+
+    def walk(node):
+        nonlocal found
+
+        if found:
+            return
+
+        if isinstance(node, dict):
+            if node.get('type') == 'text' and isinstance(node.get('marks'), list):
+                for mark in node['marks']:
+                    if mark.get('type') != 'redactionMention':
+                        continue
+
+                    attrs = mark.get('attrs') or {}
+                    if attrs.get('mentionId') == mention_id:
+                        found = True
+                        return
+
+            if isinstance(node.get('content'), list):
+                for child in node['content']:
+                    walk(child)
+
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    walk(content)
+    return found
 
 def update_working_content_for_split(content: dict, mention_id: str, new_entity: dict) -> tuple[dict, bool]:
     data = copy.deepcopy(content)
@@ -1782,7 +1815,18 @@ def split_mention(document_id: str, entity_id: str, mention_id: str, x_internal_
                     'occurrences_count': occurrences_count,
                 },
             )
-
+    if has_working_revision and doc.get('working_content') is not None:
+        if not has_redaction_mention_mark(doc.get('working_content'), mention_id):
+            _error(
+                409,
+                'SPLIT_MENTION_MARK_NOT_FOUND',
+                'Разметка выбранного упоминания не найдена',
+                {
+                    'entity_id': entity_id,
+                    'mention_id': mention_id,
+                },
+            )
+            
     updated_entities, new_ent = split_entity_mention_in_state(document_id, doc.get('entities', []), src, mention)
     store_split_mention_decision(document_id, source_entity_key, entity_id, mention, new_ent['entity_id'])
 

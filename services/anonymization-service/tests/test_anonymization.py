@@ -2298,3 +2298,51 @@ def test_split_decision_does_not_depend_only_on_uuid():
     assert sorted(len(e['mentions']) for e in reapplied) == [1, 1]
     assert all(e.get('entity_id') != decision['entity_id'] for e in reapplied)
     assert all(m.get('mention_id') != decision['mention_id'] for e in reapplied for m in e['mentions'])
+
+def test_split_mention_missing_rich_content_mark_does_not_mutate_state():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+    import copy
+
+    client = TestClient(app)
+    doc_id = 'split-rich-missing-mark-doc'
+
+    working_text = 'ФИО1 явился. ФИО1 представил документы.'
+    working_content = _split_rich_content()
+
+    # В entities выбранное упоминание имеет mention_id = mention-2,
+    # но в rich-content такого mark больше нет.
+    working_content['content'][0]['content'][2]['marks'][0]['attrs']['mentionId'] = 'another-mention-id'
+
+    _split_doc(
+        main,
+        doc_id,
+        working_text=working_text,
+        working_content=working_content,
+    )
+
+    before_doc = copy.deepcopy(main.restored_docs[doc_id])
+    before_decisions = copy.deepcopy(
+        main.manual_decisions_by_document_id.get(doc_id, {})
+    )
+
+    response = _split_post(client, main, doc_id)
+
+    assert response.status_code == 409
+
+    error = response.json()['error']
+    assert error['code'] == 'SPLIT_MENTION_MARK_NOT_FOUND'
+
+    assert main.restored_docs[doc_id]['entities'] == before_doc['entities']
+    assert main.restored_docs[doc_id]['working_text'] == before_doc['working_text']
+    assert main.restored_docs[doc_id]['working_content'] == before_doc['working_content']
+    assert main.restored_docs[doc_id]['anonymized_text'] == before_doc['anonymized_text']
+    assert main.restored_docs[doc_id]['anonymized_content'] == before_doc['anonymized_content']
+
+    decisions = main.manual_decisions_by_document_id.get(doc_id, {})
+    assert decisions == before_decisions
+    assert not any(
+        decision.get('decision_type') == 'SPLIT_MENTION'
+        for decision in decisions.values()
+    )
