@@ -110,7 +110,21 @@ class RussianPersonNormalizer:
             p = m.parse(word)[0]
             return p.normal_form.capitalize()
         except Exception:
-            return word
+            lw = word.lower()
+            # lightweight russian name fallback for common declensions
+            for src, dst in [
+                ('ым', ''), ('им', ''), ('ом', ''), ('ем', ''),
+                ('ого', 'ий'), ('его', 'ий'),
+                ('ову', 'ов'), ('еву', 'ев'), ('ину', 'ин'),
+                ('ова', 'ов'), ('ева', 'ев'), ('ина', 'ин'),
+                ('ича', 'ич'), ('овича', 'ович'), ('евича', 'евич'),
+                ('ьевича', 'ьевич'), ('овне', 'овна'), ('евне', 'евна'),
+                ('ича', 'ич'), ('ия', 'ий'), ('ея', 'ей'),
+                ('у', ''), ('ю', ''), ('а', ''), ('я', ''),
+            ]:
+                if lw.endswith(src) and len(lw) > len(src) + 2:
+                    return (lw[:-len(src)] + dst).capitalize()
+            return word.capitalize()
 
 
 class NatashaNerProvider(BaseNerProvider):

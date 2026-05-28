@@ -717,7 +717,7 @@ async def extract_entities(text: str) -> list[dict]:
         return []
 
 
-def save_document(document_id: str, case_id: str, title: str, original_text: str, anonymized_text: str, mappings: list[dict], metadata: dict | None = None, recognized_but_kept: list[dict] | None = None):
+def save_document(document_id: str, case_id: str, title: str, original_text: str, anonymized_text: str, mappings: list[dict], metadata: dict | None = None, recognized_but_kept: list[dict] | None = None, anonymized_content: dict | None = None, entities: list[dict] | None = None, kept_entities: list[dict] | None = None, review_entities: list[dict] | None = None):
     existing = restored_docs.get(document_id, {})
     public_docs[document_id] = {
         'document_id': document_id,
@@ -725,6 +725,8 @@ def save_document(document_id: str, case_id: str, title: str, original_text: str
         'title': title,
         'anonymized_text': anonymized_text,
         'recognized_but_kept': recognized_but_kept or [],
+        'anonymized_content': anonymized_content,
+        'content_format': existing.get('content_format', 'PLAIN_TEXT'),
         'metadata': metadata or {},
     }
     restored_docs[document_id] = {
@@ -735,10 +737,12 @@ def save_document(document_id: str, case_id: str, title: str, original_text: str
         'anonymized_text': anonymized_text,
         'mappings': [ensure_mapping_metadata(m) for m in mappings],
         'recognized_but_kept': recognized_but_kept or [],
+        'entities': entities or existing.get('entities', []),
+        'kept_entities': kept_entities or existing.get('kept_entities', []),
         'content_format': existing.get('content_format', 'PLAIN_TEXT'),
         'original_content': existing.get('original_content'),
-        'anonymized_content': replace_content_by_mappings(existing.get('original_content'), mappings),
-        'review_entities': existing.get('review_entities', []),
+        'anonymized_content': anonymized_content if anonymized_content is not None else existing.get('anonymized_content'),
+        'review_entities': review_entities or existing.get('review_entities', []),
         'review_markers': existing.get('review_markers', []),
         'pending_review': existing.get('pending_review', []),
         'pending_markers': existing.get('pending_markers', []),
@@ -793,7 +797,11 @@ async def process(body: ProcessRequest, x_internal_service_token: str | None = H
     rebuilt = rebuild_document_from_entities(body.document_id, entities + recognized_but_kept, body.text, body.original_content)
     mappings = rebuilt.get('mappings', [])
     anonymized = rebuilt.get('anonymized_text', '')
-    save_document(body.document_id, body.case_id, body.title, body.text, anonymized, mappings, body.metadata, recognized_but_kept)
+    save_document(
+        body.document_id, body.case_id, body.title, body.text, anonymized, mappings,
+        body.metadata, recognized_but_kept, rebuilt.get('anonymized_content'), rebuilt.get('entities'),
+        rebuilt.get('kept_entities'), review_entities
+    )
     jobs[job_id]['status'] = 'COMPLETED'
     restored_docs[body.document_id]['entities']=entities
     restored_docs[body.document_id]['review_entities']=review_entities
@@ -1003,7 +1011,11 @@ async def reanonymize(document_id: str, body: ReanonymizeRequest, x_internal_ser
     rebuilt = rebuild_document_from_entities(document_id, entities_view + recognized_but_kept, original_text, doc.get('original_content'))
     mappings = rebuilt.get('mappings', [])
     anonymized = rebuilt.get('anonymized_text', '')
-    save_document(document_id, doc.get('case_id', ''), doc.get('title', ''), original_text, anonymized, mappings, public_docs.get(document_id, {}).get('metadata', {}), recognized_but_kept)
+    save_document(
+        document_id, doc.get('case_id', ''), doc.get('title', ''), original_text, anonymized, mappings,
+        public_docs.get(document_id, {}).get('metadata', {}), recognized_but_kept, rebuilt.get('anonymized_content'),
+        rebuilt.get('entities'), rebuilt.get('kept_entities'), review_entities
+    )
     restored_docs[document_id]['entities'] = rebuilt.get('entities', [])
     restored_docs[document_id]['anonymized_content'] = rebuilt.get('anonymized_content')
     restored_docs[document_id]['review_entities']=review_entities
