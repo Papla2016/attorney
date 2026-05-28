@@ -155,28 +155,6 @@ def store_keep_redact_decision(document_id: str, decision_type: str, entity: dic
     decisions[key] = decision
     return decision
 
-
-def store_entity_metadata_decision(document_id: str, source_entity_key: str, entity: dict) -> dict:
-    now = now_iso()
-    decisions = manual_decisions_by_document_id.setdefault(document_id, {})
-    decision_key = f'UPDATE_ENTITY_METADATA::{source_entity_key}'
-    existing = decisions.get(decision_key, {})
-    decision = {
-        'decision_id': existing.get('decision_id') or str(uuid.uuid4()),
-        'document_id': document_id,
-        'decision_type': 'UPDATE_ENTITY_METADATA',
-        'source_entity_key': source_entity_key,
-        'payload': {
-            'canonical_value': entity.get('canonical_value'),
-            'person_role': entity.get('person_role'),
-            'context_label': entity.get('context_label'),
-        },
-        'created_at': existing.get('created_at') or now,
-        'updated_at': now,
-    }
-    decisions[decision_key] = decision
-    return decision
-
 def ensure_mapping_metadata(mapping: dict, *, touch_updated: bool = False) -> dict:
     now = now_iso()
     if not mapping.get('id'):
@@ -814,24 +792,6 @@ def _find_entity_by_semantic_key(entities: list[dict], entity_key: str) -> dict 
     return next((e for e in entities if e.get('entity_key') == entity_key or entity_semantic_key(e) == entity_key), None)
 
 
-def apply_entity_metadata_decisions(document_id: str, redacted_entities: list[dict], kept_entities: list[dict]) -> tuple[list[dict], list[dict]]:
-    decisions = [d for d in manual_decisions_by_document_id.get(document_id, {}).values() if d.get('decision_type') == 'UPDATE_ENTITY_METADATA']
-    by_key = {entity_semantic_key(e): e for e in [*redacted_entities, *kept_entities]}
-    for d in decisions:
-        source_entity_key = d.get('source_entity_key')
-        if not source_entity_key:
-            continue
-        ent = by_key.get(source_entity_key)
-        if not ent:
-            continue
-        payload = d.get('payload') or {}
-        for field in ('canonical_value', 'person_role', 'context_label'):
-            if field in payload:
-                ent[field] = payload.get(field)
-        ent['updated_at'] = now_iso()
-    return redacted_entities, kept_entities
-
-
 def apply_keep_redact_entity_decisions(document_id: str, redacted_entities: list[dict], kept_entities: list[dict], original_text: str) -> tuple[list[dict], list[dict]]:
     decisions = [d for d in manual_decisions_by_document_id.get(document_id, {}).values() if d.get('decision_type') in {'KEEP_ENTITY', 'REDACT_ENTITY'}]
     redacted = list(redacted_entities)
@@ -1247,7 +1207,6 @@ async def reanonymize(document_id: str, body: ReanonymizeRequest, x_internal_ser
     resolved = apply_manual_decisions(document_id, resolved)
     entities_view, recognized_but_kept, review_entities = build_entities_from_resolved(document_id, resolved, body.publication_redaction_mode)
     entities_view, recognized_but_kept = apply_keep_redact_entity_decisions(document_id, entities_view, recognized_but_kept, original_text)
-    entities_view, recognized_but_kept = apply_entity_metadata_decisions(document_id, entities_view, recognized_but_kept)
     review_entities = [e for e in entities_view if e.get('requires_review')]
     rebuilt = rebuild_document_from_entities(document_id, entities_view, recognized_but_kept, original_text, doc.get('original_content'))
     mappings = rebuilt.get('mappings', [])
@@ -1261,7 +1220,6 @@ async def reanonymize(document_id: str, body: ReanonymizeRequest, x_internal_ser
     restored_docs[document_id]['anonymized_content'] = rebuilt.get('anonymized_content')
     restored_docs[document_id]['review_entities']=review_entities
     restored_docs[document_id]['publication_redaction_mode']=body.publication_redaction_mode
-    restored_docs[document_id]['manual_decisions'] = list(manual_decisions_by_document_id.get(document_id, {}).values())
     return anonymization_result_response(restored_docs[document_id])
 
 
@@ -1570,33 +1528,13 @@ def patch_entity(document_id: str, entity_id: str, body: EntityPatchRequest, x_i
     ent = next((e for e in doc.get('entities', []) if e.get('entity_id') == entity_id), None)
     if not ent:
         _error(404, 'NOT_FOUND', 'Сущность не найдена')
-
-    source_entity_key = entity_semantic_key(ent)
     for k, v in body.model_dump(exclude_unset=True).items():
         ent[k] = v
-    ent['updated_at'] = now_iso()
-    store_entity_metadata_decision(document_id, source_entity_key, ent)
-
-    has_working_revision = (
-        doc.get('working_text') is not None
-        or doc.get('working_content') is not None
-    )
-    if has_working_revision:
-        doc['mappings'] = build_mappings_from_entities(doc.get('entities', []))
-        doc['review_entities'] = [e for e in doc.get('entities', []) if e.get('requires_review')]
-        if doc.get('working_text') is not None:
-            doc['anonymized_text'] = doc.get('working_text', '')
-        if doc.get('working_content') is not None:
-            doc['anonymized_content'] = doc.get('working_content')
-        doc['manual_decisions'] = list(manual_decisions_by_document_id.get(document_id, {}).values())
-        if document_id in public_docs:
-            public_docs[document_id]['anonymized_text'] = doc.get('anonymized_text', '')
-            public_docs[document_id]['anonymized_content'] = doc.get('anonymized_content')
-            public_docs[document_id]['content_format'] = doc.get('content_format', 'PLAIN_TEXT')
-        return anonymization_result_response(doc)
-
+    manual_decisions_by_document_id.setdefault(document_id, {})[f'UPDATE_ENTITY_ROLE::{entity_id}'] = {
+        'decision_id': str(uuid.uuid4()), 'document_id': document_id, 'decision_type': 'UPDATE_ENTITY_ROLE',
+        'entity_id': entity_id, 'payload': body.model_dump(exclude_unset=True), 'created_at': now_iso(), 'updated_at': now_iso(),
+    }
     rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
-    doc['manual_decisions'] = list(manual_decisions_by_document_id.get(document_id, {}).values())
     return anonymization_result_response(doc)
 
 
