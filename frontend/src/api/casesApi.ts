@@ -41,6 +41,7 @@ export const applyRedactionDecision = (
     entity_class: string;
     person_role?: string;
     target_cluster_id?: string;
+    target_entity_id?: string;
     reason?: string;
   }
 ) => client.post<AnonymizationResult>(`/cases/documents/${documentId}/redaction-decisions`, payload);

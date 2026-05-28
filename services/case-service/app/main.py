@@ -279,6 +279,7 @@ class RedactionDecisionIn(BaseModel):
     decision: str
     entity_class: str = 'PERSON'
     target_cluster_id: str | None = None
+    target_entity_id: str | None = None
     reason: str = 'Решение пользователя'
 
 

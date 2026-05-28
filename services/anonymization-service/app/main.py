@@ -64,6 +64,7 @@ class RedactionDecisionRequest(BaseModel):
     entity_class: str = 'PERSON'
     person_role: str | None = None
     target_cluster_id: str | None = None
+    target_entity_id: str | None = None
     reason: str = 'Исправлено пользователем'
 
 
@@ -1340,16 +1341,67 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
             if doc.get('working_content') is not None:
                 doc['anonymized_content'] = doc.get('working_content')
     elif body.decision == 'MERGE_WITH_EXISTING':
-        target = next((m for m in doc.get('mappings', []) if m.get('cluster_id') == body.target_cluster_id), None)
+        if not body.target_entity_id:
+            _error(400, 'BAD_REQUEST', 'target_entity_id обязателен для MERGE_WITH_EXISTING')
+        target = next((e for e in redacted_entities if e.get('entity_id') == body.target_entity_id), None)
         if not target:
-            _error(400, 'BAD_REQUEST', 'Целевой cluster не найден')
+            _error(404, 'NOT_FOUND', 'Целевая сущность не найдена')
+        target['placeholder'] = target.get('placeholder') or next_placeholder(target.get('entity_class', entity_class), doc.get('mappings', []))
+        pending_group = [p for p in pending_items if p.get('entity_key') == entity_key] or [{
+            'surface_value': body.selected_text,
+            'normalized_value': canonical_value,
+            'entity_class': entity_class,
+        }]
+        search_text = doc.get('working_text') if doc.get('working_text') is not None else doc.get('original_text', '')
+        existing_ranges = {(m.get('start'), m.get('end')) for m in target.get('mentions', [])}
+        new_mentions = []
+        for pending in pending_group:
+            surface = pending.get('surface_value') or body.selected_text
+            normalized = pending.get('normalized_value') or surface
+            for match in re.finditer(re.escape(surface), search_text or ''):
+                rng = (match.start(), match.end())
+                if rng in existing_ranges:
+                    continue
+                mention = {
+                    'mention_id': str(uuid.uuid4()),
+                    'entity_id': target['entity_id'],
+                    'surface_value': surface,
+                    'normalized_value': normalized,
+                    'start': match.start(),
+                    'end': match.end(),
+                    'replacement_value': target['placeholder'],
+                }
+                target.setdefault('mentions', []).append(mention)
+                new_mentions.append(mention)
+                existing_ranges.add(rng)
+        target['mentions_count'] = len(target.get('mentions', []))
+        updated_text = search_text or ''
+        for mention in sorted(new_mentions, key=lambda m: m['start'], reverse=True):
+            updated_text = updated_text[:mention['start']] + target['placeholder'] + updated_text[mention['end']:]
+        doc['working_text'] = updated_text
+        doc['anonymized_text'] = updated_text
+        working_content = doc.get('working_content')
+        if working_content:
+            updated_content = anonymize_content_by_mentions(working_content, [{**target, 'mentions': new_mentions}])
+            doc['working_content'] = updated_content
+            doc['anonymized_content'] = updated_content
+        doc['entities'] = redacted_entities
+        doc['kept_entities'] = kept_entities
+        doc['recognized_but_kept'] = kept_entities
+        doc['mappings'] = build_mappings_from_entities(redacted_entities)
+        doc['review_entities'] = [e for e in redacted_entities if e.get('requires_review')]
+        now = now_iso()
         decisions = manual_decisions_by_document_id.setdefault(document_id, {})
-        decisions[entity_key] = {'entity_key': entity_key, 'decision': 'MERGE_WITH_CLUSTER', 'target_cluster_id': body.target_cluster_id, 'reason': body.reason, 'created_at': now_iso(), 'updated_at': now_iso()}
-        doc.setdefault('mappings', []).append(ensure_mapping_metadata({'original_value': body.selected_text, 'entity_type': body.entity_class, 'entity_class': body.entity_class, 'cluster_id': body.target_cluster_id, 'placeholder': target.get('placeholder'), 'source': 'manual'}))
-        for e in redacted_entities:
-            if e.get('canonical_value') == body.selected_text or e.get('normalized_value') == body.selected_text:
-                e['redaction_decision'] = 'REDACT'
-        rebuild_document_from_entities(document_id, redacted_entities, kept_entities, doc.get('original_text', ''), doc.get('original_content'))
+        decisions[f'MERGE_PENDING_WITH_ENTITY::{entity_key}::{target["entity_id"]}'] = {
+            'decision_id': str(uuid.uuid4()),
+            'document_id': document_id,
+            'decision_type': 'MERGE_PENDING_WITH_ENTITY',
+            'entity_key': entity_key,
+            'target_entity_id': target['entity_id'],
+            'target_entity_key': entity_semantic_key(target),
+            'created_at': now,
+            'updated_at': now,
+        }
 
     pending = [p for p in pending_items if p.get('entity_key') != entity_key]
     pending_review_by_document_id[document_id] = pending
@@ -1371,7 +1423,7 @@ async def draft_scan(document_id: str, body: DraftScanRequest, x_internal_servic
     entities = await extract_entities(body.text)
     pending = []
     decisions = manual_decisions_by_document_id.get(document_id, {})
-    mappings = restored_docs[document_id].get('mappings', [])
+    existing_entities = restored_docs[document_id].get('entities', [])
     placeholder_patterns = [r'ФИО\d+', r'ПАСПОРТ\d+', r'ИНН\d+', r'АДРЕС\d+', r'ДАТА\d+', r'ТЕЛЕФОН\d+', r'СНИЛС\d+', r'ЭЛЕКТРОННАЯ_ПОЧТА\d+']
     for e in resolve_entities(body.text, entities, 'NORMATIVE'):
         surface = e.get('surface_value', '')
@@ -1380,7 +1432,20 @@ async def draft_scan(document_id: str, body: DraftScanRequest, x_internal_servic
         key = build_entity_semantic_key(e.get('entity_class','OTHER'), e.get('normalized_value') or surface, e.get('person_role'))
         if decisions.get(key, {}).get('decision_type') == 'KEEP_ENTITY':
             continue
-        merge_candidates = [{'cluster_id': m.get('cluster_id'), 'placeholder': m.get('placeholder'), 'normalized_value': m.get('normalized_value')} for m in mappings if m.get('entity_class') == e.get('entity_class') and m.get('cluster_id')]
+        merge_candidates = [
+            {
+                'entity_id': ent.get('entity_id'),
+                'placeholder': ent.get('placeholder'),
+                'canonical_value': ent.get('canonical_value'),
+                'normalized_value': ent.get('normalized_value'),
+                'entity_class': ent.get('entity_class'),
+            }
+            for ent in existing_entities
+            if ent.get('redaction_decision', 'REDACT') == 'REDACT'
+            and ent.get('entity_class') == e.get('entity_class')
+            and ent.get('entity_id')
+            and entity_semantic_key(ent) != key
+        ]
         pending.append({'entity_key': key, 'surface_value': surface, 'normalized_value': e.get('normalized_value', surface), 'entity_class': e.get('entity_class', 'OTHER'), 'person_role': e.get('person_role', 'UNKNOWN'), 'start': e.get('start', 0), 'end': e.get('end', 0), 'reason': 'В изменённом тексте найдено новое значение, требующее проверки', 'suggested_action': 'REDACT', 'merge_candidates': merge_candidates})
     pending_review_by_document_id[document_id] = pending
     restored_docs[document_id]['pending_review'] = pending
