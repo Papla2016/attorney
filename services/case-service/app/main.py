@@ -422,11 +422,15 @@ apply_doc_sync = sync_doc_from_anonymization
 def anonymization_result_response(document: dict, case: dict | None = None) -> dict:
     return {
         'document_id': document['id'],
+        'status': document.get('status'),
         'case_id': document.get('case_id') or (case.get('id') if case else None),
         'title': document.get('title'),
         'anonymized_text': document.get('anonymized_text', ''),
         'anonymized_content': document.get('anonymized_content'),
         'content_format': document.get('content_format', 'PLAIN_TEXT'),
+        'entities': document.get('entities', []),
+        'kept_entities': document.get('kept_entities', document.get('recognized_but_kept', [])),
+        'pending_entities': document.get('pending_entities', document.get('pending_review', [])),
         'mappings': document.get('mappings', []),
         'recognized_but_kept': document.get('recognized_but_kept', []),
         'review_entities': document.get('review_entities', []),
@@ -437,6 +441,26 @@ def anonymization_result_response(document: dict, case: dict | None = None) -> d
         'publication_redaction_mode': document.get('publication_redaction_mode', 'NORMATIVE'),
         'ner_provider': document.get('ner_provider'),
     }
+
+
+def _strip_redaction_marks(content: dict | None) -> dict | None:
+    if not content:
+        return content
+    import copy
+    data = copy.deepcopy(content)
+    def walk(node):
+        if isinstance(node, dict):
+            if isinstance(node.get('marks'), list):
+                node['marks'] = [m for m in node['marks'] if m.get('type') != 'redactionMention']
+            if isinstance(node.get('content'), list):
+                for ch in node['content']:
+                    walk(ch)
+        elif isinstance(node, list):
+            for ch in node:
+                walk(ch)
+    walk(data)
+    return data
+    return data
 
 
 def document_metadata(cs: dict):
@@ -780,16 +804,55 @@ async def upload(case_id: str, body: UploadDoc, authorization: str | None = Head
             r = await cl.post(f'{ANON}/internal/anonymization/process', headers={'X-Internal-Service-Token': INTERNAL}, json={'case_id': case_id, 'document_id': d['id'], 'title': body.title, 'text': body.text, 'metadata': {}, 'content_format': body.content_format, 'original_content': body.content, 'publication_redaction_mode': body.publication_redaction_mode})
         p = r.json()
         d['anonymization_job_id'] = p.get('job_id')
-        d['anonymized_text'] = p.get('anonymized_text') or d['anonymized_text']
-        d['mappings'] = [ensure_mapping_metadata(m) for m in (p.get('mappings') or [])]
-        d['recognized_but_kept'] = p.get('recognized_but_kept', [])
-        d['review_entities'] = p.get('review_entities', [])
+        sync_doc_from_anonymization(d, p)
         d['publication_redaction_mode'] = p.get('publication_redaction_mode', body.publication_redaction_mode)
     except Exception:
         d['anonymization_job_id'] = None
     d['status'] = 'ANONYMIZED'
     d['public_anonymized_document_id'] = d['id']
     audit(c.get('sub'), 'UPLOAD_DOCUMENT', 'DOCUMENT', d['id'], {'case_id': case_id})
+    return anonymization_result_response(d, cs)
+
+
+@app.patch('/api/cases/documents/{document_id}/entities/{entity_id}')
+async def update_document_entity(document_id: str, entity_id: str, body: dict, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    d, cs = find_document_and_case(document_id)
+    if not can_manage_case(c, cs):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    async with httpx.AsyncClient(timeout=10.0) as cl:
+        r = await cl.patch(f'{ANON}/internal/anonymization/documents/{document_id}/entities/{entity_id}', headers={'X-Internal-Service-Token': INTERNAL}, json=body)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.json())
+    sync_doc_from_anonymization(d, r.json())
+    return anonymization_result_response(d, cs)
+
+
+@app.post('/api/cases/documents/{document_id}/entities/merge')
+async def merge_entities(document_id: str, body: dict, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    d, cs = find_document_and_case(document_id)
+    if not can_manage_case(c, cs):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    async with httpx.AsyncClient(timeout=10.0) as cl:
+        r = await cl.post(f'{ANON}/internal/anonymization/documents/{document_id}/entities/merge', headers={'X-Internal-Service-Token': INTERNAL}, json=body)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.json())
+    sync_doc_from_anonymization(d, r.json())
+    return anonymization_result_response(d, cs)
+
+
+@app.post('/api/cases/documents/{document_id}/entities/{entity_id}/mentions/{mention_id}/split')
+async def split_mention(document_id: str, entity_id: str, mention_id: str, authorization: str | None = Header(None)):
+    c = claims(authorization)
+    d, cs = find_document_and_case(document_id)
+    if not can_manage_case(c, cs):
+        err('ACCESS_DENIED', 'Недостаточно прав')
+    async with httpx.AsyncClient(timeout=10.0) as cl:
+        r = await cl.post(f'{ANON}/internal/anonymization/documents/{document_id}/entities/{entity_id}/mentions/{mention_id}/split', headers={'X-Internal-Service-Token': INTERNAL})
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.json())
+    sync_doc_from_anonymization(d, r.json())
     return anonymization_result_response(d, cs)
 
 
@@ -1033,7 +1096,11 @@ def publish_document(document_id: str, authorization: str | None = Header(None))
     review_mention_count = sum(len(x.get('mentions', [])) if isinstance(x.get('mentions'), list) and x.get('mentions') else int(x.get('occurrences_count') or 1) for x in review_entities)
     if pending_entity_count > 0 or review_entity_count > 0:
         audit(c.get('sub'), 'BLOCK_PUBLICATION_REVIEW_REQUIRED', 'DOCUMENT', document_id, {'case_id': d['case_id'], 'pending_entity_count': pending_entity_count, 'review_entity_count': review_entity_count})
-        err('PENDING_REDACTION_REVIEW', 'Документ содержит сведения, требующие проверки перед публикацией.', 409, {'pending_entity_count': pending_entity_count, 'pending_mention_count': pending_mention_count, 'review_entity_count': review_entity_count, 'review_mention_count': review_mention_count})
+        err('PENDING_REDACTION_REVIEW', 'Документ содержит сведения, требующие проверки перед публикацией.', 409, {
+            'pending_entity_count': pending_entity_count, 'pending_mention_count': pending_mention_count,
+            'review_entity_count': review_entity_count, 'review_mention_count': review_mention_count,
+            'pending_count': pending_entity_count, 'review_count': review_entity_count,
+        })
     d['status'] = 'PUBLISHED'
     if any(doc['case_id'] == cs['id'] and doc['status'] == 'PUBLISHED' for doc in docs):
         cs['status'] = 'PUBLISHED'
@@ -1076,7 +1143,7 @@ async def pub_doc(document_id: str):
         'case_id': cs['id'],
         'title': d['title'],
         'anonymized_text': anonymized_text,
-        'anonymized_content': d.get('anonymized_content'),
+        'anonymized_content': _strip_redaction_marks(d.get('anonymized_content')),
         'content_format': d.get('content_format', 'PLAIN_TEXT'),
         'metadata': document_metadata(cs),
     }
@@ -1095,7 +1162,17 @@ async def restored(case_id: str, authorization: str | None = Header(None)):
     ds = [d for d in docs if d['case_id'] == case_id]
     out = []
     for d in ds:
-        if d.get('original_text') is not None:
+        restored_payload = None
+        try:
+            async with httpx.AsyncClient() as cl:
+                rr = await cl.get(f'{ANON}/internal/anonymization/documents/{d["id"]}/restored', headers={'X-Internal-Service-Token': INTERNAL})
+            if rr.status_code < 400:
+                restored_payload = rr.json()
+        except Exception:
+            restored_payload = None
+        if restored_payload:
+            out.append({'document_id': d['id'], 'title': d['title'], **restored_payload})
+        else:
             out.append({
                 'document_id': d['id'],
                 'title': d['title'],
@@ -1106,9 +1183,5 @@ async def restored(case_id: str, authorization: str | None = Header(None)):
                 'content_format': d.get('content_format', 'PLAIN_TEXT'),
                 'mappings': d.get('mappings', []),
             })
-        else:
-            async with httpx.AsyncClient() as cl:
-                rr = await cl.get(f'{ANON}/internal/anonymization/documents/{d["id"]}/restored', headers={'X-Internal-Service-Token': INTERNAL})
-            out.append({'document_id': d['id'], 'title': d['title'], **rr.json()})
     audit(c.get('sub'), 'VIEW_RESTORED_CASE', 'CASE', case_id)
     return {'case': cs, 'documents': out}
