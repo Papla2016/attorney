@@ -133,10 +133,10 @@ def entity_semantic_key(entity: dict) -> str:
     )
 
 
-def store_keep_redact_decision(document_id: str, decision_type: str, entity: dict, *, reason: str | None = None) -> dict:
+def store_keep_redact_decision(document_id: str, decision_type: str, entity: dict, *, reason: str | None = None, explicit_entity_key: str | None = None) -> dict:
     if decision_type not in {'KEEP_ENTITY', 'REDACT_ENTITY'}:
         raise ValueError('Unsupported keep/redact manual decision')
-    key = entity_semantic_key(entity)
+    key = explicit_entity_key or entity_semantic_key(entity)
     now = now_iso()
     decisions = manual_decisions_by_document_id.setdefault(document_id, {})
     existing = decisions.get(key, {})
@@ -788,7 +788,7 @@ def apply_manual_decisions(document_id: str, resolved: list[dict]) -> list[dict]
 
 
 def _find_entity_by_semantic_key(entities: list[dict], entity_key: str) -> dict | None:
-    return next((e for e in entities if entity_semantic_key(e) == entity_key), None)
+    return next((e for e in entities if e.get('entity_key') == entity_key or entity_semantic_key(e) == entity_key), None)
 
 
 def apply_keep_redact_entity_decisions(document_id: str, redacted_entities: list[dict], kept_entities: list[dict], original_text: str) -> tuple[list[dict], list[dict]]:
@@ -1193,13 +1193,17 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
     audit_log.append({'id': str(uuid.uuid4()), 'document_id': document_id, 'action': 'REDACTION_DECISION', 'details': body.model_dump(), 'created_at': now_iso()})
     doc = restored_docs[document_id]
     entity_class = 'PERSON' if body.entity_class in {'PERSON_FULL_NAME', 'PERSON'} else body.entity_class
-    decision_entity = {'entity_class': entity_class, 'canonical_value': body.selected_text, 'normalized_value': body.selected_text}
-    entity_key = body.entity_key or entity_semantic_key(decision_entity)
+    pending_items = pending_review_by_document_id.get(document_id, []) or doc.get('pending_review', [])
+    pending_item = next((p for p in pending_items if (body.entity_key and p.get('entity_key') == body.entity_key) or (p.get('surface_value') == body.selected_text and p.get('entity_class') == entity_class)), None)
+    entity_key = body.entity_key or (pending_item or {}).get('entity_key') or build_entity_semantic_key(entity_class, body.selected_text, body.person_role)
+    canonical_value = (pending_item or {}).get('normalized_value') or body.selected_text
+    decision_entity = {'entity_class': entity_class, 'canonical_value': canonical_value, 'normalized_value': canonical_value, 'surface_value': body.selected_text, 'entity_key': entity_key}
     redacted_entities = list(doc.get('entities', []))
     kept_entities = list(doc.get('kept_entities', []))
+    is_pending_decision = pending_item is not None
 
     if body.decision == 'REDACT':
-        store_keep_redact_decision(document_id, 'REDACT_ENTITY', decision_entity, reason=body.reason)
+        store_keep_redact_decision(document_id, 'REDACT_ENTITY', decision_entity, reason=body.reason, explicit_entity_key=entity_key)
         target = _find_entity_by_semantic_key(redacted_entities, entity_key)
         if not target:
             target = _find_entity_by_semantic_key(kept_entities, entity_key)
@@ -1207,43 +1211,77 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
                 kept_entities.remove(target)
                 target['redaction_decision'] = 'REDACT'
                 target['requires_review'] = False
+                target['entity_key'] = entity_key
                 redacted_entities.append(target)
         if not target:
             target = {
                 'entity_id': str(uuid.uuid4()),
                 'document_id': document_id,
                 'entity_class': entity_class,
-                'canonical_value': body.selected_text,
-                'normalized_value': body.selected_text,
+                'canonical_value': canonical_value,
+                'normalized_value': canonical_value,
+                'entity_key': entity_key,
                 'redaction_decision': 'REDACT',
                 'requires_review': False,
                 'mentions': [],
             }
             redacted_entities.append(target)
+        target['entity_key'] = entity_key
+        search_text = doc.get('working_text') if is_pending_decision and doc.get('working_text') is not None else doc.get('original_text', '')
         existing_ranges = {(m.get('start'), m.get('end')) for m in target.get('mentions', [])}
-        for match in re.finditer(re.escape(body.selected_text), doc.get('original_text', '')):
+        new_mentions = []
+        for match in re.finditer(re.escape(body.selected_text), search_text or ''):
             rng = (match.start(), match.end())
             if rng in existing_ranges:
                 continue
-            target.setdefault('mentions', []).append({
+            mention = {
                 'mention_id': str(uuid.uuid4()),
                 'entity_id': target['entity_id'],
                 'surface_value': body.selected_text,
-                'normalized_value': body.selected_text,
+                'normalized_value': canonical_value,
                 'start': match.start(),
                 'end': match.end(),
                 'replacement_value': target.get('placeholder') or '',
-            })
+            }
+            target.setdefault('mentions', []).append(mention)
+            new_mentions.append(mention)
         target['mentions_count'] = len(target.get('mentions', []))
+        if is_pending_decision:
+            target['placeholder'] = target.get('placeholder') or next_placeholder(entity_class, doc.get('mappings', []))
+            for mention in new_mentions:
+                mention['replacement_value'] = target['placeholder']
+            updated_text = search_text or ''
+            for mention in sorted(new_mentions, key=lambda m: m['start'], reverse=True):
+                updated_text = updated_text[:mention['start']] + target['placeholder'] + updated_text[mention['end']:]
+            doc['working_text'] = updated_text
+            doc['anonymized_text'] = updated_text
+            working_content = doc.get('working_content')
+            if working_content:
+                doc['anonymized_content'] = anonymize_content_by_mentions(working_content, [{**target, 'mentions': new_mentions}])
+            doc['entities'] = redacted_entities
+            doc['kept_entities'] = kept_entities
+            doc['recognized_but_kept'] = kept_entities
+            doc['mappings'] = build_mappings_from_entities(redacted_entities)
+            doc['review_entities'] = [e for e in redacted_entities if e.get('requires_review')]
+        else:
+            rebuild_document_from_entities(document_id, redacted_entities, kept_entities, doc.get('original_text', ''), doc.get('original_content'))
     elif body.decision == 'KEEP':
-        store_keep_redact_decision(document_id, 'KEEP_ENTITY', decision_entity, reason=body.reason)
-        target = _find_entity_by_semantic_key(redacted_entities, entity_key)
-        if target:
-            redacted_entities.remove(target)
-            target['redaction_decision'] = 'KEEP'
-            target['requires_review'] = False
-            kept_entities = [e for e in kept_entities if entity_semantic_key(e) != entity_key]
-            kept_entities.append(target)
+        store_keep_redact_decision(document_id, 'KEEP_ENTITY', decision_entity, reason=body.reason, explicit_entity_key=entity_key)
+        if not is_pending_decision:
+            target = _find_entity_by_semantic_key(redacted_entities, entity_key)
+            if target:
+                redacted_entities.remove(target)
+                target['redaction_decision'] = 'KEEP'
+                target['requires_review'] = False
+                target['entity_key'] = entity_key
+                kept_entities = [e for e in kept_entities if entity_semantic_key(e) != entity_key and e.get('entity_key') != entity_key]
+                kept_entities.append(target)
+            rebuild_document_from_entities(document_id, redacted_entities, kept_entities, doc.get('original_text', ''), doc.get('original_content'))
+        else:
+            if doc.get('working_text') is not None:
+                doc['anonymized_text'] = doc.get('working_text', '')
+            if doc.get('working_content') is not None:
+                doc['anonymized_content'] = doc.get('working_content')
     elif body.decision == 'MERGE_WITH_EXISTING':
         target = next((m for m in doc.get('mappings', []) if m.get('cluster_id') == body.target_cluster_id), None)
         if not target:
@@ -1254,9 +1292,9 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
         for e in redacted_entities:
             if e.get('canonical_value') == body.selected_text or e.get('normalized_value') == body.selected_text:
                 e['redaction_decision'] = 'REDACT'
+        rebuild_document_from_entities(document_id, redacted_entities, kept_entities, doc.get('original_text', ''), doc.get('original_content'))
 
-    rebuild_document_from_entities(document_id, redacted_entities, kept_entities, doc.get('original_text', ''), doc.get('original_content'))
-    pending = [p for p in pending_review_by_document_id.get(document_id, []) if p.get('entity_key') != entity_key]
+    pending = [p for p in pending_items if p.get('entity_key') != entity_key]
     pending_review_by_document_id[document_id] = pending
     doc['pending_review'] = pending
     doc['pending_markers'] = [{'entity_key': p['entity_key'], 'surface_value': p['surface_value'], 'start': p['start'], 'end': p['end'], 'reason': p['reason']} for p in pending]
@@ -1269,6 +1307,10 @@ async def draft_scan(document_id: str, body: DraftScanRequest, x_internal_servic
     require_internal(x_internal_service_token)
     if document_id not in restored_docs:
         _error(404, 'NOT_FOUND', 'Документ не найден')
+    restored_docs[document_id]['working_text'] = body.text
+    restored_docs[document_id]['working_content'] = body.content
+    restored_docs[document_id]['working_content_format'] = body.content_format
+    restored_docs[document_id]['working_document_revision'] = body.document_revision
     entities = await extract_entities(body.text)
     pending = []
     decisions = manual_decisions_by_document_id.get(document_id, {})

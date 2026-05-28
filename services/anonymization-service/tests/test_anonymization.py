@@ -481,3 +481,157 @@ def test_redaction_decision_keep_survives_reanonymize(monkeypatch):
     decision = main.manual_decisions_by_document_id[doc_id][main.build_entity_semantic_key('PERSON', name)]
     assert decision['decision_type'] == 'KEEP_ENTITY'
     assert 'decision' not in decision
+
+
+def test_draft_pending_redact_new_working_value_replaces_immediately(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'draft-redact-new-value-doc'
+    original_text = 'ФИО1 обратился в суд.'
+    working_text = original_text + ' Представитель Петрова Мария Ивановна предоставила документы.'
+    selected = 'Петрова Мария Ивановна'
+    start = working_text.index(selected)
+    main.restored_docs.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    main.pending_review_by_document_id.pop(doc_id, None)
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': original_text,
+        'anonymized_text': original_text,
+        'mappings': [{'id': 'existing-e1', 'placeholder': 'ФИО1', 'original_value': 'Иванов Иван Иванович', 'entity_class': 'PERSON'}],
+        'entities': [],
+        'kept_entities': [],
+    }
+
+    async def fake_extract_entities(_text):
+        return [{'type': 'PERSON_FULL_NAME', 'text': selected, 'normalized_text': 'Петрова Мария Ивановна', 'start': start, 'end': start + len(selected)}]
+
+    monkeypatch.setattr(main, 'extract_entities', fake_extract_entities)
+    scan = client.post(
+        f'/internal/anonymization/documents/{doc_id}/draft-scan',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'text': working_text, 'content': None, 'content_format': 'PLAIN_TEXT', 'document_revision': 7},
+    )
+    assert scan.status_code == 200
+    pending = scan.json()['pending_review'][0]
+
+    decision = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'selected_text': selected, 'entity_class': 'PERSON', 'entity_key': pending['entity_key'], 'decision': 'REDACT'},
+    )
+    assert decision.status_code == 200
+    payload = decision.json()
+    assert selected not in payload['anonymized_text']
+    assert 'ФИО2' in payload['anonymized_text']
+    entity = next(e for e in payload['entities'] if e['canonical_value'] == pending['normalized_value'])
+    assert entity['mentions'][0]['surface_value'] == selected
+    assert payload['pending_review'] == []
+    assert main.restored_docs[doc_id]['original_text'] == original_text
+    assert main.restored_docs[doc_id]['working_text'] == payload['anonymized_text']
+    assert main.restored_docs[doc_id]['working_document_revision'] == 7
+
+
+def test_draft_pending_redact_uses_normalized_entity_key(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'draft-redact-normalized-key-doc'
+    selected = 'Макаровым Антоном Сергеевичем'
+    normalized = 'Макаров Антон Сергеевич'
+    working_text = f'Документы представлены {selected}.'
+    start = working_text.index(selected)
+    main.restored_docs.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    main.pending_review_by_document_id.pop(doc_id, None)
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': 'ФИО1 представил документы.',
+        'anonymized_text': 'ФИО1 представил документы.',
+        'mappings': [],
+        'entities': [],
+        'kept_entities': [],
+    }
+
+    async def fake_extract_entities(_text):
+        return [{'type': 'PERSON_FULL_NAME', 'text': selected, 'normalized_text': normalized, 'start': start, 'end': start + len(selected)}]
+
+    monkeypatch.setattr(main, 'extract_entities', fake_extract_entities)
+    scan = client.post(
+        f'/internal/anonymization/documents/{doc_id}/draft-scan',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'text': working_text, 'content': None, 'content_format': 'PLAIN_TEXT', 'document_revision': 1},
+    )
+    assert scan.status_code == 200
+    entity_key = scan.json()['pending_review'][0]['entity_key']
+    assert entity_key == 'PERSON::макаров антон сергеевич'
+
+    decision = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'selected_text': selected, 'entity_class': 'PERSON', 'entity_key': entity_key, 'decision': 'REDACT'},
+    )
+    assert decision.status_code == 200
+    decisions = main.manual_decisions_by_document_id[doc_id]
+    assert 'PERSON::макаров антон сергеевич' in decisions
+    assert 'PERSON::макаровым антоном сергеевичем' not in decisions
+    assert decisions['PERSON::макаров антон сергеевич']['decision_type'] == 'REDACT_ENTITY'
+
+
+def test_draft_pending_keep_preserves_working_text(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'draft-keep-new-value-doc'
+    selected = 'Петрова Мария Ивановна'
+    working_text = f'ФИО1 обратился. Представитель {selected} пояснила.'
+    start = working_text.index(selected)
+    main.restored_docs.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    main.pending_review_by_document_id.pop(doc_id, None)
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': 'ФИО1 обратился.',
+        'anonymized_text': 'ФИО1 обратился.',
+        'mappings': [],
+        'entities': [],
+        'kept_entities': [],
+    }
+
+    async def fake_extract_entities(_text):
+        return [{'type': 'PERSON_FULL_NAME', 'text': selected, 'normalized_text': 'Петрова Мария Ивановна', 'start': start, 'end': start + len(selected)}]
+
+    monkeypatch.setattr(main, 'extract_entities', fake_extract_entities)
+    scan = client.post(
+        f'/internal/anonymization/documents/{doc_id}/draft-scan',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'text': working_text, 'content': None, 'content_format': 'PLAIN_TEXT', 'document_revision': 3},
+    )
+    assert scan.status_code == 200
+    entity_key = scan.json()['pending_review'][0]['entity_key']
+
+    keep = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'selected_text': selected, 'entity_class': 'PERSON', 'entity_key': entity_key, 'decision': 'KEEP'},
+    )
+    assert keep.status_code == 200
+    payload = keep.json()
+    assert payload['anonymized_text'] == working_text
+    assert selected in main.restored_docs[doc_id]['working_text']
+    assert payload['pending_review'] == []
+    decisions = main.manual_decisions_by_document_id[doc_id]
+    assert decisions[entity_key]['decision_type'] == 'KEEP_ENTITY'
