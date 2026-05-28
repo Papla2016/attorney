@@ -1999,3 +1999,350 @@ def test_update_entity_metadata_decision_uses_source_semantic_key():
     assert decision['source_entity_key'] == expected_source_key
     assert decision['payload']['canonical_value'] == 'Макаров Антон Сергеевич'
     assert decision.get('entity_id') is None
+
+
+def _split_rich_content(first_entity_id='person-1', second_entity_id='person-1', second_placeholder='ФИО1'):
+    return {
+        'type': 'doc',
+        'content': [{
+            'type': 'paragraph',
+            'content': [
+                {
+                    'type': 'text',
+                    'text': 'ФИО1',
+                    'marks': [{'type': 'redactionMention', 'attrs': {'entityId': first_entity_id, 'mentionId': 'mention-1', 'placeholder': 'ФИО1'}}],
+                },
+                {'type': 'text', 'text': ' явился. '},
+                {
+                    'type': 'text',
+                    'text': second_placeholder,
+                    'marks': [{'type': 'redactionMention', 'attrs': {'entityId': second_entity_id, 'mentionId': 'mention-2', 'placeholder': second_placeholder}}],
+                },
+                {'type': 'text', 'text': ' представил документы.'},
+            ],
+        }],
+    }
+
+
+def _split_original_content():
+    original_text = 'Макаров Антон Сергеевич явился. Макаров А.С. представил документы.'
+    return original_text, _simple_content(original_text)
+
+
+def _split_person_entity(doc_id, original_text=None):
+    if original_text is None:
+        original_text, _ = _split_original_content()
+    first = 'Макаров Антон Сергеевич'
+    second = 'Макаров А.С.'
+    first_start = original_text.index(first)
+    second_start = original_text.index(second)
+    return {
+        'entity_id': 'person-1',
+        'document_id': doc_id,
+        'entity_class': 'PERSON',
+        'canonical_value': first,
+        'normalized_value': first,
+        'person_role': 'UNKNOWN',
+        'context_label': None,
+        'placeholder': 'ФИО1',
+        'redaction_decision': 'REDACT',
+        'requires_review': False,
+        'mentions_count': 2,
+        'mentions': [
+            {
+                'mention_id': 'mention-1',
+                'entity_id': 'person-1',
+                'surface_value': first,
+                'normalized_value': first,
+                'start': first_start,
+                'end': first_start + len(first),
+                'replacement_value': 'ФИО1',
+            },
+            {
+                'mention_id': 'mention-2',
+                'entity_id': 'person-1',
+                'surface_value': second,
+                'normalized_value': second,
+                'start': second_start,
+                'end': second_start + len(second),
+                'replacement_value': 'ФИО1',
+                'format': 'INITIALS',
+            },
+        ],
+    }
+
+
+def _split_doc(main, doc_id, *, working_text=None, working_content=None):
+    original_text, original_content = _split_original_content()
+    main.restored_docs.pop(doc_id, None)
+    main.public_docs.pop(doc_id, None)
+    main.pending_review_by_document_id.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    anonymized_text = working_text if working_text is not None else 'ФИО1 явился. ФИО1 представил документы.'
+    anonymized_content = working_content if working_content is not None else _simple_content(anonymized_text)
+    doc = {
+        'document_id': doc_id,
+        'case_id': 'case-1',
+        'title': 'doc',
+        'original_text': original_text,
+        'original_content': original_content,
+        'anonymized_text': anonymized_text,
+        'anonymized_content': anonymized_content,
+        'entities': [_split_person_entity(doc_id, original_text)],
+        'kept_entities': [],
+        'recognized_but_kept': [],
+        'mappings': [],
+        'pending_review': [],
+    }
+    if working_text is not None:
+        doc['working_text'] = working_text
+    if working_content is not None:
+        doc['working_content'] = working_content
+    main.restored_docs[doc_id] = doc
+    return doc
+
+
+def _split_post(client, main, doc_id):
+    return client.post(
+        f'/internal/anonymization/documents/{doc_id}/entities/person-1/mentions/mention-2/split',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+    )
+
+
+def test_split_mention_preserves_working_rich_content_revision():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'split-rich-working-doc'
+    working_text = 'ФИО1 явился. ФИО1 представил документы.'
+    working_content = _split_rich_content()
+    original_text, original_content = _split_original_content()
+    _split_doc(main, doc_id, working_text=working_text, working_content=working_content)
+
+    response = _split_post(client, main, doc_id)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['anonymized_text'] == 'ФИО1 явился. ФИО2 представил документы.'
+    assert main.restored_docs[doc_id]['working_text'] == payload['anonymized_text']
+    assert main.restored_docs[doc_id]['working_content'] == main.restored_docs[doc_id]['anonymized_content']
+    nodes = payload['anonymized_content']['content'][0]['content']
+    first_mark = nodes[0]['marks'][0]['attrs']
+    second_mark = nodes[2]['marks'][0]['attrs']
+    new_entity = next(e for e in payload['entities'] if e['entity_id'] != 'person-1')
+    source_entity = next(e for e in payload['entities'] if e['entity_id'] == 'person-1')
+    assert nodes[0]['text'] == 'ФИО1'
+    assert first_mark['entityId'] == 'person-1'
+    assert nodes[2]['text'] == 'ФИО2'
+    assert second_mark['entityId'] == new_entity['entity_id']
+    assert second_mark['mentionId'] == 'mention-2'
+    assert [m['mention_id'] for m in source_entity['mentions']] == ['mention-1']
+    assert [m['mention_id'] for m in new_entity['mentions']] == ['mention-2']
+    assert main.restored_docs[doc_id]['original_text'] == original_text
+    assert main.restored_docs[doc_id]['original_content'] == original_content
+
+
+def test_split_mention_survives_working_reanonymize():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'split-rich-working-reanon-doc'
+    original_text, original_content = _split_original_content()
+    _split_doc(main, doc_id, working_text='ФИО1 явился. ФИО1 представил документы.', working_content=_split_rich_content())
+
+    split_response = _split_post(client, main, doc_id)
+    assert split_response.status_code == 200
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/reanonymize',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'mappings': []},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['anonymized_text'] == 'ФИО1 явился. ФИО2 представил документы.'
+    assert sorted(len(e['mentions']) for e in payload['entities']) == [1, 1]
+    assert main.restored_docs[doc_id]['original_text'] == original_text
+    assert main.restored_docs[doc_id]['original_content'] == original_content
+
+
+def test_split_mention_plain_text_with_ambiguous_placeholder_is_rejected():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+    import copy
+
+    client = TestClient(app)
+    doc_id = 'split-plain-ambiguous-doc'
+    _split_doc(main, doc_id, working_text='ФИО1 явился. ФИО1 представил документы.', working_content=None)
+    before_entities = copy.deepcopy(main.restored_docs[doc_id]['entities'])
+    before_working_text = main.restored_docs[doc_id]['working_text']
+
+    response = _split_post(client, main, doc_id)
+
+    assert response.status_code == 409
+    error = response.json()['error']
+    assert error['code'] == 'SPLIT_REQUIRES_STRUCTURED_CONTENT'
+    assert error['details']['entity_id'] == 'person-1'
+    assert error['details']['mention_id'] == 'mention-2'
+    assert error['details']['placeholder'] == 'ФИО1'
+    assert error['details']['occurrences_count'] == 2
+    assert main.restored_docs[doc_id]['entities'] == before_entities
+    assert main.restored_docs[doc_id]['working_text'] == before_working_text
+
+
+def test_split_mention_plain_text_single_placeholder_is_supported():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'split-plain-single-doc'
+    _split_doc(main, doc_id, working_text='ФИО1 представил документы.', working_content=None)
+
+    response = _split_post(client, main, doc_id)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['anonymized_text'] == 'ФИО2 представил документы.'
+    assert main.restored_docs[doc_id]['working_text'] == 'ФИО2 представил документы.'
+    assert len(payload['entities']) == 2
+    assert sorted(len(e['mentions']) for e in payload['entities']) == [1, 1]
+
+
+def test_split_mention_original_document_survives_original_based_reanonymize(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'split-original-reanon-doc'
+    original_text, _ = _split_original_content()
+    _split_doc(main, doc_id)
+
+    split_response = _split_post(client, main, doc_id)
+    assert split_response.status_code == 200
+    decision = next(d for d in main.manual_decisions_by_document_id[doc_id].values() if d['decision_type'] == 'SPLIT_MENTION')
+    assert decision['source_entity_key']
+    assert decision['mention_locator']['start'] == original_text.index('Макаров А.С.')
+    assert decision['mention_locator']['end'] == original_text.index('Макаров А.С.') + len('Макаров А.С.')
+    assert decision['mention_locator']['surface_value'] == 'Макаров А.С.'
+
+    async def fake_extract_entities(text):
+        assert text == original_text
+        return [
+            {
+                'type': 'PERSON_FULL_NAME',
+                'text': 'Макаров Антон Сергеевич',
+                'normalized_text': 'Макаров Антон Сергеевич',
+                'start': original_text.index('Макаров Антон Сергеевич'),
+                'end': original_text.index('Макаров Антон Сергеевич') + len('Макаров Антон Сергеевич'),
+                'source': 'natasha',
+            },
+            {
+                'type': 'PERSON_FULL_NAME',
+                'text': 'Макаров А.С.',
+                'normalized_text': 'Макаров А.С.',
+                'start': original_text.index('Макаров А.С.'),
+                'end': original_text.index('Макаров А.С.') + len('Макаров А.С.'),
+                'source': 'natasha',
+            },
+        ]
+
+    monkeypatch.setattr(main, 'extract_entities', fake_extract_entities)
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/reanonymize',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'mappings': []},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload['entities']) == 2
+    first_entity = next(e for e in payload['entities'] if e['mentions'][0]['surface_value'] == 'Макаров Антон Сергеевич')
+    second_entity = next(e for e in payload['entities'] if e['mentions'][0]['surface_value'] == 'Макаров А.С.')
+    assert first_entity['placeholder'] != second_entity['placeholder']
+    assert payload['anonymized_text'] == 'ФИО1 явился. ФИО2 представил документы.'
+
+
+def test_split_decision_does_not_depend_only_on_uuid():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app, apply_split_mention_decisions
+
+    client = TestClient(app)
+    doc_id = 'split-decision-locator-doc'
+    original_text, _ = _split_original_content()
+    _split_doc(main, doc_id)
+
+    response = _split_post(client, main, doc_id)
+
+    assert response.status_code == 200
+    decision = next(d for d in main.manual_decisions_by_document_id[doc_id].values() if d['decision_type'] == 'SPLIT_MENTION')
+    assert decision['source_entity_key']
+    assert decision['mention_locator']['start'] == original_text.index('Макаров А.С.')
+    assert decision['mention_locator']['end'] == original_text.index('Макаров А.С.') + len('Макаров А.С.')
+    assert decision['mention_locator']['surface_value'] == 'Макаров А.С.'
+
+    new_source = _split_person_entity(doc_id, original_text)
+    new_source['entity_id'] = 'fresh-person-id'
+    for idx, mention in enumerate(new_source['mentions'], start=1):
+        mention['mention_id'] = f'fresh-mention-{idx}'
+        mention['entity_id'] = 'fresh-person-id'
+    reapplied = apply_split_mention_decisions(doc_id, [new_source])
+    assert len(reapplied) == 2
+    assert sorted(len(e['mentions']) for e in reapplied) == [1, 1]
+    assert all(e.get('entity_id') != decision['entity_id'] for e in reapplied)
+    assert all(m.get('mention_id') != decision['mention_id'] for e in reapplied for m in e['mentions'])
+
+def test_split_mention_missing_rich_content_mark_does_not_mutate_state():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+    import copy
+
+    client = TestClient(app)
+    doc_id = 'split-rich-missing-mark-doc'
+
+    working_text = 'ФИО1 явился. ФИО1 представил документы.'
+    working_content = _split_rich_content()
+
+    # В entities выбранное упоминание имеет mention_id = mention-2,
+    # но в rich-content такого mark больше нет.
+    working_content['content'][0]['content'][2]['marks'][0]['attrs']['mentionId'] = 'another-mention-id'
+
+    _split_doc(
+        main,
+        doc_id,
+        working_text=working_text,
+        working_content=working_content,
+    )
+
+    before_doc = copy.deepcopy(main.restored_docs[doc_id])
+    before_decisions = copy.deepcopy(
+        main.manual_decisions_by_document_id.get(doc_id, {})
+    )
+
+    response = _split_post(client, main, doc_id)
+
+    assert response.status_code == 409
+
+    error = response.json()['error']
+    assert error['code'] == 'SPLIT_MENTION_MARK_NOT_FOUND'
+
+    assert main.restored_docs[doc_id]['entities'] == before_doc['entities']
+    assert main.restored_docs[doc_id]['working_text'] == before_doc['working_text']
+    assert main.restored_docs[doc_id]['working_content'] == before_doc['working_content']
+    assert main.restored_docs[doc_id]['anonymized_text'] == before_doc['anonymized_text']
+    assert main.restored_docs[doc_id]['anonymized_content'] == before_doc['anonymized_content']
+
+    decisions = main.manual_decisions_by_document_id.get(doc_id, {})
+    assert decisions == before_decisions
+    assert not any(
+        decision.get('decision_type') == 'SPLIT_MENTION'
+        for decision in decisions.values()
+    )

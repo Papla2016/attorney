@@ -790,6 +790,159 @@ def content_plain_text(content: dict | None) -> str:
     walk(content)
     return ''.join(parts)
 
+
+
+def mention_locator_from_mention(mention: dict) -> dict:
+    return {
+        'surface_value': mention.get('surface_value'),
+        'normalized_value': mention.get('normalized_value') or mention.get('surface_value'),
+        'start': mention.get('start'),
+        'end': mention.get('end'),
+    }
+
+
+def store_split_mention_decision(document_id: str, source_entity_key: str, source_entity_id: str, mention: dict, target_entity_id: str) -> dict:
+    now = now_iso()
+    locator = mention_locator_from_mention(mention)
+    decision_key = f"SPLIT_MENTION::{source_entity_key}::{locator.get('start')}::{locator.get('end')}::{locator.get('surface_value')}"
+    decisions = manual_decisions_by_document_id.setdefault(document_id, {})
+    existing = decisions.get(decision_key, {})
+    decision = {
+        'decision_id': existing.get('decision_id') or str(uuid.uuid4()),
+        'document_id': document_id,
+        'decision_type': 'SPLIT_MENTION',
+        'source_entity_key': source_entity_key,
+        'mention_locator': locator,
+        'entity_id': source_entity_id,
+        'mention_id': mention.get('mention_id'),
+        'target_entity_id': target_entity_id,
+        'created_at': existing.get('created_at') or now,
+        'updated_at': now,
+    }
+    decisions[decision_key] = decision
+    return decision
+
+
+def split_entity_mention_in_state(document_id: str, entities: list[dict], source_entity: dict, mention: dict) -> tuple[list[dict], dict]:
+    original_placeholder = source_entity.get('placeholder')
+    remaining_mentions = [m for m in source_entity.get('mentions', []) if m.get('mention_id') != mention.get('mention_id')]
+    split_singleton = not remaining_mentions
+    new_entity = copy.deepcopy(source_entity)
+    new_entity['entity_id'] = str(uuid.uuid4())
+    new_entity['document_id'] = document_id
+    new_entity['redaction_decision'] = 'REDACT'
+    new_entity['placeholder'] = (
+        original_placeholder
+        if split_singleton
+        else next_placeholder(source_entity.get('entity_class', 'PERSON'), [{'placeholder': e.get('placeholder')} for e in entities])
+    )
+    moved_mention = copy.deepcopy(mention)
+    moved_mention['entity_id'] = new_entity['entity_id']
+    moved_mention['replacement_value'] = new_entity['placeholder']
+    new_entity['mentions'] = [moved_mention]
+    new_entity['mentions_count'] = 1
+    new_entity['created_at'] = now_iso()
+    new_entity['updated_at'] = now_iso()
+
+    if split_singleton:
+        updated_entities = [e for e in entities if e is not source_entity and e.get('entity_id') != source_entity.get('entity_id')]
+    else:
+        source_entity['mentions'] = remaining_mentions
+        source_entity['mentions_count'] = len(remaining_mentions)
+        source_entity['updated_at'] = now_iso()
+        updated_entities = entities
+    updated_entities.append(new_entity)
+    return updated_entities, new_entity
+
+def has_redaction_mention_mark(content: dict | None, mention_id: str) -> bool:
+    if not content:
+        return False
+
+    found = False
+
+    def walk(node):
+        nonlocal found
+
+        if found:
+            return
+
+        if isinstance(node, dict):
+            if node.get('type') == 'text' and isinstance(node.get('marks'), list):
+                for mark in node['marks']:
+                    if mark.get('type') != 'redactionMention':
+                        continue
+
+                    attrs = mark.get('attrs') or {}
+                    if attrs.get('mentionId') == mention_id:
+                        found = True
+                        return
+
+            if isinstance(node.get('content'), list):
+                for child in node['content']:
+                    walk(child)
+
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    walk(content)
+    return found
+
+def update_working_content_for_split(content: dict, mention_id: str, new_entity: dict) -> tuple[dict, bool]:
+    data = copy.deepcopy(content)
+    updated = False
+
+    def walk(node):
+        nonlocal updated
+        if isinstance(node, dict):
+            if node.get('type') == 'text' and isinstance(node.get('marks'), list):
+                for mark in node['marks']:
+                    if mark.get('type') != 'redactionMention':
+                        continue
+                    attrs = mark.setdefault('attrs', {})
+                    if attrs.get('mentionId') == mention_id:
+                        node['text'] = new_entity.get('placeholder', node.get('text', ''))
+                        attrs['entityId'] = new_entity.get('entity_id')
+                        attrs['placeholder'] = new_entity.get('placeholder')
+                        attrs['mentionId'] = mention_id
+                        updated = True
+                        break
+            if isinstance(node.get('content'), list):
+                for ch in node['content']:
+                    walk(ch)
+        elif isinstance(node, list):
+            for ch in node:
+                walk(ch)
+
+    walk(data)
+    return data, updated
+
+
+def split_mention_locator_matches(mention: dict, locator: dict) -> bool:
+    return (
+        mention.get('start') == locator.get('start')
+        and mention.get('end') == locator.get('end')
+        and mention.get('surface_value') == locator.get('surface_value')
+    )
+
+
+def apply_split_mention_decisions(document_id: str, redacted_entities: list[dict]) -> list[dict]:
+    decisions = [d for d in manual_decisions_by_document_id.get(document_id, {}).values() if d.get('decision_type') == 'SPLIT_MENTION']
+    entities = redacted_entities
+    for decision in decisions:
+        source_entity_key = decision.get('source_entity_key')
+        locator = decision.get('mention_locator') or {}
+        if not source_entity_key or not locator:
+            continue
+        source_entity = _find_entity_by_semantic_key(entities, source_entity_key)
+        if not source_entity:
+            continue
+        mention = next((m for m in source_entity.get('mentions', []) if split_mention_locator_matches(m, locator)), None)
+        if not mention:
+            continue
+        entities, _new_entity = split_entity_mention_in_state(document_id, entities, source_entity, mention)
+    return entities
+
 def apply_manual_decisions(document_id: str, resolved: list[dict]) -> list[dict]:
     decisions = manual_decisions_by_document_id.get(document_id, {})
     for e in resolved:
@@ -1248,6 +1401,7 @@ async def reanonymize(document_id: str, body: ReanonymizeRequest, x_internal_ser
     entities_view, recognized_but_kept, review_entities = build_entities_from_resolved(document_id, resolved, body.publication_redaction_mode)
     entities_view, recognized_but_kept = apply_keep_redact_entity_decisions(document_id, entities_view, recognized_but_kept, original_text)
     entities_view, recognized_but_kept = apply_entity_metadata_decisions(document_id, entities_view, recognized_but_kept)
+    entities_view = apply_split_mention_decisions(document_id, entities_view)
     review_entities = [e for e in entities_view if e.get('requires_review')]
     rebuilt = rebuild_document_from_entities(document_id, entities_view, recognized_but_kept, original_text, doc.get('original_content'))
     mappings = rebuilt.get('mappings', [])
@@ -1639,17 +1793,77 @@ def split_mention(document_id: str, entity_id: str, mention_id: str, x_internal_
     mention = next((m for m in src.get('mentions', []) if m.get('mention_id') == mention_id), None)
     if not mention:
         _error(404, 'NOT_FOUND', 'Упоминание не найдено')
-    src['mentions'] = [m for m in src.get('mentions', []) if m.get('mention_id') != mention_id]
-    new_ent = copy.deepcopy(src)
-    new_ent['entity_id'] = str(uuid.uuid4())
-    new_ent['placeholder'] = next_placeholder('PERSON', [{'placeholder': e.get('placeholder')} for e in doc.get('entities', [])])
-    mention['entity_id'] = new_ent['entity_id']
-    mention['replacement_value'] = new_ent['placeholder']
-    new_ent['mentions'] = [mention]
-    doc['entities'].append(new_ent)
-    manual_decisions_by_document_id.setdefault(document_id, {})[f'SPLIT_MENTION::{mention_id}'] = {
-        'decision_id': str(uuid.uuid4()), 'document_id': document_id, 'decision_type': 'SPLIT_MENTION',
-        'entity_id': entity_id, 'mention_id': mention_id, 'target_entity_id': new_ent['entity_id'], 'payload': {}, 'created_at': now_iso(), 'updated_at': now_iso(),
-    }
+
+    source_entity_key = entity_semantic_key(src)
+    has_working_revision = (
+        doc.get('working_text') is not None
+        or doc.get('working_content') is not None
+    )
+
+    if has_working_revision and doc.get('working_content') is None:
+        placeholder = src.get('placeholder') or ''
+        occurrences_count = (doc.get('working_text') or '').count(placeholder)
+        if occurrences_count > 1:
+            _error(
+                409,
+                'SPLIT_REQUIRES_STRUCTURED_CONTENT',
+                'Невозможно однозначно разделить упоминание в текстовом режиме без разметки документа',
+                {
+                    'entity_id': entity_id,
+                    'mention_id': mention_id,
+                    'placeholder': placeholder,
+                    'occurrences_count': occurrences_count,
+                },
+            )
+    if has_working_revision and doc.get('working_content') is not None:
+        if not has_redaction_mention_mark(doc.get('working_content'), mention_id):
+            _error(
+                409,
+                'SPLIT_MENTION_MARK_NOT_FOUND',
+                'Разметка выбранного упоминания не найдена',
+                {
+                    'entity_id': entity_id,
+                    'mention_id': mention_id,
+                },
+            )
+            
+    updated_entities, new_ent = split_entity_mention_in_state(document_id, doc.get('entities', []), src, mention)
+    store_split_mention_decision(document_id, source_entity_key, entity_id, mention, new_ent['entity_id'])
+
+    if has_working_revision and doc.get('working_content') is not None:
+        updated_content, updated_mark = update_working_content_for_split(doc.get('working_content'), mention_id, new_ent)
+        if not updated_mark:
+            _error(409, 'SPLIT_MENTION_MARK_NOT_FOUND', 'Разметка выбранного упоминания не найдена', {'entity_id': entity_id, 'mention_id': mention_id})
+        doc['entities'] = updated_entities
+        doc['working_content'] = updated_content
+        doc['anonymized_content'] = updated_content
+        doc['working_text'] = content_plain_text(updated_content)
+        doc['anonymized_text'] = doc['working_text']
+        doc['mappings'] = build_mappings_from_entities(doc['entities'])
+        doc['review_entities'] = [e for e in doc.get('entities', []) if e.get('requires_review')]
+        doc['manual_decisions'] = list(manual_decisions_by_document_id.get(document_id, {}).values())
+        if document_id in public_docs:
+            public_docs[document_id]['anonymized_text'] = doc.get('anonymized_text', '')
+            public_docs[document_id]['anonymized_content'] = doc.get('anonymized_content')
+            public_docs[document_id]['content_format'] = doc.get('content_format', 'PLAIN_TEXT')
+        return anonymization_result_response(doc)
+
+    if has_working_revision:
+        working_text = doc.get('working_text') or ''
+        old_placeholder = src.get('placeholder') or ''
+        doc['entities'] = updated_entities
+        doc['working_text'] = working_text.replace(old_placeholder, new_ent.get('placeholder') or '', 1)
+        doc['anonymized_text'] = doc['working_text']
+        doc['mappings'] = build_mappings_from_entities(doc['entities'])
+        doc['review_entities'] = [e for e in doc.get('entities', []) if e.get('requires_review')]
+        doc['manual_decisions'] = list(manual_decisions_by_document_id.get(document_id, {}).values())
+        if document_id in public_docs:
+            public_docs[document_id]['anonymized_text'] = doc.get('anonymized_text', '')
+            public_docs[document_id]['anonymized_content'] = doc.get('anonymized_content')
+            public_docs[document_id]['content_format'] = doc.get('content_format', 'PLAIN_TEXT')
+        return anonymization_result_response(doc)
+
+    doc['entities'] = updated_entities
     rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
+    doc['manual_decisions'] = list(manual_decisions_by_document_id.get(document_id, {}).values())
     return anonymization_result_response(doc)
