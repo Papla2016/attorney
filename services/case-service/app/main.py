@@ -812,11 +812,25 @@ async def upload(case_id: str, body: UploadDoc, authorization: str | None = Head
         async with httpx.AsyncClient() as cl:
             r = await cl.post(f'{ANON}/internal/anonymization/process', headers={'X-Internal-Service-Token': INTERNAL}, json={'case_id': case_id, 'document_id': d['id'], 'title': body.title, 'text': body.text, 'metadata': {}, 'content_format': body.content_format, 'original_content': body.content, 'publication_redaction_mode': body.publication_redaction_mode})
         p = r.json()
+        if r.status_code >= 400:
+            d['status'] = 'ANONYMIZATION_FAILED'
+            d['anonymization_job_id'] = None
+            upstream = p.get('error', {}) if isinstance(p, dict) else {}
+            err(
+                upstream.get('code') or 'ANONYMIZATION_FAILED',
+                upstream.get('message') or 'Не удалось обезличить документ',
+                r.status_code,
+                upstream.get('details') or {},
+            )
         d['anonymization_job_id'] = p.get('job_id')
         sync_doc_from_anonymization(d, p)
         d['publication_redaction_mode'] = p.get('publication_redaction_mode', body.publication_redaction_mode)
+    except HTTPException:
+        raise
     except Exception:
         d['anonymization_job_id'] = None
+        d['status'] = 'ANONYMIZATION_FAILED'
+        err('ANONYMIZATION_FAILED', 'Не удалось обезличить документ', 502)
     d['status'] = 'ANONYMIZED'
     d['public_anonymized_document_id'] = d['id']
     audit(c.get('sub'), 'UPLOAD_DOCUMENT', 'DOCUMENT', d['id'], {'case_id': case_id})

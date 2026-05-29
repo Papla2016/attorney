@@ -410,3 +410,42 @@ def test_publish_blocked_by_pending_or_review_entities():
         main.docs.remove(doc)
         main.cases.remove(case)
         main.case_staff.pop(case['id'], None)
+
+
+class _FailingProcessAsyncClient(_FakeAsyncClient):
+    async def post(self, url, headers=None, json=None):
+        if url.endswith('/process'):
+            return _FakeResponse({
+                'error': {
+                    'code': 'CROSS_TEXT_NODE_MENTION_UNSUPPORTED',
+                    'message': 'Упоминание пересекает несколько text-node TipTap и не может быть безопасно заменено автоматически',
+                    'details': {'mention_id': 'm1'},
+                }
+            }, status_code=409)
+        return await super().post(url, headers=headers, json=json)
+
+
+def test_upload_does_not_report_anonymized_when_cross_node_redaction_is_unsupported(monkeypatch):
+    monkeypatch.setattr(main.httpx, 'AsyncClient', _FailingProcessAsyncClient)
+    client = TestClient(app)
+
+    response = client.post(
+        f'/api/cases/{main.seed_case["id"]}/documents',
+        headers=auth_header(),
+        json={
+            'title': 'Сложный rich документ',
+            'act_type': 'RULING',
+            'text': 'Иванов Иван Иванович',
+            'content_format': 'TIPTAP_JSON',
+            'content': {'type': 'doc', 'content': [{'type': 'paragraph', 'content': [{'type': 'text', 'text': 'Иванов'}, {'type': 'text', 'text': ' Иван Иванович'}]}]},
+        },
+    )
+
+    assert response.status_code == 409
+    payload = response.json()
+    assert payload['error']['code'] == 'CROSS_TEXT_NODE_MENTION_UNSUPPORTED'
+    failed_docs = [d for d in main.docs if d['title'] == 'Сложный rich документ']
+    assert failed_docs
+    assert failed_docs[-1]['status'] == 'ANONYMIZATION_FAILED'
+    assert failed_docs[-1].get('public_anonymized_document_id') is None
+    main.docs[:] = [d for d in main.docs if d['title'] != 'Сложный rich документ']
