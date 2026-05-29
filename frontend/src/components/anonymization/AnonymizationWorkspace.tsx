@@ -92,7 +92,8 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
   const publicationBlocked = statusCounts.review > 0 || statusCounts.pending > 0;
   const hasUnvalidatedDraft = documentChangedManually || scanLoading;
   const publishBlockedByState = publicationBlocked || hasUnvalidatedDraft;
-  const actionsDisabled = hasUnvalidatedDraft || !!activeAction;
+  const serverMutationInFlight = !!activeAction || !!busyEntityId;
+  const actionsDisabled = hasUnvalidatedDraft || serverMutationInFlight;
   const blockIfUnvalidatedDraft = () => {
     if (!hasUnvalidatedDraft) return false;
     setWarning('Сначала сохраните изменения и дождитесь проверки добавленного текста.');
@@ -295,9 +296,9 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
       <div className='panel-header-row'>
         <div><h1>Обезличивание документа</h1><p className='muted-text'>{provider ? 'Используется Natasha и правила' : 'Используются только правила'}</p></div>
         <div className='document-actions'>
-          <button type='button' className='button button-secondary' disabled={!!activeAction} onClick={handleSave}>{activeAction === 'save' ? 'Сохраняем...' : 'Сохранить изменения'}</button>
+          <button type='button' className='button button-secondary' disabled={serverMutationInFlight} onClick={handleSave}>{activeAction === 'save' ? 'Сохраняем...' : 'Сохранить изменения'}</button>
           <button type='button' className='button button-secondary' disabled={actionsDisabled} onClick={handleReanonymize}>{activeAction === 'reanonymize' ? 'Обезличиваем...' : 'Повторно обезличить'}</button>
-          <button type='button' className='button' disabled={!!activeAction || publishBlockedByState} onClick={handlePublish}>{activeAction === 'publish' ? 'Публикуем...' : 'Опубликовать'}</button>
+          <button type='button' className='button' disabled={serverMutationInFlight || publishBlockedByState} onClick={handlePublish}>{activeAction === 'publish' ? 'Публикуем...' : 'Опубликовать'}</button>
         </div>
       </div>
       <div className='workspace-counters'>
@@ -325,6 +326,7 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
       onRedactionClick={scrollToEntity}
       onPendingClick={(key) => scrollToPending(key)}
       onReviewClick={() => document.querySelector('.review-panel')?.scrollIntoView({ behavior: 'smooth', block: 'center' })}
+      editorLocked={serverMutationInFlight}
     />
 
     <div className='document-actions'>
