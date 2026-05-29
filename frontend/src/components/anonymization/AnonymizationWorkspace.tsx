@@ -1,94 +1,347 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { applyRedactionDecision, getDocumentAnonymization, mergeDocumentEntities, reanonymizeDocument, repairPlaceholders, saveAnonymization, scanEditedDraft, splitEntityMention, updateDocumentEntity } from '../../api/casesApi';
+import { applyRedactionDecision, getDocumentAnonymization, mergeDocumentEntities, publishDocument, reanonymizeDocument, repairPlaceholders, saveAnonymization, scanEditedDraft, splitEntityMention, updateDocumentEntity } from '../../api/casesApi';
 import type { AnonymizationResult, EntityMapping, PendingMarker, PendingReviewEntity, RedactionEntity, ReviewMarker } from '../../api/types';
-import { ENTITY_TYPE_OPTIONS, getEntityTypeLabel, getSourceLabel, PERSON_ROLE_LABELS } from '../../constants/anonymizationLabels';
-import RichDocumentEditor from '../documents/RichDocumentEditor';
-import CourtDocumentView from '../documents/CourtDocumentView';
 import { plainTextToTiptapDocument } from '../../utils/tiptapDocument';
+import AnonymizedDocumentPanel from './AnonymizedDocumentPanel';
+import EntityEditorModal from './EntityEditorModal';
+import EntityRegistryPanel from './EntityRegistryPanel';
+import KeptEntitiesPanel from './KeptEntitiesPanel';
+import PendingReviewPanel from './PendingReviewPanel';
+import ReviewEntitiesPanel from './ReviewEntitiesPanel';
+import { getApiErrorMessage, getEntityKey, legacyMappingToEntity, selectedTextForEntity } from './helpers';
 
-type Props = { documentId: string; caseId?: string; initialData?: any; onSaved?: () => void; sourceContent?: unknown; sourceText?: string };
-const pick = <T,>(obj: any, key: string, fallback: T): T => (key in (obj || {}) ? obj[key] ?? fallback : fallback);
+type Props = { documentId: string; caseId?: string; initialData?: AnonymizationResult; onSaved?: () => void; sourceContent?: unknown; sourceText?: string };
+type ActionName = 'save' | 'reanonymize' | 'publish' | 'repair' | 'merge' | 'edit' | 'split' | 'decision' | '';
 
-export default function AnonymizationWorkspace({ documentId, initialData, sourceText }: Props) {
+const pick = <T,>(obj: Partial<AnonymizationResult> | undefined, key: keyof AnonymizationResult, fallback: T): T => (key in (obj || {}) ? ((obj as any)[key] ?? fallback) : fallback);
+const hasOwn = (obj: unknown, key: string) => Object.prototype.hasOwnProperty.call(obj || {}, key);
+
+export default function AnonymizationWorkspace({ documentId, initialData, onSaved, sourceText }: Props) {
   const [mappings, setMappings] = useState<EntityMapping[]>(initialData?.mappings || []);
-  const [entities, setEntities] = useState<RedactionEntity[]>(initialData?.entities || []);
-  const [recognizedButKept, setRecognizedButKept] = useState<EntityMapping[]>(initialData?.recognized_but_kept || []);
+  const [entities, setEntities] = useState<RedactionEntity[]>(initialData?.entities || (initialData?.mappings || []).map((m, i) => legacyMappingToEntity(m, i, 'REDACT')));
+  const [keptEntities, setKeptEntities] = useState<RedactionEntity[]>(initialData?.kept_entities || (initialData?.recognized_but_kept || []).map((m, i) => legacyMappingToEntity(m, i, 'KEEP')));
   const [reviewEntities, setReviewEntities] = useState<RedactionEntity[]>(initialData?.review_entities || []);
   const [reviewMarkers, setReviewMarkers] = useState<ReviewMarker[]>(initialData?.review_markers || []);
   const [pendingReview, setPendingReview] = useState<PendingReviewEntity[]>(initialData?.pending_review || []);
   const [pendingMarkers, setPendingMarkers] = useState<PendingMarker[]>(initialData?.pending_markers || []);
   const [anonymizedText, setAnonymizedText] = useState(initialData?.anonymized_text || '');
-  const [anonymizedContent, setAnonymizedContent] = useState<any>(initialData?.anonymized_content || null);
-  const [tab, setTab] = useState<'REDACT'|'KEEP'|'REVIEW'>('REDACT');
-  const [resultTab, setResultTab] = useState<'EDIT'|'PREVIEW'>('EDIT');
-  const [editingId, setEditingId] = useState<string>('');
+  const [anonymizedContent, setAnonymizedContent] = useState<unknown>(initialData?.anonymized_content || plainTextToTiptapDocument(initialData?.anonymized_text || ''));
+  const [resultTab, setResultTab] = useState<'EDIT' | 'PREVIEW'>('EDIT');
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [mergeTarget, setMergeTarget] = useState('');
   const [mergeTargets, setMergeTargets] = useState<Record<string, string>>({});
-  const [warning, setWarning] = useState(''); const [error, setError] = useState(''); const [message, setMessage] = useState('');
-  const [contentRevision, setContentRevision] = useState(0); const [draftRevision, setDraftRevision] = useState(0); const [documentChangedManually, setDocumentChangedManually] = useState(false);
+  const [editingEntity, setEditingEntity] = useState<RedactionEntity | null>(null);
+  const [activeAction, setActiveAction] = useState<ActionName>('');
+  const [busyEntityId, setBusyEntityId] = useState('');
+  const [warning, setWarning] = useState('');
+  const [error, setError] = useState('');
+  const [message, setMessage] = useState('');
+  const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
+  const [mergeError, setMergeError] = useState('');
+  const [editorError, setEditorError] = useState('');
+  const [contentRevision, setContentRevision] = useState(0);
+  const [draftRevision, setDraftRevision] = useState(0);
+  const [documentChangedManually, setDocumentChangedManually] = useState(false);
   const [isApplyingServerContent, setIsApplyingServerContent] = useState(false);
-  const [scanLoading, setScanLoading] = useState(false); const [scanError, setScanError] = useState('');
+  const [scanLoading, setScanLoading] = useState(false);
+  const [scanError, setScanError] = useState('');
   const pendingPanelRef = useRef<HTMLDivElement | null>(null);
 
   const applyResponse = (data: Partial<AnonymizationResult>, mode: 'FULL' | 'PENDING_ONLY' = 'FULL') => {
     setIsApplyingServerContent(true);
-    if ('pending_review' in data) setPendingReview(pick(data, 'pending_review', []));
-    if ('pending_markers' in data) setPendingMarkers(pick(data, 'pending_markers', []));
+    if (hasOwn(data, 'pending_review')) setPendingReview(pick(data, 'pending_review', []));
+    if (hasOwn(data, 'pending_markers')) setPendingMarkers(pick(data, 'pending_markers', []));
     if (mode === 'FULL') {
-      if ('mappings' in data) setMappings(pick(data, 'mappings', []));
-      if ('recognized_but_kept' in data) setRecognizedButKept(pick(data, 'recognized_but_kept', []));
-      if ('entities' in data) setEntities(pick(data, 'entities', []));
-      if ('review_entities' in data) setReviewEntities(pick(data, 'review_entities', []));
-      if ('review_markers' in data) setReviewMarkers(pick(data, 'review_markers', []));
-      if ('anonymized_text' in data) setAnonymizedText(pick(data, 'anonymized_text', ''));
-      if ('anonymized_content' in data) setAnonymizedContent(pick(data, 'anonymized_content', null));
+      if (hasOwn(data, 'mappings')) setMappings(pick(data, 'mappings', []));
+      if (hasOwn(data, 'entities')) setEntities(pick(data, 'entities', []));
+      else if (hasOwn(data, 'mappings')) setEntities(pick(data, 'mappings', []).map((m, i) => legacyMappingToEntity(m, i, 'REDACT')));
+      if (hasOwn(data, 'kept_entities')) setKeptEntities(pick(data, 'kept_entities', []));
+      else if (hasOwn(data, 'recognized_but_kept')) setKeptEntities(pick(data, 'recognized_but_kept', []).map((m, i) => legacyMappingToEntity(m, i, 'KEEP')));
+      if (hasOwn(data, 'review_entities')) setReviewEntities(pick(data, 'review_entities', []));
+      if (hasOwn(data, 'review_markers')) setReviewMarkers(pick(data, 'review_markers', []));
+      if (hasOwn(data, 'anonymized_text')) setAnonymizedText(pick(data, 'anonymized_text', ''));
+      if (hasOwn(data, 'anonymized_content')) setAnonymizedContent(pick(data, 'anonymized_content', null));
       setContentRevision((v) => v + 1);
     }
     setTimeout(() => setIsApplyingServerContent(false), 0);
   };
+
   const syncFull = async () => applyResponse((await getDocumentAnonymization(documentId)).data, 'FULL');
   const provider = initialData?.ner_provider;
 
   useEffect(() => {
     if (!documentChangedManually || isApplyingServerContent || !anonymizedText.trim()) return;
     const revision = draftRevision;
-    const t = setTimeout(async () => {
-      try { setScanLoading(true); setScanError(''); const res = await scanEditedDraft(documentId, { text: anonymizedText, content: anonymizedContent, content_format: 'TIPTAP_JSON', document_revision: revision }); applyResponse(res.data, 'PENDING_ONLY'); }
-      catch { setScanError('Не удалось проверить добавленный текст.'); }
-      finally { setScanLoading(false); }
+    const timer = setTimeout(async () => {
+      try {
+        setScanLoading(true);
+        setScanError('');
+        const res = await scanEditedDraft(documentId, { text: anonymizedText, content: anonymizedContent, content_format: 'TIPTAP_JSON', document_revision: revision });
+        applyResponse(res.data, 'PENDING_ONLY');
+      } catch (err) {
+        setScanError(getApiErrorMessage(err));
+      } finally {
+        setScanLoading(false);
+      }
     }, 800);
-    return () => clearTimeout(t);
-  }, [draftRevision]);
+    return () => clearTimeout(timer);
+  }, [anonymizedContent, anonymizedText, documentChangedManually, documentId, draftRevision, isApplyingServerContent]);
 
-  const groupedKept = useMemo(() => { const map = new Map<string, EntityMapping[]>(); recognizedButKept.forEach((item) => { const key = item.cluster_id || `${item.entity_class || item.entity_type}:${item.normalized_value || item.original_value}`; map.set(key, [...(map.get(key) || []), item]); }); return [...map.values()]; }, [recognizedButKept]);
-  const conflicts = useMemo(() => { const by = new Map<string, number>(); mappings.forEach((m)=>{ if (!m.placeholder) return; by.set(m.placeholder, (by.get(m.placeholder) || 0) + 1); }); return [...by.entries()].filter(([,count])=>count>1); }, [mappings]);
-  const displayEntities = useMemo<any[]>(() => entities.length ? entities : mappings.map((m, i) => ({ entity_id: m.id || String(i), placeholder: m.placeholder, entity_class: m.entity_class || m.entity_type || 'OTHER', canonical_value: m.normalized_value || m.original_value, person_role: m.person_role, redaction_decision: 'REDACT', mentions_count: m.occurrences_count || (m.aliases?.length || 1), mentions: (m.aliases || [m.original_value]).map((a, idx) => ({ mention_id: `${m.id || i}-${idx}`, entity_id: m.id || String(i), surface_value: a, replacement_value: m.placeholder })) })), [entities, mappings]);
-  const redactionMarkers = useMemo(() => displayEntities.filter((e) => e.placeholder).map((e) => ({ entity_id: e.entity_id, placeholder: e.placeholder || '', canonical_value: e.canonical_value, entity_class: e.entity_class, person_role: PERSON_ROLE_LABELS[e.person_role || ''] || e.person_role, mentions_count: e.mentions_count || e.mentions?.length || 0 })), [displayEntities]);
+  const redactedEntities = useMemo(() => entities.filter((entity) => entity.redaction_decision === 'REDACT' && !entity.requires_review), [entities]);
+  const statusCounts = { redacted: redactedEntities.length, review: reviewEntities.length, kept: keptEntities.length, pending: pendingReview.length };
+  const publicationBlocked = statusCounts.review > 0 || statusCounts.pending > 0;
+  const hasUnvalidatedDraft = documentChangedManually || scanLoading;
+  const publishBlockedByState = publicationBlocked || hasUnvalidatedDraft;
+  const serverMutationInFlight = !!activeAction || !!busyEntityId;
+  const actionsDisabled = hasUnvalidatedDraft || serverMutationInFlight;
+  const blockIfUnvalidatedDraft = () => {
+    if (!hasUnvalidatedDraft) return false;
+    setWarning('Сначала сохраните изменения и дождитесь проверки добавленного текста.');
+    return true;
+  };
 
+  const runAction = async (action: ActionName, fn: () => Promise<void>, success?: string) => {
+    setActiveAction(action);
+    setError('');
+    setWarning('');
+    setMessage('');
+    try {
+      await fn();
+      if (success) setMessage(success);
+    } catch (err) {
+      setError(getApiErrorMessage(err));
+    } finally {
+      setActiveAction('');
+    }
+  };
+
+  const handleSave = () => runAction('save', async () => {
+    setScanLoading(true);
+    try {
+      const scan = await scanEditedDraft(documentId, { text: anonymizedText, content: anonymizedContent, content_format: 'TIPTAP_JSON', document_revision: draftRevision });
+      applyResponse(scan.data, 'PENDING_ONLY');
+      const res = await saveAnonymization(documentId, { anonymized_text: anonymizedText, anonymized_content: anonymizedContent, content_format: 'TIPTAP_JSON', mappings });
+      applyResponse(res.data, 'FULL');
+      setDocumentChangedManually(false);
+      const scanPending = scan.data.pending_review || [];
+      setMessage(scanPending.length ? 'Документ сохранён как рабочая версия. Для публикации необходимо обработать найденные фрагменты.' : 'Изменения обезличенного документа сохранены.');
+      onSaved?.();
+    } finally {
+      setScanLoading(false);
+    }
+  });
+
+  const handleReanonymize = () => {
+    if (hasUnvalidatedDraft) {
+      setWarning('Сначала сохраните изменения и дождитесь проверки добавленного текста.');
+      return;
+    }
+    return runAction('reanonymize', async () => {
+      const res = await reanonymizeDocument(documentId, { mappings, publication_redaction_mode: 'NORMATIVE' });
+      applyResponse(res.data, 'FULL');
+    }, 'Документ повторно обезличен.');
+  };
+
+  const handlePublish = () => {
+    if (hasUnvalidatedDraft) {
+      setWarning('Сначала сохраните изменения и дождитесь проверки добавленного текста.');
+      return;
+    }
+    if (publicationBlocked) {
+      setWarning('Публикация недоступна, пока не обработаны все найденные фрагменты.');
+      return;
+    }
+    return runAction('publish', async () => {
+      await publishDocument(documentId);
+      onSaved?.();
+    }, 'Документ опубликован.');
+  };
+
+  const handleRepair = () => {
+    if (blockIfUnvalidatedDraft()) return;
+    return runAction('repair', async () => {
+      const res = await repairPlaceholders(documentId);
+      applyResponse(res.data, 'FULL');
+    }, 'Условные обозначения проверены и восстановлены.');
+  };
+
+  const handleEntitySelection = (id: string, selected: boolean) => {
+    setMergeError('');
+    setSelectedIds((prev) => selected ? [...new Set([...prev, id])] : prev.filter((item) => item !== id));
+    if (!selected && mergeTarget === id) setMergeTarget('');
+  };
+
+  const handleMerge = () => {
+    if (blockIfUnvalidatedDraft()) return;
+    const selected = redactedEntities.filter((entity) => selectedIds.includes(entity.entity_id));
+    if (selected.length < 2 || !mergeTarget) return;
+    const classes = new Set(selected.map((entity) => entity.entity_class));
+    if (classes.size > 1) {
+      setMergeError('Можно объединять только сущности одного типа данных.');
+      return;
+    }
+    return runAction('merge', async () => {
+      const res = await mergeDocumentEntities(documentId, { target_entity_id: mergeTarget, source_entity_ids: selectedIds.filter((id) => id !== mergeTarget) });
+      applyResponse(res.data, 'FULL');
+      setSelectedIds([]);
+      setMergeTarget('');
+      setMergeError('');
+    }, 'Записи объединены.');
+  };
+
+  const handleEditSave = async (payload: { canonical_value: string; entity_class: string; person_role?: string; context_label?: string }) => {
+    if (!editingEntity) return;
+    if (blockIfUnvalidatedDraft()) return;
+    setActiveAction('edit');
+    setEditorError('');
+    try {
+      const res = await updateDocumentEntity(documentId, editingEntity.entity_id, payload);
+      applyResponse(res.data, 'FULL');
+      setEditingEntity(null);
+      setMessage('Сущность обновлена.');
+    } catch (err) {
+      setEditorError(getApiErrorMessage(err));
+    } finally {
+      setActiveAction('');
+    }
+  };
+
+  const handleSplitMention = async (entity: RedactionEntity, mentionId: string) => {
+    if (blockIfUnvalidatedDraft()) return;
+    setBusyEntityId(mentionId);
+    setError('');
+    try {
+      const res = await splitEntityMention(documentId, entity.entity_id, mentionId);
+      applyResponse(res.data, 'FULL');
+      setMessage('Упоминание отделено в новую сущность.');
+    } catch (err) {
+      setError(getApiErrorMessage(err));
+    } finally {
+      setBusyEntityId('');
+    }
+  };
+
+  const resolveReviewEntity = async (entity: RedactionEntity, decision: 'REDACT' | 'KEEP' | 'MERGE_WITH_EXISTING', targetEntityId?: string) => {
+    if (blockIfUnvalidatedDraft()) return;
+    const key = getEntityKey(entity);
+    const selectedText = selectedTextForEntity(entity);
+    setRowErrors((prev) => ({ ...prev, [key]: '' }));
+    if (!selectedText) {
+      setRowErrors((prev) => ({ ...prev, [key]: 'Не удалось определить значение для проверки.' }));
+      return;
+    }
+    setBusyEntityId(key);
+    try {
+      const res = await applyRedactionDecision(documentId, { entity_key: key, selected_text: selectedText, entity_class: entity.entity_class, decision, target_entity_id: targetEntityId, reason: decision === 'KEEP' ? 'Оставлено пользователем после проверки' : 'Подтверждено пользователем после проверки' });
+      applyResponse(res.data, 'FULL');
+      setMessage('Решение применено.');
+    } catch (err) {
+      setRowErrors((prev) => ({ ...prev, [key]: getApiErrorMessage(err) }));
+    } finally {
+      setBusyEntityId('');
+    }
+  };
+
+  const resolvePendingEntity = async (entity: PendingReviewEntity, decision: 'REDACT' | 'KEEP' | 'MERGE_WITH_EXISTING', targetEntityId?: string) => {
+    if (blockIfUnvalidatedDraft()) return;
+    const key = entity.entity_key || entity.surface_value;
+    setRowErrors((prev) => ({ ...prev, [key]: '' }));
+    if (!entity.surface_value) {
+      setRowErrors((prev) => ({ ...prev, [key]: 'Не удалось определить значение для проверки.' }));
+      return;
+    }
+    setBusyEntityId(key);
+    try {
+      const res = await applyRedactionDecision(documentId, { entity_key: entity.entity_key, selected_text: entity.surface_value, entity_class: entity.entity_class, decision, target_entity_id: targetEntityId, reason: decision === 'REDACT' ? 'Обезличено после проверки дописанного текста' : decision === 'KEEP' ? 'Оставлено пользователем' : 'Связано пользователем с существующей сущностью' });
+      applyResponse(res.data, 'FULL');
+      setMessage('Решение применено.');
+    } catch (err) {
+      setRowErrors((prev) => ({ ...prev, [key]: getApiErrorMessage(err) }));
+    } finally {
+      setBusyEntityId('');
+    }
+  };
+
+  const redactKeptEntity = async (entity: RedactionEntity) => {
+    if (blockIfUnvalidatedDraft()) return;
+    const key = getEntityKey(entity);
+    const selectedText = selectedTextForEntity(entity);
+    setRowErrors((prev) => ({ ...prev, [key]: '' }));
+    if (!selectedText) {
+      setRowErrors((prev) => ({ ...prev, [key]: 'Не удалось определить значение для обезличивания.' }));
+      return;
+    }
+    setBusyEntityId(key);
+    try {
+      const res = await applyRedactionDecision(documentId, { entity_key: key, selected_text: selectedText, entity_class: entity.entity_class, decision: 'REDACT', reason: 'Обезличено пользователем из списка оставленных значений' });
+      applyResponse(res.data, 'FULL');
+      setMessage('Сущность обезличена.');
+    } catch (err) {
+      setRowErrors((prev) => ({ ...prev, [key]: getApiErrorMessage(err) }));
+    } finally {
+      setBusyEntityId('');
+    }
+  };
+
+  const scrollToEntity = (entityId: string) => {
+    document.getElementById(`entity-row-${entityId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  };
+  const scrollToPending = (entityKey: string) => {
+    const row = entityKey ? document.getElementById(`pending-row-${entityKey}`) : null;
+    (row || pendingPanelRef.current)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  };
 
   return <div className='anonymization-workspace'>
-    <h2>Результат обезличивания</h2>
-    <div className='recognition-provider-card'>{provider ? 'Механизм распознавания: Natasha и правила' : 'Natasha недоступна, используются только правила'}</div>
-    {warning && <p className='warning-message'>{warning}</p>}{error && <p className='error-message'>{error}</p>}{message && <p className='success-message'>{message}</p>}
-    {pendingReview.length > 0 && <div className='publication-blocked-warning'>Документ содержит необработанные фрагменты. Сначала обработайте найденные персональные данные.</div>}
-    <div className='anonymized-editor-tabs'><button className='button button-secondary' onClick={()=>setResultTab('EDIT')}>Редактирование обезличенного текста</button><button className='button button-secondary' onClick={()=>setResultTab('PREVIEW')}>Предпросмотр обезличенного документа</button></div>
-    {resultTab==='EDIT' ? <RichDocumentEditor value={anonymizedContent ?? plainTextToTiptapDocument(anonymizedText)} contentRevision={contentRevision} editable onChange={({ json, text }) => { setAnonymizedContent(json); setAnonymizedText(text); setDocumentChangedManually(true); if (!isApplyingServerContent) setDraftRevision((v) => v + 1); }} reviewMarkers={reviewMarkers} redactionMarkers={redactionMarkers} showSensitiveTooltips onRedactionMarkerClick={(entityId)=>{const el=document.getElementById(`entity-row-${entityId}`); el?.scrollIntoView({behavior:'smooth',block:'center'}); el?.classList.add('pending-review-row-active'); setTimeout(()=>el?.classList.remove('pending-review-row-active'),1200);}} pendingMarkers={pendingMarkers} onReviewMarkerClick={() => setTab('REVIEW')} onPendingMarkerClick={(entityKey) => { setTimeout(() => pendingPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0); const el = document.getElementById(`pending-row-${entityKey}`); el?.classList.add('pending-review-row-active'); setTimeout(() => el?.classList.remove('pending-review-row-active'), 1200); }} /> : <CourtDocumentView variant='anonymizedPreview' title='Черновик обезличенного документа' content={anonymizedContent ?? plainTextToTiptapDocument(anonymizedText)} contentFormat='TIPTAP_JSON' text={anonymizedText} />}
-
-    <section className='anonymization-results-section'><h3>Результаты автоматического обезличивания</h3>
-      <div className='entity-tabs'><button className={`button button-secondary ${tab==='REDACT'?'entity-tab-active':''}`} onClick={()=>setTab('REDACT')}>Обезличено</button><button className={`button button-secondary ${tab==='KEEP'?'entity-tab-active':''}`} onClick={()=>setTab('KEEP')}>Оставлено в тексте</button><button className={`button button-secondary ${tab==='REVIEW'?'entity-tab-active':''}`} onClick={()=>setTab('REVIEW')}>Обезличено, требуется проверка</button></div>
-      {conflicts.length>0 && <div className='placeholder-conflict'><p>Обнаружены повторяющиеся обозначения.</p><button className='button' onClick={async()=>{ await repairPlaceholders(documentId); await syncFull(); }}>Исправить обозначения автоматически</button></div>}
-      {tab==='REDACT' && <><table className='entity-table'><thead><tr><th>Условное обозначение</th><th>Основное значение</th><th>Тип данных</th><th>Роль / контекст</th><th>Количество упоминаний</th><th>Проверка</th><th>Действия</th></tr></thead><tbody>{displayEntities.map((e)=> <><tr id={`entity-row-${e.entity_id}`} key={e.entity_id} className='entity-row'><td>{e.placeholder || '—'}</td><td>{e.canonical_value}</td><td>{getEntityTypeLabel(e.entity_class)}</td><td>{PERSON_ROLE_LABELS[e.person_role || ''] || e.context_label || '—'}</td><td>{e.mentions_count || e.mentions?.length || 0}</td><td>{e.requires_review ? 'Требуется проверка' : 'Подтверждено'}</td><td className='mapping-actions'><button className='button button-secondary' onClick={async()=>{const value=window.prompt('Основное значение', e.canonical_value); if(!value) return; await updateDocumentEntity(documentId, e.entity_id, { canonical_value: value, person_role: e.person_role, context_label: e.context_label || ''}); await syncFull();}}>Изменить</button><button className='button button-secondary' onClick={async()=>{ const target=window.prompt('ID целевой сущности для объединения'); if(!target) return; window.alert('Объединяйте записи только в том случае, если это разные формы записи одного человека или одного объекта. После объединения все выбранные упоминания будут иметь одно условное обозначение.'); await mergeDocumentEntities(documentId,{ target_entity_id: target, source_entity_ids:[e.entity_id]}); await syncFull(); }}>Объединить</button></td></tr><tr className='entity-details'><td colSpan={7}><table className='mentions-table'><thead><tr><th>Вариант написания</th><th>Форма</th><th>Позиция / контекст</th><th>Замена</th><th>Действия</th></tr></thead><tbody>{(e.mentions||[]).map((m:any)=><tr className='mention-row' key={m.mention_id}><td>{m.surface_value}</td><td>{m.format==='INITIALS'?'Фамилия и инициалы':'Полное ФИО'}</td><td>{m.start ?? '—'} - {m.end ?? '—'}</td><td>{m.replacement_value || e.placeholder || '—'}</td><td><button className='button button-secondary' onClick={async()=>{await splitEntityMention(documentId,e.entity_id,m.mention_id); await syncFull();}}>Разделить упоминание</button></td></tr>)}</tbody></table></td></tr></>)}</tbody></table><div className='mapping-selection-toolbar'><button className='button button-secondary' disabled={selectedIds.length<2} onClick={async()=>{ if (!mergeTarget) return setError('Выберите основную запись для объединения.'); const source = selectedIds.filter((id)=>id!==mergeTarget); await mergeDocumentEntities(documentId,{target_entity_id:mergeTarget,source_entity_ids:source}); await syncFull(); }}>Объединить выбранные записи</button><select value={mergeTarget} onChange={(e)=>setMergeTarget(e.target.value)}><option value=''>Основная запись</option>{mappings.filter((m)=>m.id).map((m:any)=><option key={m.id} value={m.id}>{m.placeholder || m.normalized_value || m.original_value}</option>)}</select></div>
-      <table className='mapping-table'><thead><tr><th></th><th>Условное обозначение</th><th>Основное значение</th><th>Варианты написания</th><th>Тип данных</th><th>Роль / контекст</th><th>Причина</th><th>Источник</th><th>Действия</th></tr></thead><tbody>{mappings.map((m, i)=><tr key={m.id || i}><td><input type='checkbox' checked={m.id ? selectedIds.includes(m.id) : false} onChange={(e)=>m.id && setSelectedIds((prev)=>e.target.checked?[...prev,m.id!]:prev.filter((x)=>x!==m.id))} /></td><td>{m.placeholder || '—'}</td><td>{m.normalized_value || m.original_value}</td><td>{(m.aliases || []).join(', ') || '—'}</td><td>{getEntityTypeLabel(m.entity_class || m.entity_type)}</td><td>{PERSON_ROLE_LABELS[m.person_role || ''] || m.role || m.context || '—'}</td><td>{m.redaction_reason || m.review_reason || '—'}</td><td>{getSourceLabel(m.source || m.detection_method)}</td><td className='mapping-actions'><button className='button button-secondary' onClick={()=>setEditingId(m.id || '')}>Изменить</button><button className='button button-secondary' onClick={async()=>{ if(!window.confirm('Убрать это значение из обезличивания? Оно будет восстановлено в тексте и не должно автоматически скрываться при повторной обработке.')) return; const r = await applyRedactionDecision(documentId,{selected_text:m.original_value,entity_key:m.entity_key,decision:'KEEP',entity_class:m.entity_class || m.entity_type || 'OTHER'}); applyResponse(r.data,'FULL'); if (!('mappings' in r.data)) await syncFull(); }}>Оставить в тексте</button></td></tr>)}</tbody></table>
-      {editingId && <div className='mapping-edit-form'>{(() => { const row = mappings.find((m)=>m.id===editingId); if (!row) return null; return <><input defaultValue={row.placeholder || ''} id='edit-placeholder' readOnly disabled /><input defaultValue={row.original_value} id='edit-original' /><select defaultValue={row.entity_class || row.entity_type || 'OTHER'} id='edit-type'>{ENTITY_TYPE_OPTIONS.map((o)=><option key={o.value} value={o.value}>{o.label}</option>)}</select><button className='button' onClick={async()=>{await updateDocumentEntity(documentId, editingId, { canonical_value: (document.getElementById('edit-original') as HTMLInputElement).value, entity_class: (document.getElementById('edit-type') as HTMLSelectElement).value }); setEditingId(''); await syncFull();}}>Сохранить изменения</button></>; })()}</div>}</>}
-      {tab==='KEEP' && <table className='mapping-table'><thead><tr><th>Значение</th><th>Тип данных</th><th>Роль / контекст</th><th>Причина оставления</th><th>Количество упоминаний</th><th>Действия</th></tr></thead><tbody>{groupedKept.map((items, idx)=>{ const first=items[0]; return <tr key={idx} className='kept-row'><td>{first.normalized_value || first.original_value}</td><td>{getEntityTypeLabel(first.entity_class || first.entity_type)}</td><td>{PERSON_ROLE_LABELS[first.person_role || ''] || first.role || '—'}</td><td>{first.redaction_reason || '—'}</td><td>{first.occurrences_count || items.reduce((s, it)=>s + (it.occurrences_count || 1),0)}</td><td><button className='button button-secondary' onClick={async()=>{ const r=await applyRedactionDecision(documentId,{entity_key:first.entity_key,selected_text:first.normalized_value || first.original_value,entity_class:first.entity_class || first.entity_type || 'OTHER',decision:'REDACT',reason:'Обезличено пользователем из списка оставленных значений'}); applyResponse(r.data,'FULL'); if (!('mappings' in r.data)) await syncFull(); }}>Обезличить вручную</button></td></tr>; })}</tbody></table>}
-      {tab==='REVIEW' && <table className='mapping-table'><thead><tr><th>Обозначение</th><th>Исходное значение</th><th>Нормализованная форма</th><th>Тип</th><th>Причина проверки</th><th>Возможные объединения</th><th>Действия</th></tr></thead><tbody>{(reviewEntities as any[]).map((r,i)=>{ const selectedText = r.original_value || r.canonical_value || r.normalized_value || r.mentions?.[0]?.surface_value || ''; const key=r.entity_key || `${r.entity_class || r.entity_type || 'OTHER'}::${r.normalized_value || r.canonical_value || selectedText || i}`; const selected=mergeTargets[key] || ''; const decisionPayload = (decision: 'REDACT' | 'KEEP' | 'MERGE_WITH_EXISTING', targetEntityId?: string) => ({entity_key:key,selected_text:selectedText,decision,entity_class:r.entity_class || r.entity_type || 'OTHER',...(targetEntityId ? {target_entity_id:targetEntityId} : {})}); const ensureSelectedText = () => { if (selectedText) return true; setError('Не удалось определить значение для проверки.'); return false; }; return <tr key={key} className='review-row'><td>{r.placeholder || '—'}</td><td>{selectedText || '—'}</td><td>{r.normalized_value || '—'}</td><td>{getEntityTypeLabel(r.entity_class || r.entity_type)}</td><td>{r.review_reason || r.ambiguity_reason || '—'}</td><td>{r.merge_candidates?.length ? <select value={selected} onChange={(e)=>setMergeTargets((p)=>({...p,[key]:e.target.value}))}><option value=''>Выберите запись</option>{r.merge_candidates?.map((m:any)=><option key={m.entity_id || m.cluster_id} value={m.entity_id || m.cluster_id}>{m.placeholder ? `${m.placeholder} — ${m.canonical_value || m.normalized_value || m.entity_id || m.cluster_id}` : (m.canonical_value || m.normalized_value || m.entity_id || m.cluster_id)}</option>)}</select> : 'Нет кандидатов'}</td><td className='mapping-actions'><button className='button' onClick={async()=>{if(!ensureSelectedText()) return; const x=await applyRedactionDecision(documentId,decisionPayload('REDACT')); applyResponse(x.data,'FULL');}}>Подтвердить обезличивание</button><button className='button button-secondary' onClick={async()=>{if(!ensureSelectedText()) return; const x=await applyRedactionDecision(documentId,decisionPayload('KEEP')); applyResponse(x.data,'FULL');}}>Оставить в тексте</button>{r.merge_candidates?.length ? <button className='button button-secondary' disabled={!selected} onClick={async()=>{if(!ensureSelectedText()) return; const x=await applyRedactionDecision(documentId,decisionPayload('MERGE_WITH_EXISTING', selected)); applyResponse(x.data,'FULL');}}>Объединить с существующей записью</button> : null}</td></tr>; })}</tbody></table>}
+    <section className='workspace-status-panel'>
+      <div className='panel-header-row'>
+        <div><h1>Обезличивание документа</h1><p className='muted-text'>{provider ? 'Используется Natasha и правила' : 'Используются только правила'}</p></div>
+        <div className='document-actions'>
+          <button type='button' className='button button-secondary' disabled={serverMutationInFlight} onClick={handleSave}>{activeAction === 'save' ? 'Сохраняем...' : 'Сохранить изменения'}</button>
+          <button type='button' className='button button-secondary' disabled={actionsDisabled} onClick={handleReanonymize}>{activeAction === 'reanonymize' ? 'Обезличиваем...' : 'Повторно обезличить'}</button>
+          <button type='button' className='button' disabled={serverMutationInFlight || publishBlockedByState} onClick={handlePublish}>{activeAction === 'publish' ? 'Публикуем...' : 'Опубликовать'}</button>
+        </div>
+      </div>
+      <div className='workspace-counters'>
+        <span className='counter-card'>Обезличено <strong>{statusCounts.redacted}</strong></span>
+        <span className='counter-card warning-counter'>Требует проверки <strong>{statusCounts.review}</strong></span>
+        <span className='counter-card'>Оставлено в тексте <strong>{statusCounts.kept}</strong></span>
+        <span className='counter-card warning-counter'>Найдено в изменениях <strong>{statusCounts.pending}</strong></span>
+      </div>
+      {publishBlockedByState && <p className='publication-blocked-warning'>{hasUnvalidatedDraft ? 'Сначала сохраните изменения и дождитесь проверки добавленного текста.' : 'Публикация недоступна, пока не обработаны все найденные фрагменты.'}</p>}
+      {warning && <p className='warning-message'>{warning}</p>}
+      {error && <p className='error-message'>{error}</p>}
+      {message && <p className='success-message'>{message}</p>}
     </section>
 
-    <div ref={pendingPanelRef} className='pending-review-panel'><h3>Найдено в изменённом тексте</h3>{scanLoading && <p className='scan-loading'>Проверяем добавленный текст...</p>}{scanError && <p className='error-message'>{scanError}</p>}</div>
-    {pendingReview.length>0 && <table className='mapping-table'><thead><tr><th>Фрагмент</th><th>Предполагаемый тип</th><th>Причина</th><th>Возможные связи</th><th>Действия</th></tr></thead><tbody>{pendingReview.map((p,i)=>{const key=p.entity_key || String(i); const selected=mergeTargets[key] || ''; return <tr id={`pending-row-${p.entity_key}`} key={key} className='pending-review-row'><td>{p.surface_value}</td><td>{getEntityTypeLabel(p.entity_class)}</td><td>{p.reason}</td><td>{p.merge_candidates?.length ? <select value={selected} onChange={(e)=>setMergeTargets((prev)=>({...prev,[key]:e.target.value}))}><option value=''>Выберите сущность</option>{p.merge_candidates?.map((m)=><option key={m.entity_id || m.cluster_id} value={m.entity_id || m.cluster_id}>{m.placeholder ? `${m.placeholder} — ${m.canonical_value || m.normalized_value || m.entity_id || m.cluster_id}` : (m.canonical_value || m.normalized_value || m.entity_id || m.cluster_id)}</option>)}</select> : 'Нет кандидатов'}</td><td><button className='button' onClick={async()=>{const r=await applyRedactionDecision(documentId,{entity_key:p.entity_key,selected_text:p.surface_value,decision:'REDACT',entity_class:p.entity_class,reason:'Обезличено после проверки дописанного текста'});applyResponse(r.data,'FULL'); if (!('mappings' in r.data)) await syncFull();}}>Обезличить</button> <button className='button button-secondary' onClick={async()=>{const r=await applyRedactionDecision(documentId,{entity_key:p.entity_key,selected_text:p.surface_value,decision:'KEEP',entity_class:p.entity_class,reason:'Оставлено пользователем'});applyResponse(r.data,'FULL'); if (!('mappings' in r.data)) await syncFull();}}>Оставить в тексте</button> {p.merge_candidates?.length ? <button className='button button-secondary' disabled={!selected} onClick={async()=>{const r=await applyRedactionDecision(documentId,{entity_key:p.entity_key,selected_text:p.surface_value,decision:'MERGE_WITH_EXISTING',entity_class:p.entity_class,target_entity_id:selected,reason:'Связано пользователем с существующей сущностью'});applyResponse(r.data,'FULL'); if (!('mappings' in r.data)) await syncFull();}}>Связать с существующей записью</button> : null}</td></tr>;})}</tbody></table>}
-    <button className='button button-secondary' onClick={async()=>{ const r = await reanonymizeDocument(documentId, { mappings, publication_redaction_mode: 'NORMATIVE' }); applyResponse(r.data,'FULL'); }}>Повторно обезличить</button>
-    <button className='button' onClick={async()=>{const r=await saveAnonymization(documentId,{anonymized_text:anonymizedText,anonymized_content:anonymizedContent,content_format:'TIPTAP_JSON',entities}); applyResponse(r.data,'FULL'); setDocumentChangedManually(false); setMessage(pendingReview.length ? 'Документ сохранён как рабочая версия. Для публикации необходимо обработать найденные фрагменты.' : 'Изменения обезличенного документа сохранены.');}}>Сохранить документ</button>
-    {sourceText && <p className='warning-message'>Исходный текст изменён. Таблица соответствия может быть неактуальна. Выполните обезличивание повторно.</p>}
+    <AnonymizedDocumentPanel
+      mode={resultTab}
+      onModeChange={setResultTab}
+      anonymizedText={anonymizedText}
+      anonymizedContent={anonymizedContent}
+      contentRevision={contentRevision}
+      reviewMarkers={reviewMarkers}
+      pendingMarkers={pendingMarkers}
+      redactionMarkers={redactedEntities}
+      onChange={({ json, text }) => { setAnonymizedContent(json); setAnonymizedText(text); setDocumentChangedManually(true); setDraftRevision((v) => v + 1); }}
+      onRedactionClick={scrollToEntity}
+      onPendingClick={(key) => scrollToPending(key)}
+      onReviewClick={() => document.querySelector('.review-panel')?.scrollIntoView({ behavior: 'smooth', block: 'center' })}
+      editorLocked={serverMutationInFlight}
+    />
+
+    <div className='document-actions'>
+      <button type='button' className='button button-secondary' disabled={actionsDisabled} onClick={handleRepair}>{activeAction === 'repair' ? 'Проверяем...' : 'Восстановить placeholder marks'}</button>
+      {sourceText && <p className='warning-message'>Исходный текст изменён. Таблица соответствия может быть неактуальна. Выполните обезличивание повторно.</p>}
+    </div>
+
+    <div className='workspace-panels-grid'>
+      {hasUnvalidatedDraft && <p className='manual-decision-warning'>Сохраните изменения документа, чтобы продолжить работу с сущностями.</p>}
+      <EntityRegistryPanel entities={redactedEntities} selectedIds={selectedIds} mergeTarget={mergeTarget} busyId={busyEntityId} mergeBusy={activeAction === 'merge'} mergeError={mergeError} onSelect={handleEntitySelection} onMergeTargetChange={setMergeTarget} onMerge={handleMerge} onClearSelection={() => { setSelectedIds([]); setMergeTarget(''); setMergeError(''); }} onEdit={setEditingEntity} onSplitMention={handleSplitMention} actionsDisabled={actionsDisabled} />
+      <div ref={pendingPanelRef}><PendingReviewPanel pendingReview={pendingReview} scanLoading={scanLoading} scanError={scanError} mergeTargets={mergeTargets} busyId={busyEntityId} errors={rowErrors} onMergeTargetChange={(key, targetId) => setMergeTargets((prev) => ({ ...prev, [key]: targetId }))} onResolve={resolvePendingEntity} actionsDisabled={actionsDisabled} /></div>
+      <ReviewEntitiesPanel reviewEntities={reviewEntities} mergeTargets={mergeTargets} busyId={busyEntityId} errors={rowErrors} onMergeTargetChange={(key, targetId) => setMergeTargets((prev) => ({ ...prev, [key]: targetId }))} onResolve={resolveReviewEntity} actionsDisabled={actionsDisabled} />
+      <KeptEntitiesPanel keptEntities={keptEntities} busyId={busyEntityId} errors={rowErrors} onRedact={redactKeptEntity} actionsDisabled={actionsDisabled} />
+    </div>
+
+    <EntityEditorModal entity={editingEntity} busy={activeAction === 'edit'} error={editorError} onClose={() => setEditingEntity(null)} onSave={handleEditSave} actionsDisabled={actionsDisabled} />
   </div>;
 }

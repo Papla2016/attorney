@@ -3860,3 +3860,83 @@ def test_merge_with_existing_cross_node_error_does_not_mutate_document_or_decisi
     assert main.restored_docs[doc_id]['entities'][0]['mentions'] == []
     assert main.restored_docs[doc_id]['working_text'] == text
     assert main.restored_docs[doc_id]['working_content'] == content
+    
+def test_draft_scan_older_revision_cannot_overwrite_newer_pending_state(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'draft-scan-revision-guard-doc'
+
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case',
+        'title': 'doc',
+        'original_text': '',
+        'anonymized_text': '',
+        'entities': [],
+        'kept_entities': [],
+        'mappings': [],
+        'pending_review': [],
+        'pending_markers': [],
+        'content_format': 'PLAIN_TEXT',
+    }
+    main.pending_review_by_document_id.pop(doc_id, None)
+
+    async def fake_extract_entities(text: str):
+        if 'Петров' in text:
+            value = 'Петров Пётр Петрович'
+        else:
+            value = 'Иванов Иван Иванович'
+
+        start = text.index(value)
+        return [{
+            'type': 'PERSON_FULL_NAME',
+            'text': value,
+            'normalized_text': value,
+            'start': start,
+            'end': start + len(value),
+            'confidence': 0.99,
+            'source': 'ner',
+        }]
+
+    monkeypatch.setattr(main, 'extract_entities', fake_extract_entities)
+
+    newer_text = 'Новый свидетель Петров Пётр Петрович.'
+    newer_response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/draft-scan',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={
+            'text': newer_text,
+            'content': None,
+            'content_format': 'PLAIN_TEXT',
+            'document_revision': 2,
+        },
+    )
+
+    assert newer_response.status_code == 200
+    assert main.restored_docs[doc_id]['working_document_revision'] == 2
+    assert main.restored_docs[doc_id]['working_text'] == newer_text
+    assert main.restored_docs[doc_id]['pending_review'][0]['surface_value'] == 'Петров Пётр Петрович'
+
+    older_text = 'Старый свидетель Иванов Иван Иванович.'
+    older_response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/draft-scan',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={
+            'text': older_text,
+            'content': None,
+            'content_format': 'PLAIN_TEXT',
+            'document_revision': 1,
+        },
+    )
+
+    assert older_response.status_code == 200
+    assert older_response.json()['stale'] is True
+
+    assert main.restored_docs[doc_id]['working_document_revision'] == 2
+    assert main.restored_docs[doc_id]['working_text'] == newer_text
+    assert main.restored_docs[doc_id]['pending_review'][0]['surface_value'] == 'Петров Пётр Петрович'
+    assert older_response.json()['pending_review'][0]['surface_value'] == 'Петров Пётр Петрович'

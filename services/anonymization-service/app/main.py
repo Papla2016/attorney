@@ -2317,17 +2317,45 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
 @app.post('/internal/anonymization/documents/{document_id}/draft-scan')
 async def draft_scan(document_id: str, body: DraftScanRequest, x_internal_service_token: str | None = Header(None)):
     require_internal(x_internal_service_token)
+
     if document_id not in restored_docs:
         _error(404, 'NOT_FOUND', 'Документ не найден')
+
+    doc = restored_docs[document_id]
+
+    def current_scan_response(stale: bool = False) -> dict:
+        current_doc = restored_docs[document_id]
+        response = {
+            'document_id': document_id,
+            'document_revision': current_doc.get('working_document_revision', body.document_revision),
+            'pending_review': current_doc.get('pending_review', []),
+            'pending_markers': current_doc.get('pending_markers', []),
+        }
+        if stale:
+            response['stale'] = True
+        return response
+
+    current_revision = doc.get('working_document_revision')
+    if not isinstance(current_revision, int):
+        current_revision = -1
+
+    if body.document_revision < current_revision:
+        return current_scan_response(stale=True)
+
     working_text = canonical_text_for_content(body.text, body.content, body.content_format)
-    restored_docs[document_id]['working_text'] = working_text
-    restored_docs[document_id]['working_content'] = body.content
-    restored_docs[document_id]['working_content_format'] = body.content_format
-    restored_docs[document_id]['working_document_revision'] = body.document_revision
+    doc['working_text'] = working_text
+    doc['working_content'] = body.content
+    doc['working_content_format'] = body.content_format
+    doc['working_document_revision'] = body.document_revision
+
     entities = await extract_entities(working_text)
+
+    if restored_docs[document_id].get('working_document_revision') != body.document_revision:
+        return current_scan_response(stale=True)
+
     pending = []
     decisions = manual_decisions_by_document_id.get(document_id, {})
-    existing_entities = restored_docs[document_id].get('entities', [])
+    existing_entities = doc.get('entities', [])
     placeholder_patterns = [r'ФИО\d+', r'ПАСПОРТ\d+', r'ИНН\d+', r'АДРЕС\d+', r'ДАТА\d+', r'ТЕЛЕФОН\d+', r'СНИЛС\d+', r'ЭЛЕКТРОННАЯ_ПОЧТА\d+']
     for e in resolve_entities(working_text, entities, 'NORMATIVE'):
         surface = e.get('surface_value', '')
@@ -2352,10 +2380,19 @@ async def draft_scan(document_id: str, body: DraftScanRequest, x_internal_servic
         ]
         pending.append({'entity_key': key, 'surface_value': surface, 'normalized_value': e.get('normalized_value', surface), 'entity_class': e.get('entity_class', 'OTHER'), 'person_role': e.get('person_role', 'UNKNOWN'), 'start': e.get('start', 0), 'end': e.get('end', 0), 'reason': 'В изменённом тексте найдено новое значение, требующее проверки', 'suggested_action': 'REDACT', 'merge_candidates': merge_candidates})
     pending_review_by_document_id[document_id] = pending
-    restored_docs[document_id]['pending_review'] = pending
-    restored_docs[document_id]['pending_markers'] = [{'entity_key': p['entity_key'], 'surface_value': p['surface_value'], 'start': p['start'], 'end': p['end'], 'reason': p['reason']} for p in pending]
-    return {'document_id': document_id, 'document_revision': body.document_revision, 'pending_review': pending, 'pending_markers': restored_docs[document_id]['pending_markers']}
+    doc['pending_review'] = pending
+    doc['pending_markers'] = [
+        {
+            'entity_key': p['entity_key'],
+            'surface_value': p['surface_value'],
+            'start': p['start'],
+            'end': p['end'],
+            'reason': p['reason'],
+        }
+        for p in pending
+    ]
 
+    return current_scan_response()
 
 @app.get('/internal/anonymization/documents/{document_id}/preview')
 def markdown_preview(document_id: str, format: str = 'markdown', x_internal_service_token: str | None = Header(None)):

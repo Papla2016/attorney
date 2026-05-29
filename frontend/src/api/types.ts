@@ -7,7 +7,7 @@ export interface PublicDocumentListItem { id: string; title: string; case_number
 export interface PublicDocumentDetails extends PublicDocumentListItem { anonymized_text: string; can_view_restored?: boolean; }
 export type FavoriteDocument = PublicDocumentListItem;
 export type EntityOccurrence = { surface_value: string; start?: number; end?: number; };
-export type MergeCandidate = { entity_id?: string; cluster_id?: string; placeholder?: string; canonical_value?: string; normalized_value: string; entity_class?: string; };
+export type MergeCandidate = { entity_id?: string; cluster_id?: string; placeholder?: string; canonical_value?: string; normalized_value?: string; entity_class?: string; };
 export interface EntityMapping { id?: string; entity_key?: string; cluster_id?: string; placeholder?: string; original_value: string; normalized_value?: string; aliases?: string[]; entity_class?: string; entity_type?: string; person_role?: string; context_kind?: string; role?: string; context?: string; redaction_decision?: 'REDACT' | 'KEEP' | 'REVIEW'; redaction_reason?: string; source?: 'natasha' | 'regex' | 'rule' | 'manual'; detection_method?: string; ambiguity_reason?: string; date_purpose?: string; location_purpose?: string; requires_review?: boolean; review_reason?: string; occurrences_count?: number; occurrences?: EntityOccurrence[]; merge_candidates?: MergeCandidate[]; }
 export interface RestoredDocument { id: string; title: string; original_text: string; anonymized_text: string; entity_mappings: EntityMapping[]; }
 export interface RestoredCase { id: string; case_number: string; court?: string; region?: string; documents: RestoredDocument[]; }
@@ -50,7 +50,7 @@ export type PendingReviewEntity = {
   end?: number;
   reason: string;
   suggested_action?: 'REDACT' | 'KEEP';
-  merge_candidates?: Array<{ entity_id?: string; cluster_id?: string; placeholder?: string; canonical_value?: string; normalized_value: string; entity_class?: string; }>;
+  merge_candidates?: MergeCandidate[];
 };
 
 export type PendingMarker = { entity_key: string; surface_value: string; start?: number; end?: number; reason: string; };
@@ -76,24 +76,23 @@ export type EntityMention = {
 
 export type RedactionEntity = {
   entity_id: string;
+  entity_key?: string;
   document_id?: string;
   placeholder?: string;
   entity_class: string;
   canonical_value: string;
+  original_value?: string;
   normalized_value?: string;
   person_role?: string;
   context_kind?: string;
+  context_label?: string;
   redaction_decision: 'REDACT' | 'KEEP';
   requires_review?: boolean;
   review_reason?: string | null;
   source?: string;
   mentions_count?: number;
   mentions: EntityMention[];
-  merge_candidates?: Array<{
-    entity_id: string;
-    placeholder?: string;
-    canonical_value: string;
-  }>;
+  merge_candidates?: MergeCandidate[];
 };
 
 export type PublicationValidationDetails = {
