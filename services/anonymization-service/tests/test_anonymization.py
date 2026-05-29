@@ -3346,3 +3346,517 @@ def test_patch_entity_allows_entity_class_update_without_losing_working_revision
     assert stored['working_text'] == 'ФИО1'
     assert stored['working_content'] == before_content
     assert stored['original_text'] == 'Иванов Иван Иванович'
+
+
+def _multiblock_content():
+    return {
+        'type': 'doc',
+        'content': [
+            {'type': 'heading', 'attrs': {'level': 1, 'textAlign': 'center'}, 'content': [{'type': 'text', 'text': 'РЕШЕНИЕ'}]},
+            {'type': 'paragraph', 'attrs': {'textAlign': 'left'}, 'content': [
+                {'type': 'text', 'text': 'Истец '},
+                {'type': 'text', 'text': 'Иванов Иван Иванович', 'marks': [{'type': 'bold'}]},
+                {'type': 'text', 'text': ' обратился в суд.'},
+            ]},
+            {'type': 'paragraph', 'content': [{'type': 'text', 'text': 'Материалы дела изучены.', 'marks': [{'type': 'italic'}, {'type': 'underline'}]}]},
+            {'type': 'bulletList', 'content': [{'type': 'listItem', 'content': [{'type': 'paragraph', 'content': [
+                {'type': 'text', 'text': 'Ответчик '},
+                {'type': 'text', 'text': 'Петров Пётр Петрович', 'marks': [{'type': 'underline'}]},
+                {'type': 'text', 'text': ' возражал.'},
+            ]}]}]},
+            {'type': 'orderedList', 'attrs': {'start': 1}, 'content': [{'type': 'listItem', 'content': [{'type': 'paragraph', 'content': [{'type': 'text', 'text': 'Первый довод принят.', 'marks': [{'type': 'strike'}]}]}]}]},
+            {'type': 'blockquote', 'content': [{'type': 'paragraph', 'content': [{'type': 'text', 'text': 'Суд установил обстоятельства.'}]}]},
+            {'type': 'table', 'content': [
+                {'type': 'tableRow', 'content': [
+                    {'type': 'tableHeader', 'attrs': {'colspan': 1, 'rowspan': 1}, 'content': [{'type': 'paragraph', 'content': [{'type': 'text', 'text': 'ФИО'}]}]},
+                    {'type': 'tableHeader', 'attrs': {'colspan': 1, 'rowspan': 1}, 'content': [{'type': 'paragraph', 'content': [{'type': 'text', 'text': 'Статус'}]}]},
+                ]},
+                {'type': 'tableRow', 'content': [
+                    {'type': 'tableCell', 'attrs': {'colspan': 1, 'rowspan': 1}, 'content': [{'type': 'paragraph', 'content': [
+                        {'type': 'text', 'text': 'Сидоров С.С.', 'marks': [{'type': 'italic'}]},
+                    ]}]},
+                    {'type': 'tableCell', 'attrs': {'colspan': 1, 'rowspan': 1}, 'content': [{'type': 'paragraph', 'content': [{'type': 'text', 'text': 'Свидетель'}]}]},
+                ]},
+            ]},
+            {'type': 'paragraph', 'content': [{'type': 'text', 'text': 'После таблицы решение объявлено.'}]},
+        ],
+    }
+
+
+def _entity(entity_id, mention_id, surface, text, placeholder):
+    start = text.index(surface)
+    return {
+        'entity_id': entity_id,
+        'document_id': 'rich-doc',
+        'entity_class': 'PERSON',
+        'canonical_value': surface,
+        'normalized_value': surface,
+        'placeholder': placeholder,
+        'redaction_decision': 'REDACT',
+        'mentions': [{
+            'mention_id': mention_id,
+            'entity_id': entity_id,
+            'surface_value': surface,
+            'normalized_value': surface,
+            'start': start,
+            'end': start + len(surface),
+            'replacement_value': placeholder,
+        }],
+    }
+
+
+def _mark_types(node):
+    return [m.get('type') for m in node.get('marks', [])]
+
+
+def _find_text_node(node, text):
+    if isinstance(node, dict):
+        if node.get('type') == 'text' and node.get('text') == text:
+            return node
+        for child in node.get('content', []) or []:
+            found = _find_text_node(child, text)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for child in node:
+            found = _find_text_node(child, text)
+            if found:
+                return found
+    return None
+
+
+def _contains_key(node, key):
+    if isinstance(node, dict):
+        if key in node:
+            return True
+        return any(_contains_key(v, key) for v in node.values())
+    if isinstance(node, list):
+        return any(_contains_key(v, key) for v in node)
+    return False
+
+
+def test_tiptap_canonical_plain_text_preserves_multiblock_separators():
+    from app.main import content_plain_text
+    content = _multiblock_content()
+    assert content_plain_text(content) == (
+        'РЕШЕНИЕ\n'
+        'Истец Иванов Иван Иванович обратился в суд.\n'
+        'Материалы дела изучены.\n'
+        'Ответчик Петров Пётр Петрович возражал.\n'
+        'Первый довод принят.\n'
+        'Суд установил обстоятельства.\n'
+        'ФИО\n'
+        'Статус\n'
+        'Сидоров С.С.\n'
+        'Свидетель\n'
+        'После таблицы решение объявлено.'
+    )
+
+
+def test_multiblock_anonymization_places_mentions_in_correct_nodes():
+    from app.main import anonymize_content_by_mentions, content_plain_text
+    content = _multiblock_content()
+    text = content_plain_text(content)
+    entities = [
+        _entity('e1', 'm1', 'Иванов Иван Иванович', text, 'ФИО1'),
+        _entity('e2', 'm2', 'Петров Пётр Петрович', text, 'ФИО2'),
+        _entity('e3', 'm3', 'Сидоров С.С.', text, 'ФИО3'),
+    ]
+    anon = anonymize_content_by_mentions(content, entities)
+    assert anon['content'][0]['attrs']['textAlign'] == 'center'
+    assert _find_text_node(anon['content'][1], 'ФИО1')['marks'][-1]['attrs']['mentionId'] == 'm1'
+    assert 'bold' in _mark_types(_find_text_node(anon['content'][1], 'ФИО1'))
+    list_node = anon['content'][3]['content'][0]['content'][0]
+    assert _find_text_node(list_node, 'ФИО2')['marks'][-1]['attrs']['mentionId'] == 'm2'
+    assert 'underline' in _mark_types(_find_text_node(list_node, 'ФИО2'))
+    table_cell = anon['content'][6]['content'][1]['content'][0]
+    assert _find_text_node(table_cell, 'ФИО3')['marks'][-1]['attrs']['mentionId'] == 'm3'
+    assert 'italic' in _mark_types(_find_text_node(table_cell, 'ФИО3'))
+    assert _find_text_node(anon, 'Статус') is not None
+    assert anon['content'][6]['content'][1]['content'][0]['attrs'] == {'colspan': 1, 'rowspan': 1}
+
+
+def test_multiblock_anonymize_restore_exact_content_roundtrip():
+    from app.main import anonymize_content_by_mentions, restore_content_from_mentions, content_plain_text
+    content = _multiblock_content()
+    text = content_plain_text(content)
+    entities = [
+        _entity('e1', 'm1', 'Иванов Иван Иванович', text, 'ФИО1'),
+        _entity('e2', 'm2', 'Петров Пётр Петрович', text, 'ФИО2'),
+        _entity('e3', 'm3', 'Сидоров С.С.', text, 'ФИО3'),
+    ]
+    restored = restore_content_from_mentions(anonymize_content_by_mentions(content, entities), entities)
+    assert restored == content
+    assert content_plain_text(restored) == text
+
+
+def test_multiblock_working_redact_keep_preserves_structure_and_formatting():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app, content_plain_text
+    client = TestClient(app)
+    doc_id = 'rich-redact-keep-doc'
+    main.restored_docs.pop(doc_id, None)
+    content = _multiblock_content()
+    original = _multiblock_content()
+    text = content_plain_text(content)
+    main.restored_docs[doc_id] = {'document_id': doc_id, 'case_id': 'case', 'title': 'doc', 'original_text': text, 'original_content': original, 'working_text': text, 'working_content': content, 'content_format': 'TIPTAP_JSON', 'entities': [], 'kept_entities': [], 'mappings': []}
+    r = client.post(f'/internal/anonymization/documents/{doc_id}/redaction-decisions', headers={'X-Internal-Service-Token': main.INTERNAL}, json={'selected_text': 'Петров Пётр Петрович', 'decision': 'REDACT', 'entity_class': 'PERSON'})
+    assert r.status_code == 200
+    entity = next(e for e in r.json()['entities'] if e['canonical_value'] == 'Петров Пётр Петрович')
+    assert _find_text_node(main.restored_docs[doc_id]['working_content']['content'][3], entity['placeholder']) is not None
+    r = client.delete(f'/internal/anonymization/documents/{doc_id}/mappings/{entity["entity_id"]}', headers={'X-Internal-Service-Token': main.INTERNAL})
+    assert r.status_code == 200
+    assert _find_text_node(main.restored_docs[doc_id]['working_content']['content'][3], 'Петров Пётр Петрович') is not None
+    assert main.restored_docs[doc_id]['working_text'] == content_plain_text(main.restored_docs[doc_id]['working_content'])
+    assert main.restored_docs[doc_id]['original_content'] == original
+
+
+def test_multiblock_split_and_merge_preserve_structure_and_roundtrip():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app, anonymize_content_by_mentions, restore_content_from_mentions, content_plain_text
+    client = TestClient(app)
+    doc_id = 'rich-split-merge-doc'
+    content = _multiblock_content()
+    text = content_plain_text(content)
+    e1 = _entity('e1', 'm1', 'Иванов Иван Иванович', text, 'ФИО1')
+    e1['mentions'].append({**_entity('e1', 'm3', 'Сидоров С.С.', text, 'ФИО1')['mentions'][0], 'entity_id': 'e1', 'replacement_value': 'ФИО1'})
+    anon = anonymize_content_by_mentions(content, [e1])
+    main.restored_docs[doc_id] = {'document_id': doc_id, 'case_id': 'case', 'title': 'doc', 'original_text': text, 'original_content': content, 'working_text': content_plain_text(anon), 'working_content': anon, 'anonymized_text': content_plain_text(anon), 'anonymized_content': anon, 'content_format': 'TIPTAP_JSON', 'entities': [e1], 'kept_entities': [], 'mappings': []}
+    r = client.post(f'/internal/anonymization/documents/{doc_id}/entities/e1/mentions/m3/split', headers={'X-Internal-Service-Token': main.INTERNAL})
+    assert r.status_code == 200
+    assert _find_text_node(main.restored_docs[doc_id]['working_content']['content'][1], 'ФИО1') is not None
+    split_entity = next(e for e in main.restored_docs[doc_id]['entities'] if e['entity_id'] != 'e1')
+    assert _find_text_node(main.restored_docs[doc_id]['working_content']['content'][6], split_entity['placeholder']) is not None
+    r = client.post(f'/internal/anonymization/documents/{doc_id}/entities/merge', headers={'X-Internal-Service-Token': main.INTERNAL}, json={'target_entity_id': 'e1', 'source_entity_ids': [split_entity['entity_id']]})
+    assert r.status_code == 200
+    restored = restore_content_from_mentions(main.restored_docs[doc_id]['working_content'], main.restored_docs[doc_id]['entities'])
+    assert content_plain_text(restored) == text
+    assert restored['content'][0]['attrs']['textAlign'] == 'center'
+    assert restored['content'][6]['type'] == 'table'
+
+
+def test_multiblock_public_content_is_sanitized_without_losing_formatting():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app, anonymize_content_by_mentions, content_plain_text
+    client = TestClient(app)
+    doc_id = 'rich-public-doc'
+    content = _multiblock_content()
+    text = content_plain_text(content)
+    entity = _entity('e1', 'm1', 'Иванов Иван Иванович', text, 'ФИО1')
+    anon = anonymize_content_by_mentions(content, [entity])
+    anon['content'][1]['attrs']['split_origin'] = {'mention_id': 'm1'}
+    main.public_docs[doc_id] = {'document_id': doc_id, 'title': 'doc', 'anonymized_text': content_plain_text(anon), 'anonymized_content': anon, 'content_format': 'TIPTAP_JSON'}
+    r = client.get(f'/internal/anonymization/documents/{doc_id}/public', headers={'X-Internal-Service-Token': main.INTERNAL})
+    assert r.status_code == 200
+    public_content = r.json()['anonymized_content']
+    assert public_content['content'][0]['type'] == 'heading'
+    assert public_content['content'][0]['attrs']['textAlign'] == 'center'
+    assert public_content['content'][6]['type'] == 'table'
+    assert _find_text_node(public_content, 'ФИО1') is not None
+    for key in ['redactionMention', 'entityId', 'mentionId', 'split_origin', 'manual_decision']:
+        assert not _contains_key(public_content, key)
+
+
+def test_cross_text_node_mention_is_not_silently_corrupted():
+    import copy
+    import pytest
+    from fastapi import HTTPException
+    from app.main import anonymize_content_by_mentions, content_plain_text
+    content = {'type': 'doc', 'content': [{'type': 'paragraph', 'content': [
+        {'type': 'text', 'text': 'Иванов', 'marks': [{'type': 'bold'}]},
+        {'type': 'text', 'text': ' Иван Иванович'},
+    ]}]}
+    before = copy.deepcopy(content)
+    text = content_plain_text(content)
+    entity = _entity('e1', 'm1', 'Иванов Иван Иванович', text, 'ФИО1')
+    with pytest.raises(HTTPException) as exc:
+        anonymize_content_by_mentions(content, [entity])
+    assert exc.value.status_code == 409
+    assert exc.value.detail['error']['code'] == 'CROSS_TEXT_NODE_MENTION_UNSUPPORTED'
+    assert content == before
+
+
+def test_multiblock_working_redact_keep_via_redaction_decision_preserves_structure_and_formatting():
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app, content_plain_text
+    client = TestClient(app)
+    doc_id = 'rich-redact-keep-real-ui-doc'
+    main.restored_docs.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    content = _multiblock_content()
+    original = _multiblock_content()
+    text = content_plain_text(content)
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case',
+        'title': 'doc',
+        'original_text': text,
+        'original_content': original,
+        'working_text': text,
+        'working_content': content,
+        'content_format': 'TIPTAP_JSON',
+        'entities': [],
+        'kept_entities': [],
+        'mappings': [],
+    }
+
+    redact = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'selected_text': 'Сидоров С.С.', 'decision': 'REDACT', 'entity_class': 'PERSON'},
+    )
+    assert redact.status_code == 200
+    entity = next(e for e in redact.json()['entities'] if e['canonical_value'] == 'Сидоров С.С.')
+    placeholder_node = _find_text_node(main.restored_docs[doc_id]['working_content']['content'][6], entity['placeholder'])
+    assert placeholder_node is not None
+    assert 'italic' in _mark_types(placeholder_node)
+
+    keep = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={
+            'selected_text': entity['canonical_value'],
+            'entity_key': entity['entity_key'],
+            'decision': 'KEEP',
+            'entity_class': entity['entity_class'],
+        },
+    )
+
+    assert keep.status_code == 200
+    stored = main.restored_docs[doc_id]
+    restored_node = _find_text_node(stored['working_content']['content'][6], 'Сидоров С.С.')
+    assert restored_node is not None
+    assert 'italic' in _mark_types(restored_node)
+    assert stored['working_content']['content'][0]['attrs']['textAlign'] == 'center'
+    assert stored['working_content']['content'][6]['type'] == 'table'
+    assert stored['working_text'] == content_plain_text(stored['working_content'])
+    assert stored['anonymized_text'] == stored['working_text']
+    assert stored['original_content'] == original
+    assert not stored['entities']
+    assert stored['kept_entities'][0]['canonical_value'] == 'Сидоров С.С.'
+
+
+def test_review_entity_contains_stable_entity_key_and_selected_value_for_decision():
+    from app.main import anonymization_result_response, build_entity_semantic_key
+    review = {
+        'entity_id': 'review-entity-1',
+        'document_id': 'review-doc',
+        'placeholder': 'ФИО1',
+        'entity_class': 'PERSON',
+        'canonical_value': 'Макаров А.С.',
+        'normalized_value': 'Макаров А.С.',
+        'redaction_decision': 'REDACT',
+        'requires_review': True,
+        'mentions': [{'mention_id': 'review-mention-1', 'surface_value': 'Макаров А.С.', 'start': 0, 'end': 11}],
+    }
+    payload = anonymization_result_response({
+        'document_id': 'review-doc',
+        'anonymized_text': 'ФИО1',
+        'review_entities': [review],
+    })
+
+    item = payload['review_entities'][0]
+    assert item['entity_key'] == build_entity_semantic_key('PERSON', 'Макаров А.С.')
+    assert item['canonical_value'] == 'Макаров А.С.'
+    assert item['mentions'][0]['surface_value'] == 'Макаров А.С.'
+
+
+def test_manual_redact_cross_node_error_does_not_mutate_document_or_decisions():
+    import copy
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app, content_plain_text
+    client = TestClient(app)
+    doc_id = 'manual-redact-cross-node-doc'
+    main.restored_docs.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    content = {'type': 'doc', 'content': [{'type': 'paragraph', 'content': [
+        {'type': 'text', 'text': 'Иванов', 'marks': [{'type': 'bold'}]},
+        {'type': 'text', 'text': ' Иван Иванович'},
+    ]}]}
+    text = content_plain_text(content)
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case',
+        'title': 'doc',
+        'original_text': text,
+        'original_content': copy.deepcopy(content),
+        'working_text': text,
+        'working_content': copy.deepcopy(content),
+        'content_format': 'TIPTAP_JSON',
+        'entities': [],
+        'kept_entities': [],
+        'mappings': [],
+    }
+    before = copy.deepcopy(main.restored_docs[doc_id])
+    before_decisions = copy.deepcopy(main.manual_decisions_by_document_id.get(doc_id, {}))
+
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'selected_text': 'Иванов Иван Иванович', 'decision': 'REDACT', 'entity_class': 'PERSON'},
+    )
+
+    assert response.status_code == 409
+    assert response.json()['error']['code'] == 'CROSS_TEXT_NODE_MENTION_UNSUPPORTED'
+    assert main.restored_docs[doc_id] == before
+    assert main.manual_decisions_by_document_id.get(doc_id, {}) == before_decisions
+
+
+def test_add_mapping_cross_node_error_does_not_mutate_document_or_decisions():
+    import copy
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app, content_plain_text
+    client = TestClient(app)
+    doc_id = 'mapping-cross-node-doc'
+    main.restored_docs.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    content = {'type': 'doc', 'content': [{'type': 'paragraph', 'content': [
+        {'type': 'text', 'text': 'Иванов', 'marks': [{'type': 'bold'}]},
+        {'type': 'text', 'text': ' Иван Иванович'},
+    ]}]}
+    text = content_plain_text(content)
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case',
+        'title': 'doc',
+        'original_text': text,
+        'original_content': copy.deepcopy(content),
+        'working_text': text,
+        'working_content': copy.deepcopy(content),
+        'content_format': 'TIPTAP_JSON',
+        'entities': [],
+        'kept_entities': [],
+        'mappings': [],
+    }
+    before = copy.deepcopy(main.restored_docs[doc_id])
+    before_decisions = copy.deepcopy(main.manual_decisions_by_document_id.get(doc_id, {}))
+
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/mappings',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={'original_value': 'Иванов Иван Иванович', 'entity_type': 'PERSON', 'mode': 'new'},
+    )
+
+    assert response.status_code == 409
+    assert response.json()['error']['code'] == 'CROSS_TEXT_NODE_MENTION_UNSUPPORTED'
+    assert main.restored_docs[doc_id] == before
+    assert main.manual_decisions_by_document_id.get(doc_id, {}) == before_decisions
+
+def test_merge_with_existing_cross_node_error_does_not_mutate_document_or_decisions():
+    import copy
+
+    from fastapi.testclient import TestClient
+
+    from app import main
+    from app.main import app, content_plain_text
+
+    client = TestClient(app)
+    doc_id = 'merge-existing-cross-node-doc'
+
+    main.restored_docs.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    main.pending_review_by_document_id.pop(doc_id, None)
+
+    content = {
+        'type': 'doc',
+        'content': [
+            {
+                'type': 'paragraph',
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': 'ФИО1 сообщил. Новый свидетель ',
+                    },
+                    {
+                        'type': 'text',
+                        'text': 'Иванов',
+                        'marks': [{'type': 'bold'}],
+                    },
+                    {
+                        'type': 'text',
+                        'text': ' Иван Иванович прибыл.',
+                    },
+                ],
+            }
+        ],
+    }
+    text = content_plain_text(content)
+
+    target_entity = {
+        'entity_id': 'target-entity-1',
+        'document_id': doc_id,
+        'entity_class': 'PERSON',
+        'canonical_value': 'Петров Пётр Петрович',
+        'normalized_value': 'Петров Пётр Петрович',
+        'entity_key': 'PERSON::Петров Пётр Петрович',
+        'redaction_decision': 'REDACT',
+        'placeholder': 'ФИО1',
+        'requires_review': False,
+        'mentions': [],
+        'mentions_count': 0,
+    }
+
+    pending_key = 'PERSON::Иванов Иван Иванович'
+
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case',
+        'title': 'doc',
+        'original_text': text,
+        'original_content': copy.deepcopy(content),
+        'working_text': text,
+        'working_content': copy.deepcopy(content),
+        'anonymized_text': text,
+        'anonymized_content': copy.deepcopy(content),
+        'content_format': 'TIPTAP_JSON',
+        'entities': [target_entity],
+        'kept_entities': [],
+        'mappings': main.build_mappings_from_entities([target_entity]),
+        'pending_review': [
+            {
+                'entity_key': pending_key,
+                'surface_value': 'Иванов Иван Иванович',
+                'normalized_value': 'Иванов Иван Иванович',
+                'entity_class': 'PERSON',
+                'start': text.index('Иванов'),
+                'end': text.index('Иванов') + len('Иванов Иван Иванович'),
+                'reason': 'В изменённом тексте найдено новое значение, требующее проверки',
+            }
+        ],
+    }
+    main.pending_review_by_document_id[doc_id] = copy.deepcopy(
+        main.restored_docs[doc_id]['pending_review']
+    )
+
+    before_doc = copy.deepcopy(main.restored_docs[doc_id])
+    before_decisions = copy.deepcopy(
+        main.manual_decisions_by_document_id.get(doc_id, {})
+    )
+
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={
+            'entity_key': pending_key,
+            'selected_text': 'Иванов Иван Иванович',
+            'decision': 'MERGE_WITH_EXISTING',
+            'entity_class': 'PERSON',
+            'target_entity_id': 'target-entity-1',
+            'reason': 'Связано пользователем с существующей сущностью',
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()['error']['code'] == 'CROSS_TEXT_NODE_MENTION_UNSUPPORTED'
+
+    assert main.restored_docs[doc_id] == before_doc
+    assert main.manual_decisions_by_document_id.get(doc_id, {}) == before_decisions
+    assert main.restored_docs[doc_id]['entities'][0]['mentions'] == []
+    assert main.restored_docs[doc_id]['working_text'] == text
+    assert main.restored_docs[doc_id]['working_content'] == content

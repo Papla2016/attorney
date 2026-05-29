@@ -827,72 +827,191 @@ def rebuild_document_from_entities(document_id: str, redacted_entities: list[dic
     return doc
 
 
+
+TEXT_BLOCK_TYPES = {'paragraph', 'heading'}
+
+
+def _tiptap_text_node_segments(node: dict, path: tuple[int, ...], block_index: int, block_start: int) -> tuple[str, list[dict]]:
+    text_parts: list[str] = []
+    segments: list[dict] = []
+
+    def walk(current, current_path: tuple[int, ...]):
+        if isinstance(current, dict):
+            if current.get('type') == 'text' and isinstance(current.get('text'), str):
+                text = current.get('text') or ''
+                local_start = sum(len(part) for part in text_parts)
+                text_parts.append(text)
+                segments.append({
+                    'path': current_path,
+                    'block_index': block_index,
+                    'text': text,
+                    'global_start': block_start + local_start,
+                    'global_end': block_start + local_start + len(text),
+                    'marks': copy.deepcopy(current.get('marks', [])),
+                })
+                return
+            if isinstance(current.get('content'), list):
+                for idx, child in enumerate(current['content']):
+                    walk(child, current_path + (idx,))
+        elif isinstance(current, list):
+            for idx, child in enumerate(current):
+                walk(child, current_path + (idx,))
+
+    walk(node, path)
+    return ''.join(text_parts), segments
+
+
+def _tiptap_text_blocks(content: dict | None) -> list[dict]:
+    blocks: list[dict] = []
+    canonical_offset = 0
+
+    def walk(node, path: tuple[int, ...]):
+        nonlocal canonical_offset
+        if isinstance(node, dict):
+            if node.get('type') in TEXT_BLOCK_TYPES:
+                block_index = len(blocks)
+                block_start = canonical_offset + (1 if block_index > 0 else 0)
+                block_text, segments = _tiptap_text_node_segments(node, path, block_index, block_start)
+                for segment in segments:
+                    segment['block_start'] = block_start
+                    segment['block_end'] = block_start + len(block_text)
+                blocks.append({
+                    'path': path,
+                    'type': node.get('type'),
+                    'block_index': block_index,
+                    'text': block_text,
+                    'global_start': block_start,
+                    'global_end': block_start + len(block_text),
+                    'segments': segments,
+                })
+                canonical_offset = block_start + len(block_text)
+                return
+            if isinstance(node.get('content'), list):
+                for idx, child in enumerate(node['content']):
+                    walk(child, path + (idx,))
+        elif isinstance(node, list):
+            for idx, child in enumerate(node):
+                walk(child, path + (idx,))
+
+    walk(content, ())
+    return blocks
+
+
+def flatten_tiptap_text_segments(content: dict | None) -> list[dict]:
+    segments: list[dict] = []
+    for block in _tiptap_text_blocks(content):
+        segments.extend(copy.deepcopy(block['segments']))
+    return segments
+
+
+def content_plain_text(content: dict | None) -> str:
+    return '\n'.join(block['text'] for block in _tiptap_text_blocks(content))
+
+
+def canonical_text_for_content(text: str | None, content: dict | None, content_format: str | None) -> str:
+    if content_format == 'TIPTAP_JSON' and content:
+        return content_plain_text(content)
+    return text or ''
+
+
+def _get_node_by_path(data: dict, path: tuple[int, ...]) -> dict:
+    node = data
+    for index in path:
+        node = node['content'][index]
+    return node
+
+
+def _redaction_mark(entity_id: str, mention_id: str, placeholder: str) -> dict:
+    return {'type': 'redactionMention', 'attrs': {'entityId': entity_id, 'mentionId': mention_id, 'placeholder': placeholder}}
+
+
 def anonymize_content_by_mentions(content: dict | None, entities: list[dict]) -> dict | None:
     if not content:
         return None
     data = copy.deepcopy(content)
+    segments = flatten_tiptap_text_segments(content)
     mentions = []
     for ent in entities:
         if ent.get('redaction_decision') != 'REDACT':
             continue
         for m in ent.get('mentions', []):
             if isinstance(m.get('start'), int) and isinstance(m.get('end'), int):
-                mentions.append((m['start'], m['end'], ent['entity_id'], m['mention_id'], ent['placeholder']))
-    mentions.sort(key=lambda x: x[0])
-    idx = 0
-    offset = 0
+                mentions.append({
+                    'start': m['start'],
+                    'end': m['end'],
+                    'entity_id': ent['entity_id'],
+                    'mention_id': m['mention_id'],
+                    'placeholder': m.get('replacement_value') or ent.get('placeholder') or '',
+                    'surface_value': m.get('surface_value'),
+                })
+    replacements_by_path: dict[tuple[int, ...], list[dict]] = defaultdict(list)
+    for mention in sorted(mentions, key=lambda item: item['start']):
+        containing = [
+            segment for segment in segments
+            if segment['global_start'] <= mention['start'] and mention['end'] <= segment['global_end']
+        ]
+        if len(containing) != 1:
+            _error(
+                409,
+                'CROSS_TEXT_NODE_MENTION_UNSUPPORTED',
+                'Упоминание пересекает несколько text-node TipTap и не может быть безопасно заменено автоматически',
+                {
+                    'mention_id': mention.get('mention_id'),
+                    'entity_id': mention.get('entity_id'),
+                    'start': mention.get('start'),
+                    'end': mention.get('end'),
+                    'surface_value': mention.get('surface_value'),
+                },
+            )
+        segment = containing[0]
+        rel_start = mention['start'] - segment['global_start']
+        rel_end = mention['end'] - segment['global_start']
+        replacements_by_path[tuple(segment['path'])].append({**mention, 'rel_start': rel_start, 'rel_end': rel_end})
 
-    def split_text_node(node: dict) -> list[dict]:
-        nonlocal idx, offset
-        text = node.get('text') or ''
-        marks = node.get('marks', [])
-        start_local = offset
-        end_local = start_local + len(text)
-        out: list[dict] = []
+    for path, replacements in replacements_by_path.items():
+        replacements.sort(key=lambda item: item['rel_start'])
         cursor = 0
-        while idx < len(mentions):
-            ms, me, entity_id, mention_id, placeholder = mentions[idx]
-            if ms >= end_local:
-                break
-            if me <= start_local:
-                idx += 1
-                continue
-            if ms < start_local or me > end_local:
-                break
-            rel_s, rel_e = ms - start_local, me - start_local
-            if rel_s > cursor:
-                out.append({'type': 'text', 'text': text[cursor:rel_s], 'marks': copy.deepcopy(marks)})
-            out.append({
-                'type': 'text',
-                'text': placeholder,
-                'marks': copy.deepcopy(marks) + [{'type': 'redactionMention', 'attrs': {'entityId': entity_id, 'mentionId': mention_id, 'placeholder': placeholder}}],
-            })
-            cursor = rel_e
-            idx += 1
-        if cursor == 0:
-            offset = end_local
-            return [node]
+        for replacement in replacements:
+            if replacement['rel_start'] < cursor:
+                _error(
+                    409,
+                    'OVERLAPPING_MENTIONS_UNSUPPORTED',
+                    'Пересекающиеся упоминания не могут быть безопасно заменены автоматически',
+                    {'mention_id': replacement.get('mention_id')},
+                )
+            cursor = replacement['rel_end']
+
+    for path in sorted(replacements_by_path.keys(), key=lambda p: p, reverse=True):
+        parent = _get_node_by_path(data, path[:-1]) if path else data
+        original_node = parent['content'][path[-1]] if path else parent
+        text = original_node.get('text') or ''
+        marks = copy.deepcopy(original_node.get('marks', []))
+        new_nodes: list[dict] = []
+        cursor = 0
+        for replacement in replacements_by_path[path]:
+            rel_start = replacement['rel_start']
+            rel_end = replacement['rel_end']
+            if rel_start > cursor:
+                node = {'type': 'text', 'text': text[cursor:rel_start]}
+                if marks:
+                    node['marks'] = copy.deepcopy(marks)
+                new_nodes.append(node)
+            placeholder_node = {'type': 'text', 'text': replacement['placeholder']}
+            placeholder_marks = copy.deepcopy(marks) + [_redaction_mark(replacement['entity_id'], replacement['mention_id'], replacement['placeholder'])]
+            if placeholder_marks:
+                placeholder_node['marks'] = placeholder_marks
+            new_nodes.append(placeholder_node)
+            cursor = rel_end
         if cursor < len(text):
-            out.append({'type': 'text', 'text': text[cursor:], 'marks': copy.deepcopy(marks)})
-        offset = end_local
-        return out
-
-    def walk(node):
-        if isinstance(node, dict) and isinstance(node.get('content'), list):
-            new_content = []
-            for ch in node['content']:
-                if isinstance(ch, dict) and ch.get('type') == 'text' and isinstance(ch.get('text'), str):
-                    new_content.extend(split_text_node(ch))
-                else:
-                    walk(ch)
-                    new_content.append(ch)
-            node['content'] = new_content
-        elif isinstance(node, list):
-            for ch in node:
-                walk(ch)
-    walk(data)
+            node = {'type': 'text', 'text': text[cursor:]}
+            if marks:
+                node['marks'] = copy.deepcopy(marks)
+            new_nodes.append(node)
+        if path:
+            parent['content'][path[-1]:path[-1] + 1] = new_nodes
+        else:
+            data = new_nodes[0] if len(new_nodes) == 1 else {'type': 'doc', 'content': new_nodes}
     return data
-
 
 def restore_content_from_mentions(anonymized_content: dict | None, entities: list[dict]) -> dict | None:
     if not anonymized_content:
@@ -913,32 +1032,30 @@ def restore_content_from_mentions(anonymized_content: dict | None, entities: lis
                     if mention:
                         node['text'] = mention.get('surface_value', node.get('text', ''))
                     node['marks'] = [m for m in node['marks'] if m.get('type') != 'redactionMention']
+                    if not node['marks']:
+                        node.pop('marks', None)
             if isinstance(node.get('content'), list):
                 for ch in node['content']:
                     walk(ch)
+                merged = []
+                for ch in node['content']:
+                    if (
+                        merged
+                        and isinstance(ch, dict)
+                        and isinstance(merged[-1], dict)
+                        and ch.get('type') == 'text'
+                        and merged[-1].get('type') == 'text'
+                        and ch.get('marks', []) == merged[-1].get('marks', [])
+                    ):
+                        merged[-1]['text'] = (merged[-1].get('text') or '') + (ch.get('text') or '')
+                    else:
+                        merged.append(ch)
+                node['content'] = merged
         elif isinstance(node, list):
             for ch in node:
                 walk(ch)
     walk(data)
     return data
-
-def content_plain_text(content: dict | None) -> str:
-    parts: list[str] = []
-    def walk(node):
-        if isinstance(node, dict):
-            if isinstance(node.get('text'), str):
-                parts.append(node['text'])
-            if isinstance(node.get('content'), list):
-                for ch in node['content']:
-                    walk(ch)
-        elif isinstance(node, list):
-            for ch in node:
-                walk(ch)
-    walk(content)
-    return ''.join(parts)
-
-
-
 
 
 def has_working_revision(doc: dict) -> bool:
@@ -1004,6 +1121,8 @@ def restore_entity_in_working_content(content: dict, entity: dict) -> tuple[dict
                             continue
                     new_marks.append(mark)
                 node['marks'] = new_marks
+                if not node['marks']:
+                    node.pop('marks', None)
             if isinstance(node.get('content'), list):
                 for ch in node['content']:
                     walk(ch)
@@ -1013,6 +1132,64 @@ def restore_entity_in_working_content(content: dict, entity: dict) -> tuple[dict
     walk(data)
     return data, restored
 
+
+
+def keep_redacted_entity_in_document(document_id: str, doc: dict, target_entity: dict, *, reason: str = 'Оставлено пользователем', explicit_entity_key: str | None = None) -> None:
+    entity_id = target_entity.get('entity_id')
+    entity_key = explicit_entity_key or target_entity.get('entity_key') or entity_semantic_key(target_entity)
+    working = has_working_revision(doc)
+    updated_content = None
+    updated_text = None
+
+    if working and doc.get('working_content') is not None:
+        updated_content, restored_mentions = restore_entity_in_working_content(doc.get('working_content'), target_entity)
+        expected_mentions = {m.get('mention_id') for m in target_entity.get('mentions', []) if m.get('mention_id')}
+        missing = sorted(expected_mentions - restored_mentions)
+        if missing:
+            _error(409, 'KEEP_ENTITY_MARK_NOT_FOUND', 'Разметка одного или нескольких упоминаний не найдена', {'missing_mention_ids': missing})
+        updated_text = content_plain_text(updated_content)
+    elif working:
+        surface_values = sorted({m.get('surface_value') for m in target_entity.get('mentions', []) if m.get('surface_value')})
+        if len(surface_values) > 1:
+            _error(409, 'KEEP_REQUIRES_STRUCTURED_CONTENT', 'Невозможно восстановить разные варианты написания без разметки документа', {'entity_id': entity_id, 'placeholder': target_entity.get('placeholder'), 'surface_values': surface_values})
+        replacement = surface_values[0] if surface_values else (target_entity.get('canonical_value') or '')
+        updated_text = replace_placeholder_boundary(doc.get('working_text') or '', target_entity.get('placeholder') or '', replacement)
+
+    store_keep_redact_decision(document_id, 'KEEP_ENTITY', target_entity, reason=reason, explicit_entity_key=entity_key)
+    redacted = []
+    kept = [
+        e for e in doc.get('kept_entities', [])
+        if e.get('entity_id') != entity_id and e.get('entity_key') != entity_key and entity_semantic_key(e) != entity_key
+    ]
+    for entity in doc.get('entities', []):
+        if entity.get('entity_id') == entity_id:
+            entity['redaction_decision'] = 'KEEP'
+            entity['requires_review'] = False
+            entity['entity_key'] = entity_key
+            kept.append(entity)
+        else:
+            redacted.append(entity)
+
+    if working and doc.get('working_content') is not None:
+        doc['entities'] = redacted
+        doc['kept_entities'] = kept
+        doc['recognized_but_kept'] = kept
+        doc['working_content'] = updated_content
+        doc['anonymized_content'] = updated_content
+        doc['working_text'] = updated_text
+        doc['anonymized_text'] = updated_text
+        doc['mappings'] = build_mappings_from_entities(redacted)
+        doc['review_entities'] = [e for e in redacted if e.get('requires_review')]
+    elif working:
+        doc['entities'] = redacted
+        doc['kept_entities'] = kept
+        doc['recognized_but_kept'] = kept
+        doc['working_text'] = updated_text
+        doc['anonymized_text'] = updated_text
+        doc['mappings'] = build_mappings_from_entities(redacted)
+        doc['review_entities'] = [e for e in redacted if e.get('requires_review')]
+    else:
+        rebuild_document_from_entities(document_id, redacted, kept, doc.get('original_text', ''), doc.get('original_content'))
 
 def replace_placeholder_boundary(text: str, placeholder: str, value: str) -> str:
     return re.sub(rf'(?<!\w){re.escape(placeholder)}(?!\w)', value, text)
@@ -1473,7 +1650,7 @@ def anonymization_result_response(document: dict) -> dict:
         'mappings': document.get('mappings', []),
         'kept_entities': entity_response_items(document.get('kept_entities', document.get('recognized_but_kept', []))),
         'recognized_but_kept': entity_response_items(document.get('recognized_but_kept', [])),
-        'review_entities': document.get('review_entities', []),
+        'review_entities': entity_response_items(document.get('review_entities', [])),
         'review_markers': document.get('review_markers', []),
         'pending_review': document.get('pending_review', []),
         'pending_markers': document.get('pending_markers', []),
@@ -1500,15 +1677,16 @@ async def process(body: ProcessRequest, x_internal_service_token: str | None = H
     job_id = str(uuid.uuid4())
     jobs[job_id] = {'id': job_id, 'case_id': body.case_id, 'document_id': body.document_id, 'status': 'NER_PROCESSING'}
 
-    entities = await extract_entities(body.text)
+    original_text = canonical_text_for_content(body.text, body.original_content, body.content_format)
+    entities = await extract_entities(original_text)
 
-    resolved = resolve_entities(body.text, entities, body.publication_redaction_mode)
+    resolved = resolve_entities(original_text, entities, body.publication_redaction_mode)
     entities, recognized_but_kept, review_entities = build_entities_from_resolved(body.document_id, resolved, body.publication_redaction_mode)
-    rebuilt = rebuild_document_from_entities(body.document_id, entities, recognized_but_kept, body.text, body.original_content)
+    rebuilt = rebuild_document_from_entities(body.document_id, entities, recognized_but_kept, original_text, body.original_content)
     mappings = rebuilt.get('mappings', [])
     anonymized = rebuilt.get('anonymized_text', '')
     save_document(
-        body.document_id, body.case_id, body.title, body.text, anonymized, mappings,
+        body.document_id, body.case_id, body.title, original_text, anonymized, mappings,
         body.metadata, recognized_but_kept, rebuilt.get('anonymized_content'), rebuilt.get('entities'),
         rebuilt.get('kept_entities'), review_entities
     )
@@ -1550,8 +1728,21 @@ def public(document_id: str, x_internal_service_token: str | None = Header(None)
     payload = copy.deepcopy(public_docs[document_id])
     def strip_marks(node):
         if isinstance(node, dict):
+            for key in ['entityId', 'mentionId', 'split_origin', 'manual_decision', 'manual_decisions']:
+                node.pop(key, None)
+            if isinstance(node.get('attrs'), dict):
+                for key in ['entityId', 'mentionId', 'split_origin', 'manual_decision', 'manual_decisions']:
+                    node['attrs'].pop(key, None)
             if isinstance(node.get('marks'), list):
-                node['marks'] = [m for m in node['marks'] if m.get('type') != 'redactionMention']
+                clean_marks = []
+                for mark in node['marks']:
+                    if mark.get('type') == 'redactionMention':
+                        continue
+                    if isinstance(mark.get('attrs'), dict):
+                        for key in ['entityId', 'mentionId', 'split_origin', 'manual_decision', 'manual_decisions']:
+                            mark['attrs'].pop(key, None)
+                    clean_marks.append(mark)
+                node['marks'] = clean_marks
             if isinstance(node.get('content'), list):
                 for ch in node['content']:
                     strip_marks(ch)
@@ -1597,74 +1788,81 @@ def add_mapping(document_id: str, body: MappingRequest, x_internal_service_token
     validate_non_empty(body.entity_type, 'entity_type')
     entity_class = 'PERSON' if body.entity_type in {'PERSON_FULL_NAME', 'PERSON'} else body.entity_type
     working = has_working_revision(doc)
-    search_text = doc.get('working_text') if working else doc.get('original_text', '')
+    search_text = (content_plain_text(doc.get('working_content')) if doc.get('working_content') is not None else doc.get('working_text', '')) if working else doc.get('original_text', '')
     positions = find_open_value_positions(search_text or '', body.original_value)
     if working and not positions:
         _error(400, 'VALUE_NOT_FOUND_IN_WORKING_DOCUMENT', 'Выбранное значение отсутствует в текущей версии документа')
     if not positions:
         return anonymization_result_response(doc)
 
-    if body.mode == 'existing':
-        target_ref = body.entity_id or body.placeholder
-        target = next((e for e in doc.get('entities', []) if e.get('entity_id') == target_ref or e.get('placeholder') == target_ref), None)
-        if not target:
-            _error(400, 'BAD_REQUEST', 'Целевая сущность не найдена')
-    else:
-        target = next((e for e in doc.get('entities', []) if e.get('entity_class') == entity_class and (e.get('canonical_value') == body.original_value or e.get('normalized_value') == body.original_value)), None)
-        if not target:
-            target = {
-                'entity_id': str(uuid.uuid4()),
-                'document_id': document_id,
-                'entity_class': entity_class,
-                'canonical_value': body.original_value,
+    before_doc = copy.deepcopy(doc)
+    before_decisions = copy.deepcopy(manual_decisions_by_document_id.get(document_id, {}))
+    try:
+        if body.mode == 'existing':
+            target_ref = body.entity_id or body.placeholder
+            target = next((e for e in doc.get('entities', []) if e.get('entity_id') == target_ref or e.get('placeholder') == target_ref), None)
+            if not target:
+                _error(400, 'BAD_REQUEST', 'Целевая сущность не найдена')
+        else:
+            target = next((e for e in doc.get('entities', []) if e.get('entity_class') == entity_class and (e.get('canonical_value') == body.original_value or e.get('normalized_value') == body.original_value)), None)
+            if not target:
+                target = {
+                    'entity_id': str(uuid.uuid4()),
+                    'document_id': document_id,
+                    'entity_class': entity_class,
+                    'canonical_value': body.original_value,
+                    'normalized_value': body.original_value,
+                    'redaction_decision': 'REDACT',
+                    'placeholder': next_placeholder(entity_class, build_mappings_from_entities(doc.get('entities', []))),
+                    'mentions': [],
+                }
+                doc.setdefault('entities', []).append(target)
+        target['placeholder'] = target.get('placeholder') or next_placeholder(target.get('entity_class', entity_class), build_mappings_from_entities(doc.get('entities', [])))
+
+        existing_ranges = {(m.get('start'), m.get('end')) for m in target.get('mentions', [])}
+        new_mentions = []
+        for pos in positions:
+            rng = (pos, pos + len(body.original_value))
+            if rng in existing_ranges:
+                continue
+            mention = {
+                'mention_id': str(uuid.uuid4()),
+                'entity_id': target['entity_id'],
+                'surface_value': body.original_value,
                 'normalized_value': body.original_value,
-                'redaction_decision': 'REDACT',
-                'placeholder': next_placeholder(entity_class, build_mappings_from_entities(doc.get('entities', []))),
-                'mentions': [],
+                'start': pos,
+                'end': pos + len(body.original_value),
+                'replacement_value': target.get('placeholder') or '',
             }
-            doc.setdefault('entities', []).append(target)
-    target['placeholder'] = target.get('placeholder') or next_placeholder(target.get('entity_class', entity_class), build_mappings_from_entities(doc.get('entities', [])))
+            target.setdefault('mentions', []).append(mention)
+            new_mentions.append(mention)
+            existing_ranges.add(rng)
+        target['mentions_count'] = len(target.get('mentions', []))
+        store_keep_redact_decision(document_id, 'REDACT_ENTITY', target, reason='Обезличено пользователем')
 
-    existing_ranges = {(m.get('start'), m.get('end')) for m in target.get('mentions', [])}
-    new_mentions = []
-    for pos in positions:
-        rng = (pos, pos + len(body.original_value))
-        if rng in existing_ranges:
-            continue
-        mention = {
-            'mention_id': str(uuid.uuid4()),
-            'entity_id': target['entity_id'],
-            'surface_value': body.original_value,
-            'normalized_value': body.original_value,
-            'start': pos,
-            'end': pos + len(body.original_value),
-            'replacement_value': target.get('placeholder') or '',
-        }
-        target.setdefault('mentions', []).append(mention)
-        new_mentions.append(mention)
-        existing_ranges.add(rng)
-    target['mentions_count'] = len(target.get('mentions', []))
-    store_keep_redact_decision(document_id, 'REDACT_ENTITY', target, reason='Обезличено пользователем')
-
-    if working and doc.get('working_content') is not None:
-        updated_content = anonymize_content_by_mentions(doc.get('working_content'), [{**target, 'mentions': new_mentions}])
-        updated_text = content_plain_text(updated_content)
-        doc['working_content'] = updated_content
-        doc['anonymized_content'] = updated_content
-        doc['working_text'] = updated_text
-        doc['anonymized_text'] = updated_text
-        doc['mappings'] = build_mappings_from_entities(doc.get('entities', []))
-        doc['review_entities'] = [e for e in doc.get('entities', []) if e.get('requires_review')]
-    elif working:
-        updated_text = search_text or ''
-        for mention in sorted(new_mentions, key=lambda m: m['start'], reverse=True):
-            updated_text = updated_text[:mention['start']] + target.get('placeholder', '') + updated_text[mention['end']:]
-        doc['working_text'] = updated_text
-        doc['anonymized_text'] = updated_text
-        doc['mappings'] = build_mappings_from_entities(doc.get('entities', []))
-        doc['review_entities'] = [e for e in doc.get('entities', []) if e.get('requires_review')]
-    else:
-        rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
+        if working and doc.get('working_content') is not None:
+            updated_content = anonymize_content_by_mentions(doc.get('working_content'), [{**target, 'mentions': new_mentions}])
+            updated_text = content_plain_text(updated_content)
+            doc['working_content'] = updated_content
+            doc['anonymized_content'] = updated_content
+            doc['working_text'] = updated_text
+            doc['anonymized_text'] = updated_text
+            doc['mappings'] = build_mappings_from_entities(doc.get('entities', []))
+            doc['review_entities'] = [e for e in doc.get('entities', []) if e.get('requires_review')]
+        elif working:
+            updated_text = search_text or ''
+            for mention in sorted(new_mentions, key=lambda m: m['start'], reverse=True):
+                updated_text = updated_text[:mention['start']] + target.get('placeholder', '') + updated_text[mention['end']:]
+            doc['working_text'] = updated_text
+            doc['anonymized_text'] = updated_text
+            doc['mappings'] = build_mappings_from_entities(doc.get('entities', []))
+            doc['review_entities'] = [e for e in doc.get('entities', []) if e.get('requires_review')]
+        else:
+            rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
+    except HTTPException:
+        restored_docs[document_id] = before_doc
+        manual_decisions_by_document_id[document_id] = before_decisions
+        raise
     doc['manual_decisions'] = list(manual_decisions_by_document_id.get(document_id, {}).values())
     sync_public_document(document_id, doc)
     audit_mapping_action(document_id, 'ADD_MAPPING_COMPAT', {'entity_id': target.get('entity_id'), 'mode': body.mode})
@@ -1705,55 +1903,7 @@ def delete_mapping(document_id: str, mapping_id: str, x_internal_service_token: 
     if not target_entity:
         _error(404, 'NOT_FOUND', 'Сущность для элемента таблицы соответствия не найдена')
 
-    working = has_working_revision(doc)
-    updated_content = None
-    updated_text = None
-    if working and doc.get('working_content') is not None:
-        updated_content, restored_mentions = restore_entity_in_working_content(doc.get('working_content'), target_entity)
-        expected_mentions = {m.get('mention_id') for m in target_entity.get('mentions', []) if m.get('mention_id')}
-        missing = sorted(expected_mentions - restored_mentions)
-        if missing:
-            _error(409, 'KEEP_ENTITY_MARK_NOT_FOUND', 'Разметка одного или нескольких упоминаний не найдена', {'missing_mention_ids': missing})
-        updated_text = content_plain_text(updated_content)
-    elif working:
-        surface_values = sorted({m.get('surface_value') for m in target_entity.get('mentions', []) if m.get('surface_value')})
-        if len(surface_values) > 1:
-            _error(409, 'KEEP_REQUIRES_STRUCTURED_CONTENT', 'Невозможно восстановить разные варианты написания без разметки документа', {'entity_id': mapping_id, 'placeholder': target_entity.get('placeholder'), 'surface_values': surface_values})
-        replacement = surface_values[0] if surface_values else (target_entity.get('canonical_value') or '')
-        updated_text = replace_placeholder_boundary(doc.get('working_text') or '', target_entity.get('placeholder') or '', replacement)
-
-    store_keep_redact_decision(document_id, 'KEEP_ENTITY', target_entity, reason='Оставлено пользователем')
-    kept = [e for e in doc.get('kept_entities', []) if e.get('entity_id') != mapping_id]
-    redacted = []
-    for entity in doc.get('entities', []):
-        if entity.get('entity_id') == mapping_id:
-            entity['redaction_decision'] = 'KEEP'
-            entity['requires_review'] = False
-            entity['entity_key'] = entity.get('entity_key') or entity_semantic_key(entity)
-            kept.append(entity)
-        else:
-            redacted.append(entity)
-
-    if working and doc.get('working_content') is not None:
-        doc['entities'] = redacted
-        doc['kept_entities'] = kept
-        doc['recognized_but_kept'] = kept
-        doc['working_content'] = updated_content
-        doc['anonymized_content'] = updated_content
-        doc['working_text'] = updated_text
-        doc['anonymized_text'] = updated_text
-        doc['mappings'] = build_mappings_from_entities(redacted)
-        doc['review_entities'] = [e for e in redacted if e.get('requires_review')]
-    elif working:
-        doc['entities'] = redacted
-        doc['kept_entities'] = kept
-        doc['recognized_but_kept'] = kept
-        doc['working_text'] = updated_text
-        doc['anonymized_text'] = updated_text
-        doc['mappings'] = build_mappings_from_entities(redacted)
-        doc['review_entities'] = [e for e in redacted if e.get('requires_review')]
-    else:
-        rebuild_document_from_entities(document_id, redacted, kept, doc.get('original_text', ''), doc.get('original_content'))
+    keep_redacted_entity_in_document(document_id, doc, target_entity, reason='Оставлено пользователем')
     doc['manual_decisions'] = list(manual_decisions_by_document_id.get(document_id, {}).values())
     manual_mappings_by_document_id[document_id] = [m for m in doc.get('mappings', []) if m.get('source') == 'manual']
     sync_public_document(document_id, doc)
@@ -1936,141 +2086,144 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
     )
 
     if body.decision == 'REDACT':
-        store_keep_redact_decision(document_id, 'REDACT_ENTITY', decision_entity, reason=body.reason, explicit_entity_key=entity_key)
-        target = _find_entity_by_semantic_key(redacted_entities, entity_key)
-        if not target:
-            target = _find_entity_by_semantic_key(kept_entities, entity_key)
-            if target:
-                kept_entities.remove(target)
-                target['redaction_decision'] = 'REDACT'
-                target['requires_review'] = False
-                target['entity_key'] = entity_key
+        before_doc = copy.deepcopy(doc)
+        before_decisions = copy.deepcopy(manual_decisions_by_document_id.get(document_id, {}))
+        try:
+            store_keep_redact_decision(document_id, 'REDACT_ENTITY', decision_entity, reason=body.reason, explicit_entity_key=entity_key)
+            target = _find_entity_by_semantic_key(redacted_entities, entity_key)
+            if not target:
+                target = _find_entity_by_semantic_key(kept_entities, entity_key)
+                if target:
+                    kept_entities.remove(target)
+                    target['redaction_decision'] = 'REDACT'
+                    target['requires_review'] = False
+                    target['entity_key'] = entity_key
+                    redacted_entities.append(target)
+            if not target:
+                target = {
+                    'entity_id': str(uuid.uuid4()),
+                    'document_id': document_id,
+                    'entity_class': entity_class,
+                    'canonical_value': canonical_value,
+                    'normalized_value': canonical_value,
+                    'entity_key': entity_key,
+                    'redaction_decision': 'REDACT',
+                    'requires_review': False,
+                    'mentions': [],
+                }
                 redacted_entities.append(target)
-        if not target:
-            target = {
-                'entity_id': str(uuid.uuid4()),
-                'document_id': document_id,
-                'entity_class': entity_class,
-                'canonical_value': canonical_value,
-                'normalized_value': canonical_value,
-                'entity_key': entity_key,
-                'redaction_decision': 'REDACT',
-                'requires_review': False,
-                'mentions': [],
-            }
-            redacted_entities.append(target)
-        target['entity_key'] = entity_key
-        working = has_working_revision(doc)
-        search_text = (doc.get('working_text') if doc.get('working_text') is not None else content_plain_text(doc.get('working_content'))) if working else doc.get('original_text', '')
+            target['entity_key'] = entity_key
+            working = has_working_revision(doc)
+            search_text = (content_plain_text(doc.get('working_content')) if doc.get('working_content') is not None else doc.get('working_text', '')) if working else doc.get('original_text', '')
 
-        previous_mentions = list(target.get('mentions', []))
-        if working and not is_pending_decision:
-            target['mentions'] = []
-            existing_ranges = set()
-        else:
-            existing_ranges = {
-                (m.get('start'), m.get('end'))
-                for m in target.get('mentions', [])
-            }
-        accepted_ranges = set(existing_ranges)
-        new_mentions = []
+            previous_mentions = list(target.get('mentions', []))
+            if working and not is_pending_decision:
+                target['mentions'] = []
+                existing_ranges = set()
+            else:
+                existing_ranges = {
+                    (m.get('start'), m.get('end'))
+                    for m in target.get('mentions', [])
+                }
+            accepted_ranges = set(existing_ranges)
+            new_mentions = []
 
-        if is_pending_decision:
-            # Решение REDACT относится ко всей сущности, а не только
-            # к одной выбранной пользователем форме написания.
-            surface_to_normalized = {}
-            for pending in pending_group:
-                surface = pending.get('surface_value')
-                if not surface:
-                    continue
-                surface_to_normalized[surface] = (
-                    pending.get('normalized_value') or canonical_value
+            if is_pending_decision:
+                # Решение REDACT относится ко всей сущности, а не только
+                # к одной выбранной пользователем форме написания.
+                surface_to_normalized = {}
+                for pending in pending_group:
+                    surface = pending.get('surface_value')
+                    if not surface:
+                        continue
+                    surface_to_normalized[surface] = (
+                        pending.get('normalized_value') or canonical_value
+                    )
+
+                # Более длинные варианты обрабатываем первыми,
+                # чтобы короткая форма не перекрыла длинную.
+                surfaces_to_redact = sorted(
+                    surface_to_normalized.keys(),
+                    key=len,
+                    reverse=True,
+                )
+            else:
+                surface_to_normalized = {body.selected_text: canonical_value}
+                if working:
+                    for previous in previous_mentions:
+                        surface = previous.get('surface_value')
+                        if surface:
+                            surface_to_normalized[surface] = previous.get('normalized_value') or canonical_value
+                surfaces_to_redact = sorted(surface_to_normalized.keys(), key=len, reverse=True)
+
+            def overlaps_existing(start: int, end: int) -> bool:
+                return any(
+                    start < existing_end and existing_start < end
+                    for existing_start, existing_end in accepted_ranges
                 )
 
-            # Более длинные варианты обрабатываем первыми,
-            # чтобы короткая форма не перекрыла длинную.
-            surfaces_to_redact = sorted(
-                surface_to_normalized.keys(),
-                key=len,
-                reverse=True,
-            )
-        else:
-            surface_to_normalized = {body.selected_text: canonical_value}
-            if working:
-                for previous in previous_mentions:
-                    surface = previous.get('surface_value')
-                    if surface:
-                        surface_to_normalized[surface] = previous.get('normalized_value') or canonical_value
-            surfaces_to_redact = sorted(surface_to_normalized.keys(), key=len, reverse=True)
+            for surface in surfaces_to_redact:
+                normalized_value = surface_to_normalized[surface]
 
-        def overlaps_existing(start: int, end: int) -> bool:
-            return any(
-                start < existing_end and existing_start < end
-                for existing_start, existing_end in accepted_ranges
-            )
+                for match in re.finditer(re.escape(surface), search_text or ''):
+                    start = match.start()
+                    end = match.end()
 
-        for surface in surfaces_to_redact:
-            normalized_value = surface_to_normalized[surface]
+                    if overlaps_existing(start, end):
+                        continue
 
-            for match in re.finditer(re.escape(surface), search_text or ''):
-                start = match.start()
-                end = match.end()
+                    mention = {
+                        'mention_id': str(uuid.uuid4()),
+                        'entity_id': target['entity_id'],
+                        'surface_value': surface,
+                        'normalized_value': normalized_value,
+                        'start': start,
+                        'end': end,
+                        'replacement_value': target.get('placeholder') or '',
+                    }
 
-                if overlaps_existing(start, end):
-                    continue
+                    target.setdefault('mentions', []).append(mention)
+                    new_mentions.append(mention)
+                    accepted_ranges.add((start, end))
 
-                mention = {
-                    'mention_id': str(uuid.uuid4()),
-                    'entity_id': target['entity_id'],
-                    'surface_value': surface,
-                    'normalized_value': normalized_value,
-                    'start': start,
-                    'end': end,
-                    'replacement_value': target.get('placeholder') or '',
-                }
-
-                target.setdefault('mentions', []).append(mention)
-                new_mentions.append(mention)
-                accepted_ranges.add((start, end))
-
-        target['mentions_count'] = len(target.get('mentions', []))
-        if is_pending_decision or working:
-            target['placeholder'] = target.get('placeholder') or next_placeholder(entity_class, doc.get('mappings', []))
-            for mention in new_mentions:
-                mention['replacement_value'] = target['placeholder']
-            updated_text = search_text or ''
-            for mention in sorted(new_mentions, key=lambda m: m['start'], reverse=True):
-                updated_text = updated_text[:mention['start']] + target['placeholder'] + updated_text[mention['end']:]
-            doc['working_text'] = updated_text
-            doc['anonymized_text'] = updated_text
-            working_content = doc.get('working_content')
-            if working_content:
-                updated_content = anonymize_content_by_mentions(working_content, [{**target, 'mentions': new_mentions}])
-                updated_text = content_plain_text(updated_content)
-                doc['working_content'] = updated_content
-                doc['anonymized_content'] = updated_content
+            target['mentions_count'] = len(target.get('mentions', []))
+            if is_pending_decision or working:
+                target['placeholder'] = target.get('placeholder') or next_placeholder(entity_class, doc.get('mappings', []))
+                for mention in new_mentions:
+                    mention['replacement_value'] = target['placeholder']
+                updated_text = search_text or ''
+                for mention in sorted(new_mentions, key=lambda m: m['start'], reverse=True):
+                    updated_text = updated_text[:mention['start']] + target['placeholder'] + updated_text[mention['end']:]
                 doc['working_text'] = updated_text
                 doc['anonymized_text'] = updated_text
-            doc['entities'] = redacted_entities
-            doc['kept_entities'] = kept_entities
-            doc['recognized_but_kept'] = kept_entities
-            doc['mappings'] = build_mappings_from_entities(redacted_entities)
-            doc['review_entities'] = [e for e in redacted_entities if e.get('requires_review')]
-        else:
-            rebuild_document_from_entities(document_id, redacted_entities, kept_entities, doc.get('original_text', ''), doc.get('original_content'))
+                working_content = doc.get('working_content')
+                if working_content:
+                    updated_content = anonymize_content_by_mentions(working_content, [{**target, 'mentions': new_mentions}])
+                    updated_text = content_plain_text(updated_content)
+                    doc['working_content'] = updated_content
+                    doc['anonymized_content'] = updated_content
+                    doc['working_text'] = updated_text
+                    doc['anonymized_text'] = updated_text
+                doc['entities'] = redacted_entities
+                doc['kept_entities'] = kept_entities
+                doc['recognized_but_kept'] = kept_entities
+                doc['mappings'] = build_mappings_from_entities(redacted_entities)
+                doc['review_entities'] = [e for e in redacted_entities if e.get('requires_review')]
+            else:
+                rebuild_document_from_entities(document_id, redacted_entities, kept_entities, doc.get('original_text', ''), doc.get('original_content'))
+        except HTTPException:
+            restored_docs[document_id] = before_doc
+            manual_decisions_by_document_id[document_id] = before_decisions
+            raise
     elif body.decision == 'KEEP':
-        store_keep_redact_decision(document_id, 'KEEP_ENTITY', decision_entity, reason=body.reason, explicit_entity_key=entity_key)
         if not is_pending_decision:
             target = _find_entity_by_semantic_key(redacted_entities, entity_key)
             if target:
-                redacted_entities.remove(target)
-                target['redaction_decision'] = 'KEEP'
-                target['requires_review'] = False
-                target['entity_key'] = entity_key
-                kept_entities = [e for e in kept_entities if entity_semantic_key(e) != entity_key and e.get('entity_key') != entity_key]
-                kept_entities.append(target)
-            rebuild_document_from_entities(document_id, redacted_entities, kept_entities, doc.get('original_text', ''), doc.get('original_content'))
+                keep_redacted_entity_in_document(document_id, doc, target, reason=body.reason, explicit_entity_key=entity_key)
+            else:
+                store_keep_redact_decision(document_id, 'KEEP_ENTITY', decision_entity, reason=body.reason, explicit_entity_key=entity_key)
         else:
+            store_keep_redact_decision(document_id, 'KEEP_ENTITY', decision_entity, reason=body.reason, explicit_entity_key=entity_key)
             if doc.get('working_text') is not None:
                 doc['anonymized_text'] = doc.get('working_text', '')
             if doc.get('working_content') is not None:
@@ -2081,13 +2234,17 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
         target = next((e for e in redacted_entities if e.get('entity_id') == body.target_entity_id), None)
         if not target:
             _error(404, 'NOT_FOUND', 'Целевая сущность не найдена')
+        before_doc = copy.deepcopy(doc)
+        before_decisions = copy.deepcopy(
+            manual_decisions_by_document_id.get(document_id, {})
+        )
         target['placeholder'] = target.get('placeholder') or next_placeholder(target.get('entity_class', entity_class), doc.get('mappings', []))
         pending_group = [p for p in pending_items if p.get('entity_key') == entity_key] or [{
             'surface_value': body.selected_text,
             'normalized_value': canonical_value,
             'entity_class': entity_class,
         }]
-        search_text = doc.get('working_text') if doc.get('working_text') is not None else doc.get('original_text', '')
+        search_text = content_plain_text(doc.get('working_content')) if doc.get('working_content') is not None else (doc.get('working_text') if doc.get('working_text') is not None else doc.get('original_text', ''))
         existing_ranges = {(m.get('start'), m.get('end')) for m in target.get('mentions', [])}
         new_mentions = []
         for pending in pending_group:
@@ -2117,9 +2274,20 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
         doc['anonymized_text'] = updated_text
         working_content = doc.get('working_content')
         if working_content:
-            updated_content = anonymize_content_by_mentions(working_content, [{**target, 'mentions': new_mentions}])
+            try:
+                updated_content = anonymize_content_by_mentions(
+                    working_content,
+                    [{**target, 'mentions': new_mentions}],
+                )
+            except HTTPException:
+                restored_docs[document_id] = before_doc
+                manual_decisions_by_document_id[document_id] = before_decisions
+                raise
+
             doc['working_content'] = updated_content
             doc['anonymized_content'] = updated_content
+            doc['working_text'] = content_plain_text(updated_content)
+            doc['anonymized_text'] = doc['working_text']
         doc['entities'] = redacted_entities
         doc['kept_entities'] = kept_entities
         doc['recognized_but_kept'] = kept_entities
@@ -2151,16 +2319,17 @@ async def draft_scan(document_id: str, body: DraftScanRequest, x_internal_servic
     require_internal(x_internal_service_token)
     if document_id not in restored_docs:
         _error(404, 'NOT_FOUND', 'Документ не найден')
-    restored_docs[document_id]['working_text'] = body.text
+    working_text = canonical_text_for_content(body.text, body.content, body.content_format)
+    restored_docs[document_id]['working_text'] = working_text
     restored_docs[document_id]['working_content'] = body.content
     restored_docs[document_id]['working_content_format'] = body.content_format
     restored_docs[document_id]['working_document_revision'] = body.document_revision
-    entities = await extract_entities(body.text)
+    entities = await extract_entities(working_text)
     pending = []
     decisions = manual_decisions_by_document_id.get(document_id, {})
     existing_entities = restored_docs[document_id].get('entities', [])
     placeholder_patterns = [r'ФИО\d+', r'ПАСПОРТ\d+', r'ИНН\d+', r'АДРЕС\d+', r'ДАТА\d+', r'ТЕЛЕФОН\d+', r'СНИЛС\d+', r'ЭЛЕКТРОННАЯ_ПОЧТА\d+']
-    for e in resolve_entities(body.text, entities, 'NORMATIVE'):
+    for e in resolve_entities(working_text, entities, 'NORMATIVE'):
         surface = e.get('surface_value', '')
         if any(re.fullmatch(pat, surface) for pat in placeholder_patterns):
             continue
