@@ -174,6 +174,9 @@ def merge_entities_in_state(entities: list[dict], target: dict, sources: list[di
             moved = copy.deepcopy(mention)
             moved['entity_id'] = target.get('entity_id')
             moved['replacement_value'] = target.get('placeholder')
+            moved['requires_review'] = False
+            moved['review_reason'] = None
+            moved.pop('merge_candidates', None)
             target_mentions.append(moved)
             if mention_id:
                 existing_mention_ids.add(mention_id)
@@ -403,10 +406,6 @@ def decide_redaction(entity: dict, mode: str) -> tuple[str, str, bool]:
     role = entity.get('person_role')
     ctx = entity.get('context_kind')
     if etype == 'PERSON':
-        if role in {'JUDGE', 'COURT_SECRETARY'}:
-            return 'KEEP', 'ФИО судьи/секретаря оставлено в нормативном режиме', False
-        if role == 'UNKNOWN':
-            return 'REDACT', 'ФИО лица подлежит обезличиванию', True
         return 'REDACT', 'ФИО лица подлежит обезличиванию', False
     if etype == 'ORGANIZATION':
         return 'KEEP', 'Организация не обезличивается в нормативном режиме', False
@@ -653,8 +652,8 @@ def build_entities_from_resolved(document_id: str, resolved: list[dict], mode: s
             elif len(full_candidates)>1:
                 key=f"{cls}::short-amb::{norm.lower()}::{e.get('start')}"
                 e['requires_review']=True
-                e['redaction_reason']='Сокращённое ФИО соответствует нескольким найденным лицам'
-                e['merge_candidates'] = full_candidates
+                e['redaction_reason']='Сокращённое ФИО соответствует нескольким найденным лицам. Выберите связанную запись.'
+                e['merge_candidate_keys'] = full_candidates
             else:
                 key=f"{cls}::short-alone::{norm.lower()}::{e.get('start')}"
                 e['requires_review']=False
@@ -703,6 +702,8 @@ def build_entities_from_resolved(document_id: str, resolved: list[dict], mode: s
         }
         if e.get('merge_candidates'):
             mention['merge_candidates'] = e.get('merge_candidates')
+        if e.get('merge_candidate_keys'):
+            mention['merge_candidate_keys'] = e.get('merge_candidate_keys')
         ent['mentions'].append(mention)
         person_key_first_pos[key] = min(person_key_first_pos.get(key, mention.get('start') or 0), mention.get('start') or 0)
         ent['requires_review']=ent['requires_review'] or mention['requires_review']
@@ -710,6 +711,8 @@ def build_entities_from_resolved(document_id: str, resolved: list[dict], mode: s
             ent['review_reason']=mention['review_reason']
         if mention.get('merge_candidates'):
             ent['merge_candidates'] = mention['merge_candidates']
+        if mention.get('merge_candidate_keys'):
+            ent['merge_candidate_keys'] = mention['merge_candidate_keys']
         audit_log.append({'action':'ADD_ENTITY_MENTION','document_id':document_id,'entity_id':ent['entity_id'],'entity_class':cls,'placeholder':ent['placeholder'],'mentions_count':len(ent['mentions']),'created_at':now_iso()})
     # stable placeholder numbering by first mention position
     per_class_counter: dict[str, int] = defaultdict(int)
@@ -720,6 +723,29 @@ def build_entities_from_resolved(document_id: str, resolved: list[dict], mode: s
         ent['placeholder'] = f'{prefix}{per_class_counter[prefix]}'
         for m in ent.get('mentions', []):
             m['replacement_value'] = ent['placeholder']
+
+
+    entity_by_key = {key: ent for key, ent in by_key.items()}
+    for ent in entities:
+        candidate_keys = ent.pop('merge_candidate_keys', None)
+        if not candidate_keys:
+            continue
+        candidates = []
+        for candidate_key in candidate_keys:
+            candidate = entity_by_key.get(candidate_key)
+            if not candidate:
+                continue
+            candidates.append({
+                'entity_id': candidate.get('entity_id'),
+                'placeholder': candidate.get('placeholder'),
+                'canonical_value': candidate.get('canonical_value'),
+                'normalized_value': candidate.get('normalized_value'),
+                'entity_class': candidate.get('entity_class'),
+            })
+        ent['merge_candidates'] = candidates
+        for mention in ent.get('mentions', []):
+            if mention.pop('merge_candidate_keys', None) is not None or mention.get('requires_review'):
+                mention['merge_candidates'] = candidates
 
     kept_by_key = {}
     for e in resolved:
@@ -2084,6 +2110,29 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
         if is_pending_decision
         else []
     )
+
+    if body.decision == 'REDACT' and not is_pending_decision:
+        target = _find_entity_by_semantic_key(redacted_entities, entity_key)
+        if target and target.get('requires_review') is True:
+            store_keep_redact_decision(document_id, 'REDACT_ENTITY', target, reason=body.reason, explicit_entity_key=entity_key)
+            target['redaction_decision'] = 'REDACT'
+            target['requires_review'] = False
+            target['review_reason'] = None
+            for mention in target.get('mentions', []):
+                mention['requires_review'] = False
+                mention['review_reason'] = None
+            doc['entities'] = redacted_entities
+            doc['kept_entities'] = kept_entities
+            doc['recognized_but_kept'] = kept_entities
+            doc['mappings'] = build_mappings_from_entities(redacted_entities)
+            doc['review_entities'] = [e for e in redacted_entities if e.get('requires_review')]
+            pending = [p for p in pending_items if p.get('entity_key') != entity_key]
+            pending_review_by_document_id[document_id] = pending
+            doc['pending_review'] = pending
+            doc['pending_markers'] = [{'entity_key': p['entity_key'], 'surface_value': p['surface_value'], 'start': p['start'], 'end': p['end'], 'reason': p['reason']} for p in pending]
+            doc['manual_decisions'] = list(manual_decisions_by_document_id.get(document_id, {}).values())
+            sync_public_document(document_id, doc)
+            return anonymization_result_response(doc)
 
     if body.decision == 'REDACT':
         before_doc = copy.deepcopy(doc)

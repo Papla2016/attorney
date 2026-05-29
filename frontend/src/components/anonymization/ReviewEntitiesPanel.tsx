@@ -27,12 +27,12 @@ export default function ReviewEntitiesPanel({ reviewEntities, mergeTargets, busy
             <div><span className='muted-text'>Причина</span><strong>{entity.review_reason || 'Нужно решение пользователя'}</strong></div>
           </div>
           <div className='review-actions-grid'>
-            <label>Связать с существующей записью
-              <select value={selected} onChange={(e) => onMergeTargetChange(key, e.target.value)} disabled={!entity.merge_candidates?.length}>
+            {!!entity.merge_candidates?.length && <label>Связать с существующей записью
+              <select value={selected} onChange={(e) => onMergeTargetChange(key, e.target.value)}>
                 <option value=''>Выберите запись</option>
-                {entity.merge_candidates?.map((candidate) => <option key={candidate.entity_id || candidate.cluster_id} value={candidate.entity_id || ''}>{mergeCandidateLabel(candidate)}</option>)}
+                {entity.merge_candidates.map((candidate) => <option key={candidate.entity_id || candidate.cluster_id} value={candidate.entity_id || ''}>{mergeCandidateLabel(candidate)}</option>)}
               </select>
-            </label>
+            </label>}
             {errors[key] && <p className='error-message'>{errors[key]}</p>}
             <div className='mapping-actions'>
               <button type='button' className='button' disabled={actionsDisabled || busyId === key} onClick={() => onResolve(entity, 'REDACT')}>{busyId === key ? 'Обрабатываем...' : 'Подтвердить обезличивание'}</button>
