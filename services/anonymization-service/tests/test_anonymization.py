@@ -3747,3 +3747,116 @@ def test_add_mapping_cross_node_error_does_not_mutate_document_or_decisions():
     assert response.json()['error']['code'] == 'CROSS_TEXT_NODE_MENTION_UNSUPPORTED'
     assert main.restored_docs[doc_id] == before
     assert main.manual_decisions_by_document_id.get(doc_id, {}) == before_decisions
+
+def test_merge_with_existing_cross_node_error_does_not_mutate_document_or_decisions():
+    import copy
+
+    from fastapi.testclient import TestClient
+
+    from app import main
+    from app.main import app, content_plain_text
+
+    client = TestClient(app)
+    doc_id = 'merge-existing-cross-node-doc'
+
+    main.restored_docs.pop(doc_id, None)
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+    main.pending_review_by_document_id.pop(doc_id, None)
+
+    content = {
+        'type': 'doc',
+        'content': [
+            {
+                'type': 'paragraph',
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': 'ФИО1 сообщил. Новый свидетель ',
+                    },
+                    {
+                        'type': 'text',
+                        'text': 'Иванов',
+                        'marks': [{'type': 'bold'}],
+                    },
+                    {
+                        'type': 'text',
+                        'text': ' Иван Иванович прибыл.',
+                    },
+                ],
+            }
+        ],
+    }
+    text = content_plain_text(content)
+
+    target_entity = {
+        'entity_id': 'target-entity-1',
+        'document_id': doc_id,
+        'entity_class': 'PERSON',
+        'canonical_value': 'Петров Пётр Петрович',
+        'normalized_value': 'Петров Пётр Петрович',
+        'entity_key': 'PERSON::Петров Пётр Петрович',
+        'redaction_decision': 'REDACT',
+        'placeholder': 'ФИО1',
+        'requires_review': False,
+        'mentions': [],
+        'mentions_count': 0,
+    }
+
+    pending_key = 'PERSON::Иванов Иван Иванович'
+
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case',
+        'title': 'doc',
+        'original_text': text,
+        'original_content': copy.deepcopy(content),
+        'working_text': text,
+        'working_content': copy.deepcopy(content),
+        'anonymized_text': text,
+        'anonymized_content': copy.deepcopy(content),
+        'content_format': 'TIPTAP_JSON',
+        'entities': [target_entity],
+        'kept_entities': [],
+        'mappings': main.build_mappings_from_entities([target_entity]),
+        'pending_review': [
+            {
+                'entity_key': pending_key,
+                'surface_value': 'Иванов Иван Иванович',
+                'normalized_value': 'Иванов Иван Иванович',
+                'entity_class': 'PERSON',
+                'start': text.index('Иванов'),
+                'end': text.index('Иванов') + len('Иванов Иван Иванович'),
+                'reason': 'В изменённом тексте найдено новое значение, требующее проверки',
+            }
+        ],
+    }
+    main.pending_review_by_document_id[doc_id] = copy.deepcopy(
+        main.restored_docs[doc_id]['pending_review']
+    )
+
+    before_doc = copy.deepcopy(main.restored_docs[doc_id])
+    before_decisions = copy.deepcopy(
+        main.manual_decisions_by_document_id.get(doc_id, {})
+    )
+
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={
+            'entity_key': pending_key,
+            'selected_text': 'Иванов Иван Иванович',
+            'decision': 'MERGE_WITH_EXISTING',
+            'entity_class': 'PERSON',
+            'target_entity_id': 'target-entity-1',
+            'reason': 'Связано пользователем с существующей сущностью',
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()['error']['code'] == 'CROSS_TEXT_NODE_MENTION_UNSUPPORTED'
+
+    assert main.restored_docs[doc_id] == before_doc
+    assert main.manual_decisions_by_document_id.get(doc_id, {}) == before_decisions
+    assert main.restored_docs[doc_id]['entities'][0]['mentions'] == []
+    assert main.restored_docs[doc_id]['working_text'] == text
+    assert main.restored_docs[doc_id]['working_content'] == content

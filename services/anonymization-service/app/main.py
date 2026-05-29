@@ -2234,6 +2234,10 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
         target = next((e for e in redacted_entities if e.get('entity_id') == body.target_entity_id), None)
         if not target:
             _error(404, 'NOT_FOUND', 'Целевая сущность не найдена')
+        before_doc = copy.deepcopy(doc)
+        before_decisions = copy.deepcopy(
+            manual_decisions_by_document_id.get(document_id, {})
+        )
         target['placeholder'] = target.get('placeholder') or next_placeholder(target.get('entity_class', entity_class), doc.get('mappings', []))
         pending_group = [p for p in pending_items if p.get('entity_key') == entity_key] or [{
             'surface_value': body.selected_text,
@@ -2270,9 +2274,20 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
         doc['anonymized_text'] = updated_text
         working_content = doc.get('working_content')
         if working_content:
-            updated_content = anonymize_content_by_mentions(working_content, [{**target, 'mentions': new_mentions}])
+            try:
+                updated_content = anonymize_content_by_mentions(
+                    working_content,
+                    [{**target, 'mentions': new_mentions}],
+                )
+            except HTTPException:
+                restored_docs[document_id] = before_doc
+                manual_decisions_by_document_id[document_id] = before_decisions
+                raise
+
             doc['working_content'] = updated_content
             doc['anonymized_content'] = updated_content
+            doc['working_text'] = content_plain_text(updated_content)
+            doc['anonymized_text'] = doc['working_text']
         doc['entities'] = redacted_entities
         doc['kept_entities'] = kept_entities
         doc['recognized_but_kept'] = kept_entities
