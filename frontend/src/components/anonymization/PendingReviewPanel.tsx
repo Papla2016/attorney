@@ -8,12 +8,13 @@ type Props = {
   scanError?: string;
   mergeTargets: Record<string, string>;
   busyId?: string;
+  actionsDisabled?: boolean;
   errors: Record<string, string>;
   onMergeTargetChange: (key: string, targetId: string) => void;
   onResolve: (entity: PendingReviewEntity, decision: 'REDACT' | 'KEEP' | 'MERGE_WITH_EXISTING', targetEntityId?: string) => void;
 };
 
-export default function PendingReviewPanel({ pendingReview, scanLoading, scanError, mergeTargets, busyId, errors, onMergeTargetChange, onResolve }: Props) {
+export default function PendingReviewPanel({ pendingReview, scanLoading, scanError, mergeTargets, busyId, actionsDisabled = false, errors, onMergeTargetChange, onResolve }: Props) {
   return <section className={`pending-review-panel ${pendingReview.length ? 'pending-review-panel-warning' : ''}`} aria-label='Найдено в изменённом тексте'>
     <div className='panel-header-row'>
       <h2>Найдено в изменённом тексте</h2>
@@ -40,9 +41,9 @@ export default function PendingReviewPanel({ pendingReview, scanLoading, scanErr
             </label>
             {errors[key] && <p className='error-message'>{errors[key]}</p>}
             <div className='mapping-actions'>
-              <button type='button' className='button' disabled={busyId === key} onClick={() => onResolve(entity, 'REDACT')}>{busyId === key ? 'Обрабатываем...' : 'Обезличить'}</button>
-              <button type='button' className='button button-secondary' disabled={busyId === key} onClick={() => onResolve(entity, 'KEEP')}>Оставить в тексте</button>
-              <button type='button' className='button button-secondary' disabled={busyId === key || !selected} onClick={() => onResolve(entity, 'MERGE_WITH_EXISTING', selected)}>Связать с существующей записью</button>
+              <button type='button' className='button' disabled={actionsDisabled || busyId === key} onClick={() => onResolve(entity, 'REDACT')}>{busyId === key ? 'Обрабатываем...' : 'Обезличить'}</button>
+              <button type='button' className='button button-secondary' disabled={actionsDisabled || busyId === key} onClick={() => onResolve(entity, 'KEEP')}>Оставить в тексте</button>
+              <button type='button' className='button button-secondary' disabled={actionsDisabled || busyId === key || !selected} onClick={() => onResolve(entity, 'MERGE_WITH_EXISTING', selected)}>Связать с существующей записью</button>
             </div>
           </article>;
         })}

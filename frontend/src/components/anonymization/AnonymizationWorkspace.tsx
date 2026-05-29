@@ -92,6 +92,12 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
   const publicationBlocked = statusCounts.review > 0 || statusCounts.pending > 0;
   const hasUnvalidatedDraft = documentChangedManually || scanLoading;
   const publishBlockedByState = publicationBlocked || hasUnvalidatedDraft;
+  const actionsDisabled = hasUnvalidatedDraft || !!activeAction;
+  const blockIfUnvalidatedDraft = () => {
+    if (!hasUnvalidatedDraft) return false;
+    setWarning('Сначала сохраните изменения и дождитесь проверки добавленного текста.');
+    return true;
+  };
 
   const runAction = async (action: ActionName, fn: () => Promise<void>, success?: string) => {
     setActiveAction(action);
@@ -150,10 +156,13 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
     }, 'Документ опубликован.');
   };
 
-  const handleRepair = () => runAction('repair', async () => {
-    const res = await repairPlaceholders(documentId);
-    applyResponse(res.data, 'FULL');
-  }, 'Условные обозначения проверены и восстановлены.');
+  const handleRepair = () => {
+    if (blockIfUnvalidatedDraft()) return;
+    return runAction('repair', async () => {
+      const res = await repairPlaceholders(documentId);
+      applyResponse(res.data, 'FULL');
+    }, 'Условные обозначения проверены и восстановлены.');
+  };
 
   const handleEntitySelection = (id: string, selected: boolean) => {
     setMergeError('');
@@ -162,6 +171,7 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
   };
 
   const handleMerge = () => {
+    if (blockIfUnvalidatedDraft()) return;
     const selected = redactedEntities.filter((entity) => selectedIds.includes(entity.entity_id));
     if (selected.length < 2 || !mergeTarget) return;
     const classes = new Set(selected.map((entity) => entity.entity_class));
@@ -180,6 +190,7 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
 
   const handleEditSave = async (payload: { canonical_value: string; entity_class: string; person_role?: string; context_label?: string }) => {
     if (!editingEntity) return;
+    if (blockIfUnvalidatedDraft()) return;
     setActiveAction('edit');
     setEditorError('');
     try {
@@ -195,6 +206,7 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
   };
 
   const handleSplitMention = async (entity: RedactionEntity, mentionId: string) => {
+    if (blockIfUnvalidatedDraft()) return;
     setBusyEntityId(mentionId);
     setError('');
     try {
@@ -209,6 +221,7 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
   };
 
   const resolveReviewEntity = async (entity: RedactionEntity, decision: 'REDACT' | 'KEEP' | 'MERGE_WITH_EXISTING', targetEntityId?: string) => {
+    if (blockIfUnvalidatedDraft()) return;
     const key = getEntityKey(entity);
     const selectedText = selectedTextForEntity(entity);
     setRowErrors((prev) => ({ ...prev, [key]: '' }));
@@ -229,6 +242,7 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
   };
 
   const resolvePendingEntity = async (entity: PendingReviewEntity, decision: 'REDACT' | 'KEEP' | 'MERGE_WITH_EXISTING', targetEntityId?: string) => {
+    if (blockIfUnvalidatedDraft()) return;
     const key = entity.entity_key || entity.surface_value;
     setRowErrors((prev) => ({ ...prev, [key]: '' }));
     if (!entity.surface_value) {
@@ -248,6 +262,7 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
   };
 
   const redactKeptEntity = async (entity: RedactionEntity) => {
+    if (blockIfUnvalidatedDraft()) return;
     const key = getEntityKey(entity);
     const selectedText = selectedTextForEntity(entity);
     setRowErrors((prev) => ({ ...prev, [key]: '' }));
@@ -281,7 +296,7 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
         <div><h1>Обезличивание документа</h1><p className='muted-text'>{provider ? 'Используется Natasha и правила' : 'Используются только правила'}</p></div>
         <div className='document-actions'>
           <button type='button' className='button button-secondary' disabled={!!activeAction} onClick={handleSave}>{activeAction === 'save' ? 'Сохраняем...' : 'Сохранить изменения'}</button>
-          <button type='button' className='button button-secondary' disabled={hasUnvalidatedDraft || !!activeAction} onClick={handleReanonymize}>{activeAction === 'reanonymize' ? 'Обезличиваем...' : 'Повторно обезличить'}</button>
+          <button type='button' className='button button-secondary' disabled={actionsDisabled} onClick={handleReanonymize}>{activeAction === 'reanonymize' ? 'Обезличиваем...' : 'Повторно обезличить'}</button>
           <button type='button' className='button' disabled={!!activeAction || publishBlockedByState} onClick={handlePublish}>{activeAction === 'publish' ? 'Публикуем...' : 'Опубликовать'}</button>
         </div>
       </div>
@@ -313,17 +328,18 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
     />
 
     <div className='document-actions'>
-      <button type='button' className='button button-secondary' disabled={!!activeAction} onClick={handleRepair}>{activeAction === 'repair' ? 'Проверяем...' : 'Восстановить placeholder marks'}</button>
+      <button type='button' className='button button-secondary' disabled={actionsDisabled} onClick={handleRepair}>{activeAction === 'repair' ? 'Проверяем...' : 'Восстановить placeholder marks'}</button>
       {sourceText && <p className='warning-message'>Исходный текст изменён. Таблица соответствия может быть неактуальна. Выполните обезличивание повторно.</p>}
     </div>
 
     <div className='workspace-panels-grid'>
-      <EntityRegistryPanel entities={redactedEntities} selectedIds={selectedIds} mergeTarget={mergeTarget} busyId={busyEntityId} mergeBusy={activeAction === 'merge'} mergeError={mergeError} onSelect={handleEntitySelection} onMergeTargetChange={setMergeTarget} onMerge={handleMerge} onClearSelection={() => { setSelectedIds([]); setMergeTarget(''); setMergeError(''); }} onEdit={setEditingEntity} onSplitMention={handleSplitMention} />
-      <div ref={pendingPanelRef}><PendingReviewPanel pendingReview={pendingReview} scanLoading={scanLoading} scanError={scanError} mergeTargets={mergeTargets} busyId={busyEntityId} errors={rowErrors} onMergeTargetChange={(key, targetId) => setMergeTargets((prev) => ({ ...prev, [key]: targetId }))} onResolve={resolvePendingEntity} /></div>
-      <ReviewEntitiesPanel reviewEntities={reviewEntities} mergeTargets={mergeTargets} busyId={busyEntityId} errors={rowErrors} onMergeTargetChange={(key, targetId) => setMergeTargets((prev) => ({ ...prev, [key]: targetId }))} onResolve={resolveReviewEntity} />
-      <KeptEntitiesPanel keptEntities={keptEntities} busyId={busyEntityId} errors={rowErrors} onRedact={redactKeptEntity} />
+      {hasUnvalidatedDraft && <p className='manual-decision-warning'>Сохраните изменения документа, чтобы продолжить работу с сущностями.</p>}
+      <EntityRegistryPanel entities={redactedEntities} selectedIds={selectedIds} mergeTarget={mergeTarget} busyId={busyEntityId} mergeBusy={activeAction === 'merge'} mergeError={mergeError} onSelect={handleEntitySelection} onMergeTargetChange={setMergeTarget} onMerge={handleMerge} onClearSelection={() => { setSelectedIds([]); setMergeTarget(''); setMergeError(''); }} onEdit={setEditingEntity} onSplitMention={handleSplitMention} actionsDisabled={actionsDisabled} />
+      <div ref={pendingPanelRef}><PendingReviewPanel pendingReview={pendingReview} scanLoading={scanLoading} scanError={scanError} mergeTargets={mergeTargets} busyId={busyEntityId} errors={rowErrors} onMergeTargetChange={(key, targetId) => setMergeTargets((prev) => ({ ...prev, [key]: targetId }))} onResolve={resolvePendingEntity} actionsDisabled={actionsDisabled} /></div>
+      <ReviewEntitiesPanel reviewEntities={reviewEntities} mergeTargets={mergeTargets} busyId={busyEntityId} errors={rowErrors} onMergeTargetChange={(key, targetId) => setMergeTargets((prev) => ({ ...prev, [key]: targetId }))} onResolve={resolveReviewEntity} actionsDisabled={actionsDisabled} />
+      <KeptEntitiesPanel keptEntities={keptEntities} busyId={busyEntityId} errors={rowErrors} onRedact={redactKeptEntity} actionsDisabled={actionsDisabled} />
     </div>
 
-    <EntityEditorModal entity={editingEntity} busy={activeAction === 'edit'} error={editorError} onClose={() => setEditingEntity(null)} onSave={handleEditSave} />
+    <EntityEditorModal entity={editingEntity} busy={activeAction === 'edit'} error={editorError} onClose={() => setEditingEntity(null)} onSave={handleEditSave} actionsDisabled={actionsDisabled} />
   </div>;
 }

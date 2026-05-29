@@ -10,6 +10,7 @@ type Props = {
   mergeTarget: string;
   busyId?: string;
   mergeBusy: boolean;
+  actionsDisabled?: boolean;
   mergeError?: string;
   onSelect: (id: string, selected: boolean) => void;
   onMergeTargetChange: (id: string) => void;
@@ -19,11 +20,11 @@ type Props = {
   onSplitMention: (entity: RedactionEntity, mentionId: string) => void;
 };
 
-export default function EntityRegistryPanel({ entities, selectedIds, mergeTarget, busyId, mergeBusy, mergeError, onSelect, onMergeTargetChange, onMerge, onClearSelection, onEdit, onSplitMention }: Props) {
+export default function EntityRegistryPanel({ entities, selectedIds, mergeTarget, busyId, mergeBusy, actionsDisabled = false, mergeError, onSelect, onMergeTargetChange, onMerge, onClearSelection, onEdit, onSplitMention }: Props) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   return <section className='anonymization-results-section' aria-label='Обезличенные сущности'>
     <div className='panel-header-row'><h2>Обезличено</h2><span className='badge'>{entities.length}</span></div>
-    <MergeEntitiesModal entities={entities} selectedIds={selectedIds} targetId={mergeTarget} busy={mergeBusy} error={mergeError} onTargetChange={onMergeTargetChange} onMerge={onMerge} onClear={onClearSelection} />
+    <MergeEntitiesModal entities={entities} selectedIds={selectedIds} targetId={mergeTarget} busy={mergeBusy} actionsDisabled={actionsDisabled} error={mergeError} onTargetChange={onMergeTargetChange} onMerge={onMerge} onClear={onClearSelection} />
     {entities.length === 0 ? <p className='empty-state'>Обезличенных сущностей без проверки пока нет.</p> : <div className='entity-card-list'>
       {entities.map((entity) => {
         const isExpanded = !!expanded[entity.entity_id];
@@ -37,11 +38,11 @@ export default function EntityRegistryPanel({ entities, selectedIds, mergeTarget
             <div><span className='muted-text'>Упоминаний</span><strong>{entity.mentions_count || entity.mentions?.length || 0}</strong></div>
             <div className='mapping-actions'>
               <button type='button' className='button button-secondary' onClick={() => setExpanded((prev) => ({ ...prev, [entity.entity_id]: !isExpanded }))}>{isExpanded ? 'Скрыть варианты' : 'Варианты написания'}</button>
-              <button type='button' className='button' onClick={() => onEdit(entity)}>Редактировать</button>
+              <button type='button' className='button' disabled={actionsDisabled} onClick={() => onEdit(entity)}>Редактировать</button>
             </div>
           </div>
           {isExpanded && <div className='entity-mentions-block'>
-            {(entity.mentions || []).length === 0 ? <p className='empty-state'>Упоминания не переданы API.</p> : <table className='mentions-table'><thead><tr><th>Текст</th><th>Нормализация</th><th>Формат</th><th>Позиция / контекст</th><th>Замена</th><th>Действие</th></tr></thead><tbody>{entity.mentions.map((mention) => <tr key={mention.mention_id} className='mention-row'><td>{mention.surface_value}</td><td>{mention.normalized_value && mention.normalized_value !== mention.surface_value ? mention.normalized_value : '—'}</td><td>{formatMentionFormat(mention.format)}</td><td>{mention.start !== undefined && mention.end !== undefined ? `${mention.start}-${mention.end}` : '—'}</td><td>{mention.replacement_value || entity.placeholder || '—'}</td><td><button type='button' className='button button-secondary' disabled={busyId === mention.mention_id} onClick={() => onSplitMention(entity, mention.mention_id)}>{busyId === mention.mention_id ? 'Отделяем...' : 'Отделить упоминание'}</button></td></tr>)}</tbody></table>}
+            {(entity.mentions || []).length === 0 ? <p className='empty-state'>Упоминания не переданы API.</p> : <table className='mentions-table'><thead><tr><th>Текст</th><th>Нормализация</th><th>Формат</th><th>Позиция / контекст</th><th>Замена</th><th>Действие</th></tr></thead><tbody>{entity.mentions.map((mention) => <tr key={mention.mention_id} className='mention-row'><td>{mention.surface_value}</td><td>{mention.normalized_value && mention.normalized_value !== mention.surface_value ? mention.normalized_value : '—'}</td><td>{formatMentionFormat(mention.format)}</td><td>{mention.start !== undefined && mention.end !== undefined ? `${mention.start}-${mention.end}` : '—'}</td><td>{mention.replacement_value || entity.placeholder || '—'}</td><td><button type='button' className='button button-secondary' disabled={actionsDisabled || busyId === mention.mention_id} onClick={() => onSplitMention(entity, mention.mention_id)}>{busyId === mention.mention_id ? 'Отделяем...' : 'Отделить упоминание'}</button></td></tr>)}</tbody></table>}
           </div>}
         </article>;
       })}

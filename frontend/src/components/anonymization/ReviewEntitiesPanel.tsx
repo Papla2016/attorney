@@ -6,12 +6,13 @@ type Props = {
   reviewEntities: RedactionEntity[];
   mergeTargets: Record<string, string>;
   busyId?: string;
+  actionsDisabled?: boolean;
   errors: Record<string, string>;
   onMergeTargetChange: (key: string, targetId: string) => void;
   onResolve: (entity: RedactionEntity, decision: 'REDACT' | 'KEEP' | 'MERGE_WITH_EXISTING', targetEntityId?: string) => void;
 };
 
-export default function ReviewEntitiesPanel({ reviewEntities, mergeTargets, busyId, errors, onMergeTargetChange, onResolve }: Props) {
+export default function ReviewEntitiesPanel({ reviewEntities, mergeTargets, busyId, actionsDisabled = false, errors, onMergeTargetChange, onResolve }: Props) {
   return <section className='anonymization-results-section review-panel' aria-label='Сущности, требующие проверки'>
     <div className='panel-header-row'><h2>Требует проверки</h2><span className='badge badge-warning'>{reviewEntities.length}</span></div>
     {reviewEntities.length === 0 ? <p className='empty-state'>Нет обезличенных сущностей, ожидающих решения пользователя.</p> : <div className='review-card-list'>
@@ -34,9 +35,9 @@ export default function ReviewEntitiesPanel({ reviewEntities, mergeTargets, busy
             </label>
             {errors[key] && <p className='error-message'>{errors[key]}</p>}
             <div className='mapping-actions'>
-              <button type='button' className='button' disabled={busyId === key} onClick={() => onResolve(entity, 'REDACT')}>{busyId === key ? 'Обрабатываем...' : 'Подтвердить обезличивание'}</button>
-              <button type='button' className='button button-secondary' disabled={busyId === key} onClick={() => onResolve(entity, 'KEEP')}>Оставить в тексте</button>
-              <button type='button' className='button button-secondary' disabled={busyId === key || !selected} onClick={() => onResolve(entity, 'MERGE_WITH_EXISTING', selected)}>Связать с существующей записью</button>
+              <button type='button' className='button' disabled={actionsDisabled || busyId === key} onClick={() => onResolve(entity, 'REDACT')}>{busyId === key ? 'Обрабатываем...' : 'Подтвердить обезличивание'}</button>
+              <button type='button' className='button button-secondary' disabled={actionsDisabled || busyId === key} onClick={() => onResolve(entity, 'KEEP')}>Оставить в тексте</button>
+              <button type='button' className='button button-secondary' disabled={actionsDisabled || busyId === key || !selected} onClick={() => onResolve(entity, 'MERGE_WITH_EXISTING', selected)}>Связать с существующей записью</button>
             </div>
           </div>
         </article>;

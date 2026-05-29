@@ -21,12 +21,13 @@ const ENTITY_MODEL_OPTIONS = [
 type Props = {
   entity: RedactionEntity | null;
   busy: boolean;
+  actionsDisabled?: boolean;
   error?: string;
   onClose: () => void;
   onSave: (payload: { canonical_value: string; entity_class: string; person_role?: string; context_label?: string }) => void;
 };
 
-export default function EntityEditorModal({ entity, busy, error, onClose, onSave }: Props) {
+export default function EntityEditorModal({ entity, busy, actionsDisabled = false, error, onClose, onSave }: Props) {
   const [canonicalValue, setCanonicalValue] = useState('');
   const [entityClass, setEntityClass] = useState('OTHER');
   const [personRole, setPersonRole] = useState('');
@@ -67,9 +68,10 @@ export default function EntityEditorModal({ entity, busy, error, onClose, onSave
       <label>Контекст
         <input value={contextLabel} onChange={(e) => setContextLabel(e.target.value)} placeholder='Например: судья, адрес регистрации, дата заседания' />
       </label>
+      {actionsDisabled && <p className='manual-decision-warning'>Сохраните изменения документа, чтобы продолжить работу с сущностями.</p>}
       {error && <p className='error-message'>{error}</p>}
       <div className='mapping-actions'>
-        <button type='submit' className='button' disabled={busy}>{busy ? 'Сохраняем...' : 'Сохранить'}</button>
+        <button type='submit' className='button' disabled={actionsDisabled || busy}>{busy ? 'Сохраняем...' : 'Сохранить'}</button>
         <button type='button' className='button button-secondary' onClick={onClose} disabled={busy}>Отмена</button>
       </div>
     </form>
