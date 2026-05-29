@@ -232,7 +232,9 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
     }
     setBusyEntityId(key);
     try {
-      const res = await applyRedactionDecision(documentId, { entity_key: key, selected_text: selectedText, entity_class: entity.entity_class, decision, target_entity_id: targetEntityId, reason: decision === 'KEEP' ? 'Оставлено пользователем после проверки' : 'Подтверждено пользователем после проверки' });
+      const res = decision === 'MERGE_WITH_EXISTING'
+        ? await mergeDocumentEntities(documentId, { target_entity_id: targetEntityId || '', source_entity_ids: [entity.entity_id] })
+        : await applyRedactionDecision(documentId, { entity_key: key, selected_text: selectedText, entity_class: entity.entity_class, decision, target_entity_id: targetEntityId, reason: decision === 'KEEP' ? 'Оставлено пользователем после проверки' : 'Подтверждено пользователем после проверки' });
       applyResponse(res.data, 'FULL');
       setMessage('Решение применено.');
     } catch (err) {

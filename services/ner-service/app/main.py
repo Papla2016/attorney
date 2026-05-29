@@ -182,7 +182,19 @@ class RegexRuleNerProvider(BaseNerProvider):
 
     def __init__(self) -> None:
         flags = re.IGNORECASE | re.UNICODE
-        fio_full = r'[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+'
+        person_flags = re.UNICODE
+        title_word = r'[А-ЯЁ][а-яё]+'
+        # Conservative fallback: a full name must end with a patronymic-like
+        # word, including common Russian case forms. This intentionally avoids
+        # treating any three title-case words as a full name.
+        patronymic = (
+            r'[А-ЯЁ][а-яё]*(?:'
+            r'ович(?:а|ем)?|евич(?:а|ем)?|ьевич(?:а|ем)?|ич(?:а|ем)?|'
+            r'овна|овны|овной|овне|евна|евны|евной|евне|'
+            r'ьевна|ьевны|ьевной|ьевне|ична|ичны|ичной|ичне'
+            r')'
+        )
+        fio_full = rf'{title_word}\s+{title_word}\s+{patronymic}'
         fio_initials = r'[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\.'
         fio = rf'(?:{fio_full}|{fio_initials})'
         try:
@@ -197,7 +209,7 @@ class RegexRuleNerProvider(BaseNerProvider):
             ('INN', re.compile(r'\b\d{10}(?:\d{2})?\b'), 0.88, 'regex'),
             ('PASSPORT', re.compile(r'\bпаспорт(?:\s+серии)?\s*\d{2}\s?\d{2}(?:\s+номер)?\s*\d{6}\b|\b\d{4}\s?\d{6}\b', flags), 0.88, 'regex'),
             ('DATE', re.compile(r'\b\d{2}\.\d{2}\.\d{4}\b', flags), 0.86, 'regex'),
-            ('PERSON_FULL_NAME', re.compile(fio), 0.85, 'regex'),
+            ('PERSON_FULL_NAME', re.compile(fio, person_flags), 0.85, 'regex'),
             ('ORGANIZATION', re.compile(r'\b(?:ООО|АО|ПАО|ЗАО|ОАО)\s+[«"][^»"]+[»"]', flags), 0.82, 'rule'),
             ('ADDRESS', re.compile(r'\b(?:(?:г\.|город)\s*[А-ЯЁа-яё\- ]+|(?:ул\.|улица)\s*[А-ЯЁа-яё\- ]+|(?:д\.|дом)\s*\d+[А-Яа-я]?)(?:,?\s*(?:(?:ул\.|улица)\s*[А-ЯЁа-яё\- ]+|(?:д\.|дом)\s*\d+[А-Яа-я]?))*', flags), 0.80, 'regex'),
             ('LOCATION', re.compile(r'\b(?:г\.|город)\s*[А-ЯЁа-яё\- ]+', flags), 0.78, 'regex'),
@@ -208,7 +220,7 @@ class RegexRuleNerProvider(BaseNerProvider):
             ('CASE_PARTICIPANT', r'(?:истец|ответчик|заявитель|подсудимый|лицо,\s*привлекаемое\s+к\s+административной\s+ответственности|с\s+участием|в\s+отношении)'),
         ]
         self.role_patterns = [
-            (etype, re.compile(rf'\b{prefix}\s+(?:[^.\n,;:]*?\s+)?({fio})', flags), 0.87 if etype != 'CASE_PARTICIPANT' else 0.82)
+            (etype, re.compile(rf'\b(?i:{prefix})\s+(?:[^.\n,;:]*?\s+)?({fio})', person_flags), 0.87 if etype != 'CASE_PARTICIPANT' else 0.82)
             for etype, prefix in role_specs
         ]
 
