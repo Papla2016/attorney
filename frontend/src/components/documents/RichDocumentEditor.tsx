@@ -14,6 +14,7 @@ import { Mark } from '@tiptap/core';
 import { Decoration, DecorationSet } from '@tiptap/pm/view';
 import { Plugin, PluginKey } from '@tiptap/pm/state';
 import type { PendingMarker, ReviewMarker } from '../../api/types';
+import { tiptapDocumentToPlainText } from '../../utils/tiptapDocument';
 
 export const UPDATE_REDACTION_MARKERS = 'updateRedactionMarkers';
 const redactionPluginKey = new PluginKey('redactionHighlight');
@@ -94,7 +95,7 @@ export default function RichDocumentEditor({ value, contentRevision, onChange, p
   const editor = useEditor({
     editable, shouldRerenderOnTransaction: false,
     extensions: [StarterKit.configure({ bulletList: { keepMarks: true }, orderedList: { keepMarks: true } }), Underline, HorizontalRule, TextAlign.configure({ types: ['heading', 'paragraph'] }), Table.configure({ resizable: true }), TableRow, TableHeader, TableCell, Placeholder.configure({ placeholder: placeholder || 'Введите текст документа...' }), RedactionMentionMark, ReviewHighlight.configure({ onReviewClick: onReviewMarkerClick, onPendingClick: onPendingMarkerClick, onRedactionClick: onRedactionMarkerClick, showSensitiveTooltips })],
-    content: value || '<p></p>', onUpdate: ({ editor: ed }) => onChange?.({ json: ed.getJSON(), text: ed.getText() }), onSelectionUpdate: ({ editor: ed }) => onSelectionChange?.(ed.state.doc.textBetween(ed.state.selection.from, ed.state.selection.to, ' ').trim()),
+    content: value || '<p></p>', onUpdate: ({ editor: ed }) => { const json = ed.getJSON(); onChange?.({ json, text: tiptapDocumentToPlainText(json) }); }, onSelectionUpdate: ({ editor: ed }) => onSelectionChange?.(ed.state.doc.textBetween(ed.state.selection.from, ed.state.selection.to, ' ').trim()),
   });
 
   useEffect(() => { if (!editor) return; editor.view.dispatch(editor.state.tr.setMeta(UPDATE_REDACTION_MARKERS, { redactionMarkers, reviewMarkers, pendingMarkers })); }, [editor, redactionMarkers, reviewMarkers, pendingMarkers]);
