@@ -37,6 +37,7 @@ class ProcessRequest(BaseModel):
 class MappingRequest(BaseModel):
     original_value: str
     placeholder: str | None = None
+    entity_id: str | None = None
     entity_type: str
     mode: str = 'new'
 
@@ -77,6 +78,7 @@ class DraftScanRequest(BaseModel):
 
 class EntityPatchRequest(BaseModel):
     canonical_value: str | None = None
+    entity_class: str | None = None
     person_role: str | None = None
     context_label: str | None = None
 
@@ -271,6 +273,7 @@ def store_entity_metadata_decision(document_id: str, source_entity_key: str, ent
         'source_entity_key': source_entity_key,
         'payload': {
             'canonical_value': entity.get('canonical_value'),
+            'entity_class': entity.get('entity_class'),
             'person_role': entity.get('person_role'),
             'context_label': entity.get('context_label'),
         },
@@ -309,6 +312,7 @@ def store_split_entity_metadata_decision(document_id: str, entity: dict) -> dict
         },
         'payload': {
             'canonical_value': entity.get('canonical_value'),
+            'entity_class': entity.get('entity_class'),
             'person_role': entity.get('person_role'),
             'context_label': entity.get('context_label'),
         },
@@ -734,6 +738,7 @@ def build_entities_from_resolved(document_id: str, resolved: list[dict], mode: s
                 'canonical_value': normalized,
                 'normalized_value': normalized,
                 'person_role': role,
+                'entity_key': build_entity_semantic_key(cls, normalized, role),
                 'redaction_decision': 'KEEP',
                 'requires_review': False,
                 'source': e.get('source', 'natasha'),
@@ -932,6 +937,140 @@ def content_plain_text(content: dict | None) -> str:
     walk(content)
     return ''.join(parts)
 
+
+
+
+
+def has_working_revision(doc: dict) -> bool:
+    return doc.get('working_text') is not None or doc.get('working_content') is not None
+
+
+def sync_public_document(document_id: str, doc: dict) -> None:
+    if document_id in public_docs:
+        public_docs[document_id]['anonymized_text'] = doc.get('anonymized_text', '')
+        public_docs[document_id]['anonymized_content'] = doc.get('anonymized_content')
+        public_docs[document_id]['content_format'] = doc.get('content_format', 'PLAIN_TEXT')
+
+
+def audit_mapping_action(document_id: str, action: str, details: dict | None = None) -> None:
+    audit_log.append({'id': str(uuid.uuid4()), 'document_id': document_id, 'action': action, 'created_at': now_iso(), 'details': details or {}})
+
+
+def apply_entity_metadata_update(document_id: str, doc: dict, ent: dict, payload: dict) -> dict:
+    source_entity_key = entity_semantic_key(ent)
+    for key in ('canonical_value', 'person_role', 'context_label'):
+        if key in payload:
+            ent[key] = payload[key]
+    if 'entity_class' in payload:
+        ent['entity_class'] = payload['entity_class']
+    ent['updated_at'] = now_iso()
+    if ent.get('split_origin'):
+        store_split_entity_metadata_decision(document_id, ent)
+    else:
+        store_entity_metadata_decision(document_id, source_entity_key, ent)
+    if has_working_revision(doc):
+        doc['mappings'] = build_mappings_from_entities(doc.get('entities', []))
+        doc['review_entities'] = [e for e in doc.get('entities', []) if e.get('requires_review')]
+        if doc.get('working_text') is not None:
+            doc['anonymized_text'] = doc.get('working_text', '')
+        if doc.get('working_content') is not None:
+            doc['anonymized_content'] = doc.get('working_content')
+    else:
+        rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
+    doc['manual_decisions'] = list(manual_decisions_by_document_id.get(document_id, {}).values())
+    sync_public_document(document_id, doc)
+    return doc
+
+
+def restore_entity_in_working_content(content: dict, entity: dict) -> tuple[dict, set[str]]:
+    data = copy.deepcopy(content)
+    mentions = {m.get('mention_id'): m for m in entity.get('mentions', []) if m.get('mention_id')}
+    restored: set[str] = set()
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get('type') == 'text' and isinstance(node.get('marks'), list):
+                new_marks = []
+                replaced = False
+                for mark in node['marks']:
+                    if mark.get('type') == 'redactionMention':
+                        attrs = mark.get('attrs') or {}
+                        mention_id = attrs.get('mentionId')
+                        if mention_id in mentions:
+                            if not replaced:
+                                node['text'] = mentions[mention_id].get('surface_value', node.get('text', ''))
+                                replaced = True
+                            restored.add(mention_id)
+                            continue
+                    new_marks.append(mark)
+                node['marks'] = new_marks
+            if isinstance(node.get('content'), list):
+                for ch in node['content']:
+                    walk(ch)
+        elif isinstance(node, list):
+            for ch in node:
+                walk(ch)
+    walk(data)
+    return data, restored
+
+
+def replace_placeholder_boundary(text: str, placeholder: str, value: str) -> str:
+    return re.sub(rf'(?<!\w){re.escape(placeholder)}(?!\w)', value, text)
+
+
+def assign_unique_placeholders_for_entities(entities: list[dict]) -> dict[str, str]:
+    counters: dict[str, int] = defaultdict(int)
+    desired: dict[str, str] = {}
+    def first_pos(entity: dict) -> int:
+        positions = [m.get('start') for m in entity.get('mentions', []) if isinstance(m.get('start'), int)]
+        return min(positions) if positions else 0
+    for entity in sorted(entities, key=first_pos):
+        entity_class = entity.get('entity_class') or entity.get('entity_type') or 'OTHER'
+        prefix = 'ФИО' if entity_class == 'PERSON' else make_placeholder(entity_class, 0)[:-1]
+        counters[prefix] += 1
+        desired[entity.get('entity_id')] = f'{prefix}{counters[prefix]}'
+    return desired
+
+
+def update_working_content_placeholders(content: dict, entity_placeholders: dict[str, str]) -> tuple[dict, set[str]]:
+    data = copy.deepcopy(content)
+    updated_mentions: set[str] = set()
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get('type') == 'text' and isinstance(node.get('marks'), list):
+                for mark in node['marks']:
+                    if mark.get('type') != 'redactionMention':
+                        continue
+                    attrs = mark.setdefault('attrs', {})
+                    entity_id = attrs.get('entityId')
+                    mention_id = attrs.get('mentionId')
+                    if entity_id in entity_placeholders and mention_id:
+                        placeholder = entity_placeholders[entity_id]
+                        node['text'] = placeholder
+                        attrs['placeholder'] = placeholder
+                        attrs['entityId'] = entity_id
+                        attrs['mentionId'] = mention_id
+                        updated_mentions.add(mention_id)
+                        break
+            if isinstance(node.get('content'), list):
+                for ch in node['content']:
+                    walk(ch)
+        elif isinstance(node, list):
+            for ch in node:
+                walk(ch)
+    walk(data)
+    return data, updated_mentions
+
+
+def find_open_value_positions(text: str, value: str) -> list[int]:
+    return [m.start() for m in re.finditer(re.escape(value), text or '')]
+
+
+def entity_response_items(entities: list[dict]) -> list[dict]:
+    return [
+        {**entity, 'entity_key': entity.get('entity_key') or entity_semantic_key(entity)}
+        for entity in entities
+    ]
 
 
 def mention_locator_from_mention(mention: dict) -> dict:
@@ -1182,7 +1321,7 @@ def apply_split_entity_metadata_decisions(document_id: str, redacted_entities: l
         if not ent:
             continue
         payload = decision.get('payload') or {}
-        for field in ('canonical_value', 'person_role', 'context_label'):
+        for field in ('canonical_value', 'entity_class', 'person_role', 'context_label'):
             if field in payload:
                 ent[field] = payload.get(field)
         ent['updated_at'] = now_iso()
@@ -1200,7 +1339,7 @@ def apply_entity_metadata_decisions(document_id: str, redacted_entities: list[di
         if not ent:
             continue
         payload = d.get('payload') or {}
-        for field in ('canonical_value', 'person_role', 'context_label'):
+        for field in ('canonical_value', 'entity_class', 'person_role', 'context_label'):
             if field in payload:
                 ent[field] = payload.get(field)
         ent['updated_at'] = now_iso()
@@ -1332,8 +1471,8 @@ def anonymization_result_response(document: dict) -> dict:
         'content_format': document.get('content_format', 'PLAIN_TEXT'),
         'entities': document.get('entities', []),
         'mappings': document.get('mappings', []),
-        'kept_entities': document.get('kept_entities', document.get('recognized_but_kept', [])),
-        'recognized_but_kept': document.get('recognized_but_kept', []),
+        'kept_entities': entity_response_items(document.get('kept_entities', document.get('recognized_but_kept', []))),
+        'recognized_but_kept': entity_response_items(document.get('recognized_but_kept', [])),
         'review_entities': document.get('review_entities', []),
         'review_markers': document.get('review_markers', []),
         'pending_review': document.get('pending_review', []),
@@ -1450,117 +1589,237 @@ def add_mapping(document_id: str, body: MappingRequest, x_internal_service_token
     require_internal(x_internal_service_token)
     if body.mode not in {'new', 'existing'}:
         _error(400, 'BAD_REQUEST', 'Недопустимый режим', {'allowed': ['new', 'existing']})
-    if document_id not in restored_docs:
+    doc = restored_docs.get(document_id)
+    if not doc:
         _error(404, 'NOT_FOUND', 'Документ не найден')
 
-    doc = restored_docs[document_id]
     validate_non_empty(body.original_value, 'original_value')
     validate_non_empty(body.entity_type, 'entity_type')
-    positions = [m.start() for m in re.finditer(re.escape(body.original_value), doc.get('original_text', ''))]
+    entity_class = 'PERSON' if body.entity_type in {'PERSON_FULL_NAME', 'PERSON'} else body.entity_type
+    working = has_working_revision(doc)
+    search_text = doc.get('working_text') if working else doc.get('original_text', '')
+    positions = find_open_value_positions(search_text or '', body.original_value)
+    if working and not positions:
+        _error(400, 'VALUE_NOT_FOUND_IN_WORKING_DOCUMENT', 'Выбранное значение отсутствует в текущей версии документа')
     if not positions:
         return anonymization_result_response(doc)
-    entity_class = 'PERSON' if body.entity_type in {'PERSON_FULL_NAME', 'PERSON'} else body.entity_type
+
     if body.mode == 'existing':
-        target = next((e for e in doc.get('entities', []) if e.get('placeholder') == body.placeholder or e.get('entity_id') == body.placeholder), None)
+        target_ref = body.entity_id or body.placeholder
+        target = next((e for e in doc.get('entities', []) if e.get('entity_id') == target_ref or e.get('placeholder') == target_ref), None)
         if not target:
             _error(400, 'BAD_REQUEST', 'Целевая сущность не найдена')
     else:
         target = next((e for e in doc.get('entities', []) if e.get('entity_class') == entity_class and (e.get('canonical_value') == body.original_value or e.get('normalized_value') == body.original_value)), None)
         if not target:
-            target = {'entity_id': str(uuid.uuid4()), 'document_id': document_id, 'entity_class': entity_class, 'canonical_value': body.original_value, 'normalized_value': body.original_value, 'redaction_decision': 'REDACT', 'mentions': []}
+            target = {
+                'entity_id': str(uuid.uuid4()),
+                'document_id': document_id,
+                'entity_class': entity_class,
+                'canonical_value': body.original_value,
+                'normalized_value': body.original_value,
+                'redaction_decision': 'REDACT',
+                'placeholder': next_placeholder(entity_class, build_mappings_from_entities(doc.get('entities', []))),
+                'mentions': [],
+            }
             doc.setdefault('entities', []).append(target)
+    target['placeholder'] = target.get('placeholder') or next_placeholder(target.get('entity_class', entity_class), build_mappings_from_entities(doc.get('entities', [])))
+
     existing_ranges = {(m.get('start'), m.get('end')) for m in target.get('mentions', [])}
+    new_mentions = []
     for pos in positions:
         rng = (pos, pos + len(body.original_value))
         if rng in existing_ranges:
             continue
-        target.setdefault('mentions', []).append({'mention_id': str(uuid.uuid4()), 'entity_id': target['entity_id'], 'surface_value': body.original_value, 'start': pos, 'end': pos + len(body.original_value), 'replacement_value': target.get('placeholder') or ''})
+        mention = {
+            'mention_id': str(uuid.uuid4()),
+            'entity_id': target['entity_id'],
+            'surface_value': body.original_value,
+            'normalized_value': body.original_value,
+            'start': pos,
+            'end': pos + len(body.original_value),
+            'replacement_value': target.get('placeholder') or '',
+        }
+        target.setdefault('mentions', []).append(mention)
+        new_mentions.append(mention)
+        existing_ranges.add(rng)
     target['mentions_count'] = len(target.get('mentions', []))
     store_keep_redact_decision(document_id, 'REDACT_ENTITY', target, reason='Обезличено пользователем')
-    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
+
+    if working and doc.get('working_content') is not None:
+        updated_content = anonymize_content_by_mentions(doc.get('working_content'), [{**target, 'mentions': new_mentions}])
+        updated_text = content_plain_text(updated_content)
+        doc['working_content'] = updated_content
+        doc['anonymized_content'] = updated_content
+        doc['working_text'] = updated_text
+        doc['anonymized_text'] = updated_text
+        doc['mappings'] = build_mappings_from_entities(doc.get('entities', []))
+        doc['review_entities'] = [e for e in doc.get('entities', []) if e.get('requires_review')]
+    elif working:
+        updated_text = search_text or ''
+        for mention in sorted(new_mentions, key=lambda m: m['start'], reverse=True):
+            updated_text = updated_text[:mention['start']] + target.get('placeholder', '') + updated_text[mention['end']:]
+        doc['working_text'] = updated_text
+        doc['anonymized_text'] = updated_text
+        doc['mappings'] = build_mappings_from_entities(doc.get('entities', []))
+        doc['review_entities'] = [e for e in doc.get('entities', []) if e.get('requires_review')]
+    else:
+        rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
+    doc['manual_decisions'] = list(manual_decisions_by_document_id.get(document_id, {}).values())
+    sync_public_document(document_id, doc)
+    audit_mapping_action(document_id, 'ADD_MAPPING_COMPAT', {'entity_id': target.get('entity_id'), 'mode': body.mode})
     return anonymization_result_response(doc)
+
 
 @app.patch('/internal/anonymization/documents/{document_id}/mappings/{mapping_id}')
 def update_mapping(document_id: str, mapping_id: str, body: MappingPatchRequest, x_internal_service_token: str | None = Header(None)):
     require_internal(x_internal_service_token)
-    if document_id not in restored_docs:
+    doc = restored_docs.get(document_id)
+    if not doc:
         _error(404, 'NOT_FOUND', 'Документ не найден')
-    validate_non_empty(body.placeholder, 'placeholder')
-    validate_non_empty(body.original_value, 'original_value')
-    validate_non_empty(body.entity_type, 'entity_type')
-    doc = restored_docs[document_id]
     target = next((e for e in doc.get('entities', []) if e.get('entity_id') == mapping_id), None)
     if not target:
         _error(404, 'NOT_FOUND', 'Элемент таблицы соответствия не найден')
     data = body.model_dump(exclude_unset=True)
-    if data.get('original_value'):
-        target['canonical_value'] = data['original_value'].strip()
-    if data.get('entity_type'):
-        target['entity_class'] = data['entity_type'].strip()
-    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
+    if 'placeholder' in data and data.get('placeholder') != target.get('placeholder'):
+        _error(400, 'PLACEHOLDER_MANAGED_AUTOMATICALLY', 'Условное обозначение формируется системой и не редактируется вручную')
+    payload = {}
+    if data.get('original_value') is not None:
+        validate_non_empty(data.get('original_value'), 'original_value')
+        payload['canonical_value'] = data['original_value'].strip()
+    if data.get('entity_type') is not None:
+        validate_non_empty(data.get('entity_type'), 'entity_type')
+        payload['entity_class'] = data['entity_type'].strip()
+    apply_entity_metadata_update(document_id, doc, target, payload)
+    audit_mapping_action(document_id, 'UPDATE_MAPPING_COMPAT', {'entity_id': mapping_id})
     return anonymization_result_response(doc)
 
 
 @app.delete('/internal/anonymization/documents/{document_id}/mappings/{mapping_id}')
 def delete_mapping(document_id: str, mapping_id: str, x_internal_service_token: str | None = Header(None)):
     require_internal(x_internal_service_token)
-    if document_id not in restored_docs:
+    doc = restored_docs.get(document_id)
+    if not doc:
         _error(404, 'NOT_FOUND', 'Документ не найден')
-    doc = restored_docs[document_id]
-    mappings = ensure_document_mappings(document_id)
-    mapping = next((m for m in mappings if m.get('id') == mapping_id), None)
-    if not mapping:
-        _error(404, 'NOT_FOUND', 'Элемент таблицы соответствия не найден')
     target_entity = next((e for e in doc.get('entities', []) if e.get('entity_id') == mapping_id), None)
     if not target_entity:
         _error(404, 'NOT_FOUND', 'Сущность для элемента таблицы соответствия не найдена')
+
+    working = has_working_revision(doc)
+    updated_content = None
+    updated_text = None
+    if working and doc.get('working_content') is not None:
+        updated_content, restored_mentions = restore_entity_in_working_content(doc.get('working_content'), target_entity)
+        expected_mentions = {m.get('mention_id') for m in target_entity.get('mentions', []) if m.get('mention_id')}
+        missing = sorted(expected_mentions - restored_mentions)
+        if missing:
+            _error(409, 'KEEP_ENTITY_MARK_NOT_FOUND', 'Разметка одного или нескольких упоминаний не найдена', {'missing_mention_ids': missing})
+        updated_text = content_plain_text(updated_content)
+    elif working:
+        surface_values = sorted({m.get('surface_value') for m in target_entity.get('mentions', []) if m.get('surface_value')})
+        if len(surface_values) > 1:
+            _error(409, 'KEEP_REQUIRES_STRUCTURED_CONTENT', 'Невозможно восстановить разные варианты написания без разметки документа', {'entity_id': mapping_id, 'placeholder': target_entity.get('placeholder'), 'surface_values': surface_values})
+        replacement = surface_values[0] if surface_values else (target_entity.get('canonical_value') or '')
+        updated_text = replace_placeholder_boundary(doc.get('working_text') or '', target_entity.get('placeholder') or '', replacement)
+
     store_keep_redact_decision(document_id, 'KEEP_ENTITY', target_entity, reason='Оставлено пользователем')
     kept = [e for e in doc.get('kept_entities', []) if e.get('entity_id') != mapping_id]
     redacted = []
-    for e in doc.get('entities', []):
-        if e.get('entity_id') == mapping_id:
-            e['redaction_decision'] = 'KEEP'
-            e['requires_review'] = False
-            kept.append(e)
+    for entity in doc.get('entities', []):
+        if entity.get('entity_id') == mapping_id:
+            entity['redaction_decision'] = 'KEEP'
+            entity['requires_review'] = False
+            entity['entity_key'] = entity.get('entity_key') or entity_semantic_key(entity)
+            kept.append(entity)
         else:
-            redacted.append(e)
-    rebuild_document_from_entities(document_id, redacted, kept, doc.get('original_text', ''), doc.get('original_content'))
+            redacted.append(entity)
+
+    if working and doc.get('working_content') is not None:
+        doc['entities'] = redacted
+        doc['kept_entities'] = kept
+        doc['recognized_but_kept'] = kept
+        doc['working_content'] = updated_content
+        doc['anonymized_content'] = updated_content
+        doc['working_text'] = updated_text
+        doc['anonymized_text'] = updated_text
+        doc['mappings'] = build_mappings_from_entities(redacted)
+        doc['review_entities'] = [e for e in redacted if e.get('requires_review')]
+    elif working:
+        doc['entities'] = redacted
+        doc['kept_entities'] = kept
+        doc['recognized_but_kept'] = kept
+        doc['working_text'] = updated_text
+        doc['anonymized_text'] = updated_text
+        doc['mappings'] = build_mappings_from_entities(redacted)
+        doc['review_entities'] = [e for e in redacted if e.get('requires_review')]
+    else:
+        rebuild_document_from_entities(document_id, redacted, kept, doc.get('original_text', ''), doc.get('original_content'))
+    doc['manual_decisions'] = list(manual_decisions_by_document_id.get(document_id, {}).values())
     manual_mappings_by_document_id[document_id] = [m for m in doc.get('mappings', []) if m.get('source') == 'manual']
+    sync_public_document(document_id, doc)
+    audit_mapping_action(document_id, 'DELETE_MAPPING_COMPAT', {'entity_id': mapping_id})
     return anonymization_result_response(doc)
 
 
 @app.post('/internal/anonymization/documents/{document_id}/mappings/merge')
 def merge_document_mappings(document_id: str, body: MergeMappingsRequest, x_internal_service_token: str | None = Header(None)):
     require_internal(x_internal_service_token)
-    if document_id not in restored_docs:
-        _error(404, 'NOT_FOUND', 'Документ не найден')
-    doc = restored_docs[document_id]
-    target = next((e for e in doc.get('entities', []) if e.get('entity_id') == body.target_mapping_id), None)
-    if not target:
-        _error(404, 'NOT_FOUND', 'Целевой элемент таблицы соответствия не найден')
-    if not body.source_mapping_ids:
-        _error(400, 'BAD_REQUEST', 'source_mapping_ids не должен быть пустым')
-    source_ids = set(body.source_mapping_ids)
-    sources = [e for e in doc.get('entities', []) if e.get('entity_id') in source_ids]
-    if len(sources) != len(source_ids):
-        _error(404, 'NOT_FOUND', 'Один или несколько исходных элементов таблицы соответствия не найдены')
-    for src in sources:
-        target.setdefault('mentions', []).extend(src.get('mentions', []))
-        doc['entities'].remove(src)
-    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
-    return anonymization_result_response(doc)
-
+    response = merge_entities_operation(document_id, body.target_mapping_id, body.source_mapping_ids)
+    audit_mapping_action(document_id, 'MERGE_MAPPINGS_COMPAT', {'target_entity_id': body.target_mapping_id, 'source_entity_ids': body.source_mapping_ids})
+    return response
 
 
 @app.post('/internal/anonymization/documents/{document_id}/mappings/repair-placeholders')
 def repair_placeholders(document_id: str, x_internal_service_token: str | None = Header(None)):
     require_internal(x_internal_service_token)
-    if document_id not in restored_docs:
+    doc = restored_docs.get(document_id)
+    if not doc:
         _error(404, 'NOT_FOUND', 'Документ не найден')
-    doc = restored_docs[document_id]
-    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
-    audit_log.append({'id': str(uuid.uuid4()), 'document_id': document_id, 'action': 'REPAIR_PLACEHOLDERS', 'created_at': now_iso(), 'details': {}})
+    working = has_working_revision(doc)
+    redacted = [e for e in doc.get('entities', []) if e.get('redaction_decision') == 'REDACT']
+    desired = assign_unique_placeholders_for_entities(redacted)
+    changed = {e.get('entity_id'): desired.get(e.get('entity_id')) for e in redacted if desired.get(e.get('entity_id')) and desired.get(e.get('entity_id')) != e.get('placeholder')}
+
+    if working and doc.get('working_content') is not None:
+        missing_mention_ids = sorted(
+            m.get('mention_id')
+            for e in redacted
+            if e.get('entity_id') in changed
+            for m in e.get('mentions', [])
+            if m.get('mention_id') and not has_redaction_mention_mark(doc.get('working_content'), m.get('mention_id'))
+        )
+        if missing_mention_ids:
+            _error(409, 'REPAIR_PLACEHOLDERS_MARK_NOT_FOUND', 'Разметка одного или нескольких упоминаний не найдена', {'missing_mention_ids': missing_mention_ids})
+        updated_content, updated_mentions = update_working_content_placeholders(doc.get('working_content'), changed)
+        expected_mentions = {m.get('mention_id') for e in redacted if e.get('entity_id') in changed for m in e.get('mentions', []) if m.get('mention_id')}
+        missing_after = sorted(expected_mentions - updated_mentions)
+        if missing_after:
+            _error(409, 'REPAIR_PLACEHOLDERS_MARK_NOT_FOUND', 'Разметка одного или нескольких упоминаний не найдена', {'missing_mention_ids': missing_after})
+        for entity in redacted:
+            if entity.get('entity_id') in changed:
+                entity['placeholder'] = changed[entity.get('entity_id')]
+                for mention in entity.get('mentions', []):
+                    mention['replacement_value'] = entity['placeholder']
+        updated_text = content_plain_text(updated_content)
+        doc['working_content'] = updated_content
+        doc['anonymized_content'] = updated_content
+        doc['working_text'] = updated_text
+        doc['anonymized_text'] = updated_text
+        doc['mappings'] = build_mappings_from_entities(doc.get('entities', []))
+        doc['review_entities'] = [e for e in doc.get('entities', []) if e.get('requires_review')]
+    elif working:
+        placeholders = [e.get('placeholder') for e in redacted if e.get('placeholder')]
+        conflict = len(placeholders) != len(set(placeholders))
+        if conflict:
+            _error(409, 'REPAIR_REQUIRES_STRUCTURED_CONTENT', 'Невозможно исправить одинаковые обозначения без разметки документа')
+        return anonymization_result_response(doc)
+    else:
+        rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
+    doc['manual_decisions'] = list(manual_decisions_by_document_id.get(document_id, {}).values())
+    sync_public_document(document_id, doc)
+    audit_mapping_action(document_id, 'REPAIR_PLACEHOLDERS_COMPAT', {'changed_entity_ids': list(changed.keys())})
     return anonymization_result_response(doc)
+
 
 @app.post('/internal/anonymization/documents/{document_id}/reanonymize')
 async def reanonymize(document_id: str, body: ReanonymizeRequest, x_internal_service_token: str | None = Header(None)):
@@ -1701,16 +1960,18 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
             }
             redacted_entities.append(target)
         target['entity_key'] = entity_key
-        search_text = (
-            doc.get('working_text')
-            if is_pending_decision and doc.get('working_text') is not None
-            else doc.get('original_text', '')
-        )
+        working = has_working_revision(doc)
+        search_text = (doc.get('working_text') if doc.get('working_text') is not None else content_plain_text(doc.get('working_content'))) if working else doc.get('original_text', '')
 
-        existing_ranges = {
-            (m.get('start'), m.get('end'))
-            for m in target.get('mentions', [])
-        }
+        previous_mentions = list(target.get('mentions', []))
+        if working and not is_pending_decision:
+            target['mentions'] = []
+            existing_ranges = set()
+        else:
+            existing_ranges = {
+                (m.get('start'), m.get('end'))
+                for m in target.get('mentions', [])
+            }
         accepted_ranges = set(existing_ranges)
         new_mentions = []
 
@@ -1734,10 +1995,13 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
                 reverse=True,
             )
         else:
-            surface_to_normalized = {
-                body.selected_text: canonical_value
-            }
-            surfaces_to_redact = [body.selected_text]
+            surface_to_normalized = {body.selected_text: canonical_value}
+            if working:
+                for previous in previous_mentions:
+                    surface = previous.get('surface_value')
+                    if surface:
+                        surface_to_normalized[surface] = previous.get('normalized_value') or canonical_value
+            surfaces_to_redact = sorted(surface_to_normalized.keys(), key=len, reverse=True)
 
         def overlaps_existing(start: int, end: int) -> bool:
             return any(
@@ -1770,7 +2034,7 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
                 accepted_ranges.add((start, end))
 
         target['mentions_count'] = len(target.get('mentions', []))
-        if is_pending_decision:
+        if is_pending_decision or working:
             target['placeholder'] = target.get('placeholder') or next_placeholder(entity_class, doc.get('mappings', []))
             for mention in new_mentions:
                 mention['replacement_value'] = target['placeholder']
@@ -1782,8 +2046,11 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
             working_content = doc.get('working_content')
             if working_content:
                 updated_content = anonymize_content_by_mentions(working_content, [{**target, 'mentions': new_mentions}])
+                updated_text = content_plain_text(updated_content)
                 doc['working_content'] = updated_content
                 doc['anonymized_content'] = updated_content
+                doc['working_text'] = updated_text
+                doc['anonymized_text'] = updated_text
             doc['entities'] = redacted_entities
             doc['kept_entities'] = kept_entities
             doc['recognized_but_kept'] = kept_entities
@@ -1948,58 +2215,26 @@ def patch_entity(document_id: str, entity_id: str, body: EntityPatchRequest, x_i
     ent = next((e for e in doc.get('entities', []) if e.get('entity_id') == entity_id), None)
     if not ent:
         _error(404, 'NOT_FOUND', 'Сущность не найдена')
-
-    split_origin = ent.get('split_origin')
-    source_entity_key = entity_semantic_key(ent)
-    for k, v in body.model_dump(exclude_unset=True).items():
-        ent[k] = v
-    ent['updated_at'] = now_iso()
-    if split_origin:
-        store_split_entity_metadata_decision(document_id, ent)
-    else:
-        store_entity_metadata_decision(document_id, source_entity_key, ent)
-
-    has_working_revision = (
-        doc.get('working_text') is not None
-        or doc.get('working_content') is not None
-    )
-    if has_working_revision:
-        doc['mappings'] = build_mappings_from_entities(doc.get('entities', []))
-        doc['review_entities'] = [e for e in doc.get('entities', []) if e.get('requires_review')]
-        if doc.get('working_text') is not None:
-            doc['anonymized_text'] = doc.get('working_text', '')
-        if doc.get('working_content') is not None:
-            doc['anonymized_content'] = doc.get('working_content')
-        doc['manual_decisions'] = list(manual_decisions_by_document_id.get(document_id, {}).values())
-        if document_id in public_docs:
-            public_docs[document_id]['anonymized_text'] = doc.get('anonymized_text', '')
-            public_docs[document_id]['anonymized_content'] = doc.get('anonymized_content')
-            public_docs[document_id]['content_format'] = doc.get('content_format', 'PLAIN_TEXT')
-        return anonymization_result_response(doc)
-
-    rebuild_document_from_entities(document_id, doc.get('entities', []), doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
-    doc['manual_decisions'] = list(manual_decisions_by_document_id.get(document_id, {}).values())
+    apply_entity_metadata_update(document_id, doc, ent, body.model_dump(exclude_unset=True))
     return anonymization_result_response(doc)
 
 
-@app.post('/internal/anonymization/documents/{document_id}/entities/merge')
-def merge_entities(document_id: str, body: EntityMergeRequest, x_internal_service_token: str | None = Header(None)):
-    require_internal(x_internal_service_token)
+def merge_entities_operation(document_id: str, target_entity_id: str, source_entity_ids: list[str]):
     doc = restored_docs.get(document_id)
     if not doc:
         _error(404, 'NOT_FOUND', 'Документ не найден')
-    if not body.source_entity_ids:
+    if not source_entity_ids:
         _error(400, 'BAD_REQUEST', 'Не указаны исходные сущности для объединения')
-    if body.target_entity_id in body.source_entity_ids:
+    if target_entity_id in source_entity_ids:
         _error(400, 'BAD_REQUEST', 'Целевая сущность не может быть исходной сущностью')
 
     entities = doc.get('entities', [])
-    target = next((e for e in entities if e.get('entity_id') == body.target_entity_id), None)
+    target = next((e for e in entities if e.get('entity_id') == target_entity_id), None)
     if not target:
         _error(404, 'NOT_FOUND', 'Целевая сущность не найдена')
 
     sources = []
-    for source_id in body.source_entity_ids:
+    for source_id in source_entity_ids:
         source = next((e for e in entities if e.get('entity_id') == source_id), None)
         if not source:
             _error(404, 'NOT_FOUND', 'Исходная сущность не найдена', {'source_entity_id': source_id})
@@ -2013,11 +2248,8 @@ def merge_entities(document_id: str, body: EntityMergeRequest, x_internal_servic
     if target.get('redaction_decision') != 'REDACT' or any(source.get('redaction_decision') != 'REDACT' for source in sources):
         _error(400, 'BAD_REQUEST', 'Можно объединять только обезличиваемые сущности')
 
-    has_working_revision = (
-        doc.get('working_text') is not None
-        or doc.get('working_content') is not None
-    )
-    if not has_working_revision:
+    working = has_working_revision(doc)
+    if not working:
         _validate_merge_semantic_keys_are_replayable(entities, target, sources)
 
     source_mention_ids = {
@@ -2028,33 +2260,23 @@ def merge_entities(document_id: str, body: EntityMergeRequest, x_internal_servic
     }
 
     updated_content = None
-    if has_working_revision and doc.get('working_content') is not None:
+    if working and doc.get('working_content') is not None:
         missing_mention_ids = sorted(
             mention_id
             for mention_id in source_mention_ids
             if not has_redaction_mention_mark(doc.get('working_content'), mention_id)
         )
         if missing_mention_ids:
-            _error(
-                409,
-                'MERGE_ENTITIES_MARK_NOT_FOUND',
-                'Разметка одного или нескольких объединяемых упоминаний не найдена',
-                {'missing_mention_ids': missing_mention_ids},
-            )
+            _error(409, 'MERGE_ENTITIES_MARK_NOT_FOUND', 'Разметка одного или нескольких объединяемых упоминаний не найдена', {'missing_mention_ids': missing_mention_ids})
         updated_content, updated_mention_ids = update_working_content_for_merge(doc.get('working_content'), source_mention_ids, target)
         missing_after_update = sorted(source_mention_ids - updated_mention_ids)
         if missing_after_update:
-            _error(
-                409,
-                'MERGE_ENTITIES_MARK_NOT_FOUND',
-                'Разметка одного или нескольких объединяемых упоминаний не найдена',
-                {'missing_mention_ids': missing_after_update},
-            )
+            _error(409, 'MERGE_ENTITIES_MARK_NOT_FOUND', 'Разметка одного или нескольких объединяемых упоминаний не найдена', {'missing_mention_ids': missing_after_update})
 
     store_merge_entities_decision(document_id, target, sources)
     merged_entities = merge_entities_in_state(entities, target, sources)
 
-    if has_working_revision and doc.get('working_content') is not None:
+    if working and doc.get('working_content') is not None:
         updated_text = content_plain_text(updated_content)
         doc['entities'] = merged_entities
         doc['working_content'] = updated_content
@@ -2063,19 +2285,13 @@ def merge_entities(document_id: str, body: EntityMergeRequest, x_internal_servic
         doc['anonymized_text'] = updated_text
         doc['mappings'] = build_mappings_from_entities(doc['entities'])
         doc['review_entities'] = [e for e in doc.get('entities', []) if e.get('requires_review')]
-    elif has_working_revision:
+    elif working:
         updated_text = doc.get('working_text') or ''
         target_placeholder = target.get('placeholder') or ''
-
         for source in sources:
             source_placeholder = source.get('placeholder') or ''
             if source_placeholder:
-                updated_text = re.sub(
-                    rf'(?<!\w){re.escape(source_placeholder)}(?!\w)',
-                    target_placeholder,
-                    updated_text,
-                )
-
+                updated_text = replace_placeholder_boundary(updated_text, source_placeholder, target_placeholder)
         doc['entities'] = merged_entities
         doc['working_text'] = updated_text
         doc['anonymized_text'] = updated_text
@@ -2085,11 +2301,14 @@ def merge_entities(document_id: str, body: EntityMergeRequest, x_internal_servic
         rebuild_document_from_entities(document_id, merged_entities, doc.get('kept_entities', []), doc.get('original_text', ''), doc.get('original_content'))
 
     doc['manual_decisions'] = list(manual_decisions_by_document_id.get(document_id, {}).values())
-    if document_id in public_docs:
-        public_docs[document_id]['anonymized_text'] = doc.get('anonymized_text', '')
-        public_docs[document_id]['anonymized_content'] = doc.get('anonymized_content')
-        public_docs[document_id]['content_format'] = doc.get('content_format', 'PLAIN_TEXT')
+    sync_public_document(document_id, doc)
     return anonymization_result_response(doc)
+
+
+@app.post('/internal/anonymization/documents/{document_id}/entities/merge')
+def merge_entities(document_id: str, body: EntityMergeRequest, x_internal_service_token: str | None = Header(None)):
+    require_internal(x_internal_service_token)
+    return merge_entities_operation(document_id, body.target_entity_id, body.source_entity_ids)
 
 
 @app.post('/internal/anonymization/documents/{document_id}/entities/{entity_id}/mentions/{mention_id}/split')

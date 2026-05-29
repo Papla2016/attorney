@@ -17,7 +17,7 @@ export const docStatus = (docId: string) => client.get(`/cases/documents/${docId
 export const publishDocument = (docId: string) => client.post(`/cases/documents/${docId}/publish`);
 export const updateCaseStatus = (caseId: string, status: 'DRAFT' | 'PUBLISHED' | 'ARCHIVED') => client.patch(`/cases/${caseId}/status`, { status });
 export const getDocumentAnonymization = (documentId: string) => client.get(`/cases/documents/${documentId}/anonymization`);
-export const addDocumentMapping = (documentId: string, payload: { original_value: string; entity_type: string; mode: 'new' | 'existing'; placeholder?: string }) => client.post(`/cases/documents/${documentId}/mappings`, payload);
+export const addDocumentMapping = (documentId: string, payload: { original_value: string; entity_type: string; mode: 'new' | 'existing'; placeholder?: string; entity_id?: string }) => client.post(`/cases/documents/${documentId}/mappings`, payload);
 
 export const updateDocumentMapping = (documentId: string, mappingId: string, payload: { placeholder: string; original_value: string; entity_type: string }) => client.patch(`/cases/documents/${documentId}/mappings/${mappingId}`, payload);
 export const deleteDocumentMapping = (documentId: string, mappingId: string) => client.delete(`/cases/documents/${documentId}/mappings/${mappingId}`);
@@ -52,4 +52,4 @@ export const scanEditedDraft = (
   payload: { text: string; content: unknown; content_format: 'TIPTAP_JSON'; document_revision: number }
 ) => client.post<AnonymizationResult>(`/cases/documents/${documentId}/draft-scan`, payload);
 
-export const updateDocumentEntity = (documentId: string, entityId: string, payload: { canonical_value: string; person_role?: string; context_label?: string }) => client.patch(`/cases/documents/${documentId}/entities/${entityId}`, payload);
+export const updateDocumentEntity = (documentId: string, entityId: string, payload: { canonical_value: string; entity_class?: string; person_role?: string; context_label?: string }) => client.patch(`/cases/documents/${documentId}/entities/${entityId}`, payload);

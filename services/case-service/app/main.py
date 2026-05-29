@@ -251,6 +251,7 @@ class CasePatch(BaseModel):
 class MappingIn(BaseModel):
     original_value: str
     placeholder: str | None = None
+    entity_id: str | None = None
     entity_type: str
     mode: str = 'new'
 
@@ -264,6 +265,13 @@ class MappingPatchIn(BaseModel):
 class MergeMappingsIn(BaseModel):
     target_mapping_id: str
     source_mapping_ids: list[str]
+
+
+class EntityPatchIn(BaseModel):
+    canonical_value: str | None = None
+    entity_class: str | None = None
+    person_role: str | None = None
+    context_label: str | None = None
 
 
 class ReanonymizeIn(BaseModel):
@@ -816,13 +824,13 @@ async def upload(case_id: str, body: UploadDoc, authorization: str | None = Head
 
 
 @app.patch('/api/cases/documents/{document_id}/entities/{entity_id}')
-async def update_document_entity(document_id: str, entity_id: str, body: dict, authorization: str | None = Header(None)):
+async def update_document_entity(document_id: str, entity_id: str, body: EntityPatchIn, authorization: str | None = Header(None)):
     c = claims(authorization)
     d, cs = find_document_and_case(document_id)
     if not can_manage_case(c, cs):
         err('ACCESS_DENIED', 'Недостаточно прав')
     async with httpx.AsyncClient(timeout=10.0) as cl:
-        r = await cl.patch(f'{ANON}/internal/anonymization/documents/{document_id}/entities/{entity_id}', headers={'X-Internal-Service-Token': INTERNAL}, json=body)
+        r = await cl.patch(f'{ANON}/internal/anonymization/documents/{document_id}/entities/{entity_id}', headers={'X-Internal-Service-Token': INTERNAL}, json=body.model_dump(exclude_none=True))
     if r.status_code >= 400:
         raise HTTPException(status_code=r.status_code, detail=r.json())
     sync_doc_from_anonymization(d, r.json())
