@@ -1,6 +1,22 @@
 import { useEffect, useState } from 'react';
 import type { RedactionEntity } from '../../api/types';
-import { ENTITY_TYPE_OPTIONS, PERSON_ROLE_LABELS } from '../../constants/anonymizationLabels';
+import { PERSON_ROLE_LABELS } from '../../constants/anonymizationLabels';
+
+const ENTITY_MODEL_OPTIONS = [
+  { value: 'PERSON', label: 'ФИО' },
+  { value: 'ORGANIZATION', label: 'Организация' },
+  { value: 'ADDRESS', label: 'Адрес' },
+  { value: 'LOCATION', label: 'Место' },
+  { value: 'PHONE', label: 'Телефон' },
+  { value: 'EMAIL', label: 'Электронная почта' },
+  { value: 'PASSPORT', label: 'Паспортные данные' },
+  { value: 'SNILS', label: 'СНИЛС' },
+  { value: 'INN', label: 'ИНН' },
+  { value: 'BIRTH_DATE', label: 'Дата рождения' },
+  { value: 'DATE', label: 'Дата' },
+  { value: 'CADASTRAL_NUMBER', label: 'Кадастровый номер' },
+  { value: 'OTHER', label: 'Иные данные' },
+];
 
 type Props = {
   entity: RedactionEntity | null;
@@ -25,7 +41,7 @@ export default function EntityEditorModal({ entity, busy, error, onClose, onSave
 
   if (!entity) return null;
   return <div className='modal-backdrop' role='presentation'>
-    <form className='entity-editor-modal' onSubmit={(e) => { e.preventDefault(); onSave({ canonical_value: canonicalValue, entity_class: entityClass, person_role: entityClass === 'PERSON' ? personRole || undefined : undefined, context_label: contextLabel || undefined }); }}>
+    <form className='entity-editor-modal' onSubmit={(e) => { e.preventDefault(); onSave({ canonical_value: canonicalValue, entity_class: entityClass, person_role: entityClass === 'PERSON' ? personRole : '', context_label: contextLabel || undefined }); }}>
       <div className='panel-header-row'>
         <h3>Редактирование сущности</h3>
         <button type='button' className='button button-secondary' onClick={onClose} disabled={busy}>Закрыть</button>
@@ -39,7 +55,7 @@ export default function EntityEditorModal({ entity, busy, error, onClose, onSave
       </label>
       <label>Тип данных
         <select value={entityClass} onChange={(e) => setEntityClass(e.target.value)}>
-          {ENTITY_TYPE_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+          {ENTITY_MODEL_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
         </select>
       </label>
       {entityClass === 'PERSON' && <label>Роль лица

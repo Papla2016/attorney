@@ -43,8 +43,10 @@ export const formatMentionFormat = (format?: string) => {
 
 export const getApiErrorMessage = (err: unknown) => {
   const anyErr = err as any;
-  const code = anyErr?.response?.data?.error?.code || anyErr?.response?.data?.code;
-  const backendMessage = anyErr?.response?.data?.error?.message || anyErr?.response?.data?.message;
+  const data = anyErr?.response?.data || {};
+  const error = data.error || data.detail?.error;
+  const code = error?.code || data.code;
+  const backendMessage = error?.message || data.message || data.detail?.message;
   const messages: Record<string, string> = {
     PENDING_REVIEW_REQUIRED: 'Перед повторным обезличиванием обработайте найденные в изменённом тексте фрагменты.',
     CROSS_TEXT_NODE_MENTION_UNSUPPORTED: 'Найденное значение пересекает разные участки форматирования. Уберите частичное форматирование этого значения или обработайте его вручную.',

@@ -90,6 +90,8 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
   const redactedEntities = useMemo(() => entities.filter((entity) => entity.redaction_decision === 'REDACT' && !entity.requires_review), [entities]);
   const statusCounts = { redacted: redactedEntities.length, review: reviewEntities.length, kept: keptEntities.length, pending: pendingReview.length };
   const publicationBlocked = statusCounts.review > 0 || statusCounts.pending > 0;
+  const hasUnvalidatedDraft = documentChangedManually || scanLoading;
+  const publishBlockedByState = publicationBlocked || hasUnvalidatedDraft;
 
   const runAction = async (action: ActionName, fn: () => Promise<void>, success?: string) => {
     setActiveAction(action);
@@ -107,18 +109,37 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
   };
 
   const handleSave = () => runAction('save', async () => {
-    const res = await saveAnonymization(documentId, { anonymized_text: anonymizedText, anonymized_content: anonymizedContent, content_format: 'TIPTAP_JSON', entities });
-    applyResponse(res.data, 'FULL');
-    setDocumentChangedManually(false);
-    onSaved?.();
-  }, pendingReview.length ? 'Документ сохранён как рабочая версия. Для публикации необходимо обработать найденные фрагменты.' : 'Изменения обезличенного документа сохранены.');
+    setScanLoading(true);
+    try {
+      const scan = await scanEditedDraft(documentId, { text: anonymizedText, content: anonymizedContent, content_format: 'TIPTAP_JSON', document_revision: draftRevision });
+      applyResponse(scan.data, 'PENDING_ONLY');
+      const res = await saveAnonymization(documentId, { anonymized_text: anonymizedText, anonymized_content: anonymizedContent, content_format: 'TIPTAP_JSON', mappings });
+      applyResponse(res.data, 'FULL');
+      setDocumentChangedManually(false);
+      const scanPending = scan.data.pending_review || [];
+      setMessage(scanPending.length ? 'Документ сохранён как рабочая версия. Для публикации необходимо обработать найденные фрагменты.' : 'Изменения обезличенного документа сохранены.');
+      onSaved?.();
+    } finally {
+      setScanLoading(false);
+    }
+  });
 
-  const handleReanonymize = () => runAction('reanonymize', async () => {
-    const res = await reanonymizeDocument(documentId, { mappings, publication_redaction_mode: 'NORMATIVE' });
-    applyResponse(res.data, 'FULL');
-  }, 'Документ повторно обезличен.');
+  const handleReanonymize = () => {
+    if (hasUnvalidatedDraft) {
+      setWarning('Сначала сохраните изменения и дождитесь проверки добавленного текста.');
+      return;
+    }
+    return runAction('reanonymize', async () => {
+      const res = await reanonymizeDocument(documentId, { mappings, publication_redaction_mode: 'NORMATIVE' });
+      applyResponse(res.data, 'FULL');
+    }, 'Документ повторно обезличен.');
+  };
 
   const handlePublish = () => {
+    if (hasUnvalidatedDraft) {
+      setWarning('Сначала сохраните изменения и дождитесь проверки добавленного текста.');
+      return;
+    }
     if (publicationBlocked) {
       setWarning('Публикация недоступна, пока не обработаны все найденные фрагменты.');
       return;
@@ -260,8 +281,8 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
         <div><h1>Обезличивание документа</h1><p className='muted-text'>{provider ? 'Используется Natasha и правила' : 'Используются только правила'}</p></div>
         <div className='document-actions'>
           <button type='button' className='button button-secondary' disabled={!!activeAction} onClick={handleSave}>{activeAction === 'save' ? 'Сохраняем...' : 'Сохранить изменения'}</button>
-          <button type='button' className='button button-secondary' disabled={!!activeAction} onClick={handleReanonymize}>{activeAction === 'reanonymize' ? 'Обезличиваем...' : 'Повторно обезличить'}</button>
-          <button type='button' className='button' disabled={!!activeAction || publicationBlocked} onClick={handlePublish}>{activeAction === 'publish' ? 'Публикуем...' : 'Опубликовать'}</button>
+          <button type='button' className='button button-secondary' disabled={hasUnvalidatedDraft || !!activeAction} onClick={handleReanonymize}>{activeAction === 'reanonymize' ? 'Обезличиваем...' : 'Повторно обезличить'}</button>
+          <button type='button' className='button' disabled={!!activeAction || publishBlockedByState} onClick={handlePublish}>{activeAction === 'publish' ? 'Публикуем...' : 'Опубликовать'}</button>
         </div>
       </div>
       <div className='workspace-counters'>
@@ -270,7 +291,7 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
         <span className='counter-card'>Оставлено в тексте <strong>{statusCounts.kept}</strong></span>
         <span className='counter-card warning-counter'>Найдено в изменениях <strong>{statusCounts.pending}</strong></span>
       </div>
-      {publicationBlocked && <p className='publication-blocked-warning'>Публикация недоступна, пока не обработаны все найденные фрагменты.</p>}
+      {publishBlockedByState && <p className='publication-blocked-warning'>{hasUnvalidatedDraft ? 'Сначала сохраните изменения и дождитесь проверки добавленного текста.' : 'Публикация недоступна, пока не обработаны все найденные фрагменты.'}</p>}
       {warning && <p className='warning-message'>{warning}</p>}
       {error && <p className='error-message'>{error}</p>}
       {message && <p className='success-message'>{message}</p>}
