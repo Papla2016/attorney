@@ -154,15 +154,45 @@ def test_organization_boundary_only_name():
     assert resolved[0]['normalized_value'] == 'ООО «ТОК»'
 
 
-def test_judge_kept_witness_redacted():
-    text = 'Судья Андреева Татьяна Викторовна и свидетель Макаров Антон Сергеевич.'
+def test_judge_and_secretary_are_kept_other_person_is_redacted_without_review():
+    text = (
+        'Судья Андреева Татьяна Викторовна '
+        'при секретаре Никитиной Марии Олеговне '
+        'рассмотрела заявление свидетеля Макарова Антона Сергеевича.'
+    )
+
     entities = [
-        {'type': 'PERSON_FULL_NAME', 'text': 'Андреева Татьяна Викторовна', 'start': 6, 'end': 33},
-        {'type': 'PERSON_FULL_NAME', 'text': 'Макаров Антон Сергеевич', 'start': 47, 'end': 70},
+        {
+            'type': 'PERSON_FULL_NAME',
+            'text': 'Андреева Татьяна Викторовна',
+            'start': text.index('Андреева'),
+            'end': text.index('Андреева') + len('Андреева Татьяна Викторовна'),
+        },
+        {
+            'type': 'PERSON_FULL_NAME',
+            'text': 'Никитиной Марии Олеговне',
+            'start': text.index('Никитиной'),
+            'end': text.index('Никитиной') + len('Никитиной Марии Олеговне'),
+        },
+        {
+            'type': 'PERSON_FULL_NAME',
+            'text': 'Макарова Антона Сергеевича',
+            'start': text.index('Макарова'),
+            'end': text.index('Макарова') + len('Макарова Антона Сергеевича'),
+        },
     ]
+
     resolved = resolve_entities(text, entities)
-    assert resolved[0]['redaction_decision'] == 'KEEP'
-    assert resolved[1]['redaction_decision'] == 'REDACT'
+
+    judge = next(e for e in resolved if e['surface_value'] == 'Андреева Татьяна Викторовна')
+    secretary = next(e for e in resolved if e['surface_value'] == 'Никитиной Марии Олеговне')
+    witness = next(e for e in resolved if e['surface_value'] == 'Макарова Антона Сергеевича')
+
+    assert judge['redaction_decision'] == 'KEEP'
+    assert secretary['redaction_decision'] == 'KEEP'
+
+    assert witness['redaction_decision'] == 'REDACT'
+    assert witness['requires_review'] is False
 
 
 def test_mappings_include_multiple_pii_types_not_only_person():
@@ -251,6 +281,11 @@ def test_ambiguous_initials_are_redacted_and_marked_for_review():
     ])
     entities, _, review = build_entities_from_resolved('doc-2', resolved)
     assert len(entities) == 3
+    full_entities = [
+        entity for entity in entities
+        if entity['canonical_value'] != 'Макаров А.С.'
+    ]
+    assert all(entity['requires_review'] is False for entity in full_entities)
     ambiguous = next(e for e in entities if e['canonical_value'] == 'Макаров А.С.')
     assert ambiguous['requires_review'] is True
     assert any(e['canonical_value'] == 'Макаров А.С.' for e in review)
@@ -3940,3 +3975,120 @@ def test_draft_scan_older_revision_cannot_overwrite_newer_pending_state(monkeypa
     assert main.restored_docs[doc_id]['working_text'] == newer_text
     assert main.restored_docs[doc_id]['pending_review'][0]['surface_value'] == 'Петров Пётр Петрович'
     assert older_response.json()['pending_review'][0]['surface_value'] == 'Петров Пётр Петрович'
+
+def test_confirm_reviewed_redacted_entity_removes_review_without_changing_mentions():
+    import copy
+
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.main import app
+
+    client = TestClient(app)
+    doc_id = 'confirm-review-person-doc'
+
+    entity = {
+        'entity_id': 'review-e1',
+        'document_id': doc_id,
+        'entity_key': 'PERSON::макаров а.с.',
+        'entity_class': 'PERSON',
+        'canonical_value': 'Макаров А.С.',
+        'normalized_value': 'Макаров А.С.',
+        'placeholder': 'ФИО1',
+        'redaction_decision': 'REDACT',
+        'requires_review': True,
+        'review_reason': 'Сокращённое ФИО соответствует нескольким найденным лицам',
+        'mentions': [
+            {
+                'mention_id': 'review-m1',
+                'entity_id': 'review-e1',
+                'surface_value': 'Макаров А.С.',
+                'normalized_value': 'Макаров А.С.',
+                'start': 0,
+                'end': len('Макаров А.С.'),
+                'replacement_value': 'ФИО1',
+                'requires_review': True,
+                'review_reason': 'Сокращённое ФИО соответствует нескольким найденным лицам',
+            }
+        ],
+    }
+
+    content = {
+        'type': 'doc',
+        'content': [
+            {
+                'type': 'paragraph',
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': 'ФИО1',
+                        'marks': [
+                            {
+                                'type': 'redactionMention',
+                                'attrs': {
+                                    'entityId': 'review-e1',
+                                    'mentionId': 'review-m1',
+                                    'placeholder': 'ФИО1',
+                                },
+                            }
+                        ],
+                    },
+                    {'type': 'text', 'text': ' подписал документ.'},
+                ],
+            }
+        ],
+    }
+
+    main.restored_docs[doc_id] = {
+        'document_id': doc_id,
+        'case_id': 'case',
+        'title': 'doc',
+        'original_text': 'Макаров А.С. подписал документ.',
+        'working_text': 'ФИО1 подписал документ.',
+        'anonymized_text': 'ФИО1 подписал документ.',
+        'working_content': copy.deepcopy(content),
+        'anonymized_content': copy.deepcopy(content),
+        'entities': [copy.deepcopy(entity)],
+        'kept_entities': [],
+        'mappings': main.build_mappings_from_entities([entity]),
+        'review_entities': [copy.deepcopy(entity)],
+        'pending_review': [],
+    }
+    main.manual_decisions_by_document_id.pop(doc_id, None)
+
+    before_content = copy.deepcopy(main.restored_docs[doc_id]['working_content'])
+    before_mentions = copy.deepcopy(main.restored_docs[doc_id]['entities'][0]['mentions'])
+
+    response = client.post(
+        f'/internal/anonymization/documents/{doc_id}/redaction-decisions',
+        headers={'X-Internal-Service-Token': main.INTERNAL},
+        json={
+            'entity_key': 'PERSON::макаров а.с.',
+            'selected_text': 'Макаров А.С.',
+            'entity_class': 'PERSON',
+            'decision': 'REDACT',
+            'reason': 'Подтверждено пользователем после проверки',
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert payload['review_entities'] == []
+    assert len(payload['entities']) == 1
+    assert payload['entities'][0]['requires_review'] is False
+    assert payload['entities'][0]['placeholder'] == 'ФИО1'
+    mention = payload['entities'][0]['mentions'][0]
+    before_mention = before_mentions[0]
+
+    assert mention['mention_id'] == before_mention['mention_id']
+    assert mention['entity_id'] == before_mention['entity_id']
+    assert mention['surface_value'] == before_mention['surface_value']
+    assert mention['normalized_value'] == before_mention['normalized_value']
+    assert mention['start'] == before_mention['start']
+    assert mention['end'] == before_mention['end']
+    assert mention['replacement_value'] == before_mention['replacement_value']
+
+    assert mention['requires_review'] is False
+    assert mention['review_reason'] is None
+
+    assert payload['anonymized_content'] == before_content

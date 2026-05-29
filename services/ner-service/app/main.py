@@ -182,8 +182,20 @@ class RegexRuleNerProvider(BaseNerProvider):
 
     def __init__(self) -> None:
         flags = re.IGNORECASE | re.UNICODE
-        fio_full = r'[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+'
-        fio_initials = r'[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\.'
+        surname_or_name = r'[А-ЯЁ][а-яё]+'
+        patronymic = (
+            r'[А-ЯЁ][а-яё]*'
+            r'(?:'
+            r'ович(?:а|у|ем|е)?|'
+            r'евич(?:а|у|ем|е)?|'
+            r'ич(?:а|у|ем|е)?|'
+            r'овн(?:а|ы|е|ой|у)|'
+            r'евн(?:а|ы|е|ой|у)|'
+            r'ичн(?:а|ы|е|ой|у)'
+            r')'
+        )
+        fio_full = rf'{surname_or_name}\s+{surname_or_name}\s+{patronymic}'
+        fio_initials = rf'{surname_or_name}\s+[А-ЯЁ]\.\s?[А-ЯЁ]\.'
         fio = rf'(?:{fio_full}|{fio_initials})'
         try:
             from natasha import MorphVocab

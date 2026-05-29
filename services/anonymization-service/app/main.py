@@ -405,8 +405,6 @@ def decide_redaction(entity: dict, mode: str) -> tuple[str, str, bool]:
     if etype == 'PERSON':
         if role in {'JUDGE', 'COURT_SECRETARY'}:
             return 'KEEP', 'ФИО судьи/секретаря оставлено в нормативном режиме', False
-        if role == 'UNKNOWN':
-            return 'REDACT', 'ФИО лица подлежит обезличиванию', True
         return 'REDACT', 'ФИО лица подлежит обезличиванию', False
     if etype == 'ORGANIZATION':
         return 'KEEP', 'Организация не обезличивается в нормативном режиме', False
@@ -2091,6 +2089,30 @@ def redaction_decision(document_id: str, body: RedactionDecisionRequest, x_inter
         try:
             store_keep_redact_decision(document_id, 'REDACT_ENTITY', decision_entity, reason=body.reason, explicit_entity_key=entity_key)
             target = _find_entity_by_semantic_key(redacted_entities, entity_key)
+            if target and not is_pending_decision and target.get('requires_review'):
+                target['redaction_decision'] = 'REDACT'
+                target['requires_review'] = False
+                target['review_reason'] = None
+                target['entity_key'] = entity_key
+
+                for mention in target.get('mentions', []):
+                    mention['requires_review'] = False
+                    mention['review_reason'] = None
+
+                doc['entities'] = redacted_entities
+                doc['kept_entities'] = kept_entities
+                doc['recognized_but_kept'] = kept_entities
+                doc['mappings'] = build_mappings_from_entities(redacted_entities)
+                doc['review_entities'] = [
+                    entity for entity in redacted_entities
+                    if entity.get('requires_review')
+                ]
+                doc['manual_decisions'] = list(
+                    manual_decisions_by_document_id.get(document_id, {}).values()
+                )
+                sync_public_document(document_id, doc)
+
+                return anonymization_result_response(doc)
             if not target:
                 target = _find_entity_by_semantic_key(kept_entities, entity_key)
                 if target:
