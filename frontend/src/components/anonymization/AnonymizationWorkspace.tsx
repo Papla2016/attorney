@@ -43,6 +43,8 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
   const [draftRevision, setDraftRevision] = useState(0);
   const [documentChangedManually, setDocumentChangedManually] = useState(false);
   const [isApplyingServerContent, setIsApplyingServerContent] = useState(false);
+	const lastScannedDraftRevisionRef = useRef<number | null>(null);
+	const scanInFlightDraftRevisionRef = useRef<number | null>(null);
   const [scanLoading, setScanLoading] = useState(false);
   const [scanError, setScanError] = useState('');
   const pendingPanelRef = useRef<HTMLDivElement | null>(null);
@@ -69,23 +71,52 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
   const syncFull = async () => applyResponse((await getDocumentAnonymization(documentId)).data, 'FULL');
   const provider = initialData?.ner_provider;
 
-  useEffect(() => {
-    if (!documentChangedManually || isApplyingServerContent || !anonymizedText.trim()) return;
-    const revision = draftRevision;
-    const timer = setTimeout(async () => {
-      try {
-        setScanLoading(true);
-        setScanError('');
-        const res = await scanEditedDraft(documentId, { text: anonymizedText, content: anonymizedContent, content_format: 'TIPTAP_JSON', document_revision: revision });
-        applyResponse(res.data, 'PENDING_ONLY');
-      } catch (err) {
-        setScanError(getApiErrorMessage(err));
-      } finally {
-        setScanLoading(false);
-      }
-    }, 800);
-    return () => clearTimeout(timer);
-  }, [anonymizedContent, anonymizedText, documentChangedManually, documentId, draftRevision, isApplyingServerContent]);
+	useEffect(() => {
+		if (!documentChangedManually || isApplyingServerContent || !anonymizedText.trim()) return;
+
+		if (
+			lastScannedDraftRevisionRef.current === draftRevision ||
+			scanInFlightDraftRevisionRef.current === draftRevision
+		) {
+			return;
+		}
+
+		const revision = draftRevision;
+
+		const timer = setTimeout(async () => {
+			if (
+				lastScannedDraftRevisionRef.current === revision ||
+				scanInFlightDraftRevisionRef.current === revision
+			) {
+				return;
+			}
+
+			scanInFlightDraftRevisionRef.current = revision;
+
+			try {
+				setScanLoading(true);
+				setScanError('');
+
+				const res = await scanEditedDraft(documentId, {
+					text: anonymizedText,
+					content: anonymizedContent,
+					content_format: 'TIPTAP_JSON',
+					document_revision: revision,
+				});
+
+				applyResponse(res.data, 'PENDING_ONLY');
+				lastScannedDraftRevisionRef.current = revision;
+			} catch (err) {
+				setScanError(getApiErrorMessage(err));
+				lastScannedDraftRevisionRef.current = revision;
+			} finally {
+				scanInFlightDraftRevisionRef.current = null;
+				setScanLoading(false);
+			}
+		}, 800);
+
+		return () => clearTimeout(timer);
+	}, [anonymizedContent, anonymizedText, documentChangedManually, documentId, draftRevision, isApplyingServerContent]);
 
   const redactedEntities = useMemo(() => entities.filter((entity) => entity.redaction_decision === 'REDACT' && !entity.requires_review), [entities]);
   const statusCounts = { redacted: redactedEntities.length, review: reviewEntities.length, kept: keptEntities.length, pending: pendingReview.length };
@@ -119,6 +150,7 @@ export default function AnonymizationWorkspace({ documentId, initialData, onSave
     setScanLoading(true);
     try {
       const scan = await scanEditedDraft(documentId, { text: anonymizedText, content: anonymizedContent, content_format: 'TIPTAP_JSON', document_revision: draftRevision });
+			lastScannedDraftRevisionRef.current = draftRevision;
       applyResponse(scan.data, 'PENDING_ONLY');
       const res = await saveAnonymization(documentId, { anonymized_text: anonymizedText, anonymized_content: anonymizedContent, content_format: 'TIPTAP_JSON', mappings });
       applyResponse(res.data, 'FULL');

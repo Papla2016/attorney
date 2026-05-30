@@ -411,15 +411,11 @@ def decide_redaction(entity: dict, mode: str) -> tuple[str, str, bool]:
     if etype == 'DATE':
         if ctx == 'BIRTH_DATE':
             return 'REDACT', 'Дата рождения подлежит обезличиванию', False
-        if ctx == 'UNKNOWN_DATE':
-            return 'REDACT', 'Дата скрыта до ручной проверки', True
         return 'KEEP', 'Обычная дата документа/события', False
     if etype == 'EMAIL':
-        if mode == 'EXTENDED_SAFE':
-            return 'REDACT', 'Email скрыт в расширенном режиме', False
-        return 'REDACT', 'Email скрыт до ручной проверки', True
-    if etype == 'PLACE' and entity.get('context_kind') == 'UNKNOWN_LOCATION':
-        return 'REDACT', 'Адрес/место скрыто до ручной проверки', True
+        return 'REDACT', 'Email скрыт до ручной проверки', False
+    if etype == 'PLACE':
+        return 'REDACT', 'Адрес/место скрыто до ручной проверки', False
     return ('REDACT', 'Сведения подлежат обезличиванию', False) if etype in {'PHONE', 'SNILS', 'PASSPORT', 'INN'} else ('KEEP', 'Оставлено политикой публикации', False)
 
 def make_placeholder(entity_type: str, idx: int) -> str:
@@ -2378,12 +2374,24 @@ async def draft_scan(document_id: str, body: DraftScanRequest, x_internal_servic
     pending = []
     decisions = manual_decisions_by_document_id.get(document_id, {})
     existing_entities = doc.get('entities', [])
+    kept_entities = doc.get('kept_entities', doc.get('recognized_but_kept', []))
+    kept_entity_keys = {
+        key
+        for entity in kept_entities
+        for key in (
+            entity.get('entity_key'),
+            entity_semantic_key(entity),
+        )
+        if key
+    }
     placeholder_patterns = [r'ФИО\d+', r'ПАСПОРТ\d+', r'ИНН\d+', r'АДРЕС\d+', r'ДАТА\d+', r'ТЕЛЕФОН\d+', r'СНИЛС\d+', r'ЭЛЕКТРОННАЯ_ПОЧТА\d+']
     for e in resolve_entities(working_text, entities, 'NORMATIVE'):
         surface = e.get('surface_value', '')
         if any(re.fullmatch(pat, surface) for pat in placeholder_patterns):
             continue
         key = build_entity_semantic_key(e.get('entity_class','OTHER'), e.get('normalized_value') or surface, e.get('person_role'))
+        if key in kept_entity_keys:
+            continue
         if decisions.get(key, {}).get('decision_type') == 'KEEP_ENTITY':
             continue
         merge_candidates = [
